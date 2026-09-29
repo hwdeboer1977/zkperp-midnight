@@ -1,0 +1,9 @@
+node_modules/
+dist/
+contracts/managed/
+.wallet-state/
+midnight-level-db/
+# Trader-side secrets: position openings and collateral coin nonces.
+.zkperp/
+deployment.json
+.env

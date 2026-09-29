@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// pUSDC — the mock stablecoin zkperp settles in.
+//
+// Shielded: balances and transfers are private. Only mint amounts are public,
+// through `totalSupply`. Collateral, liquidity and payouts in zkperp are all
+// pUSDC coins, so the privacy of a position starts here — a transparent
+// collateral token would publish every position's margin as it was posted.
+//
+// ⚠️  MOCK TOKEN. Anyone may mint any amount. It exists so the devnet can hand
+// out collateral without a faucet; it has none of the supply control a real
+// stablecoin is for. Adapted from pEUR in midnight-polisZK.
+//
+// 6 decimals, like USDC: 1 pUSDC = 1_000_000.
+
+// This deployment's token type, recorded on the first mint. Zero until then.
+// zkperp is deployed with this value and accepts no other token.
+export ledger tokenId: Bytes<32>;
+
+// Public: how much pUSDC exists. Individual holdings stay private.
+export ledger totalSupply: Uint<64>;
+
+// Makes every mint's coin nonce unique; see `evolveNonce` below.
+export ledger mintCounter: Counter;
+
+constructor() {
+  totalSupply = 0;
+}
+
+// Mints pUSDC to the caller. No key exchange needed: the caller's own wallet
+// builds the transaction, so it can find and spend the coin.
+export circuit mint(amount: Uint<48>): [] {
+  mintTo_(amount, left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey()));
+}
+
+// Mints pUSDC to someone else. The caller must also hand the SDK the
+// recipient's encryption public key (`additionalCoinEncPublicKeyMappings`), or
+// the coin is built for a key that can never find it.
+export circuit mintTo(amount: Uint<48>, recipient: ZswapCoinPublicKey): [] {
+  mintTo_(amount, left<ZswapCoinPublicKey, ContractAddress>(disclose(recipient)));
+}
+
+circuit mintTo_(amount: Uint<48>, recipient: Either<ZswapCoinPublicKey, ContractAddress>): [] {
+  // Derived from this contract's address, so it is unique to this deployment.
+  // Set here because the constructor does not know the address yet.
+  tokenId = tokenType(pad(32, "pUSDC"), kernel.self());
+
+  // Compact widens the sum rather than wrapping, so this catches overflow with
+  // a readable message instead of a failed cast.
+  const next = totalSupply + disclose(amount);
+  assert(next <= 18446744073709551615, "pUSDC supply would overflow");
+  totalSupply = next as Uint<64>;
+
+  mintCounter.increment(1);
+  mintShieldedToken(
+    pad(32, "pUSDC"),
+    disclose(amount),
+    evolveNonce(mintCounter, kernel.self().bytes),
+    recipient
+  );
+}

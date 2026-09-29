@@ -1,0 +1,47 @@
+{
+  "name": "zkperp-midnight",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Private perpetuals on Midnight: pUSDC collateral, a GMX-style liquidity pool, shielded positions",
+  "scripts": {
+    "compile": "for f in contracts/*.compact; do n=$(basename \"$f\" .compact); echo \"compiling $n\"; compact compile \"$f\" \"contracts/managed/$n\" || exit 1; done",
+    "compile:skip-zk": "for f in contracts/*.compact; do n=$(basename \"$f\" .compact); echo \"compiling $n (no proving keys)\"; compact compile --skip-zk \"$f\" \"contracts/managed/$n\" || exit 1; done",
+    "build": "tsc",
+    "test": "node test/pusdc.test.mjs && node test/zkperp.test.mjs",
+    "devnet:up": "docker compose up -d --wait",
+    "devnet:down": "docker compose down",
+    "devnet:reset": "docker compose down -v && rm -rf .wallet-state .zkperp midnight-level-db deployment.json && docker compose up -d --wait",
+    "proof:up": "docker run -d --name proof-server --restart unless-stopped -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v",
+    "demo:open-long": "npm run build && node dist/demo-open-long.js"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-js": "2.5.1",
+    "@midnight-ntwrk/ledger-v8": "8.1.0",
+    "@midnight-ntwrk/midnight-js-contracts": "4.1.1",
+    "@midnight-ntwrk/midnight-js-http-client-proof-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-indexer-public-data-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-level-private-state-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-network-id": "4.1.1",
+    "@midnight-ntwrk/midnight-js-node-zk-config-provider": "4.1.1",
+    "@midnight-ntwrk/midnight-js-protocol": "4.1.1",
+    "@midnight-ntwrk/midnight-js-types": "4.1.1",
+    "@midnight-ntwrk/wallet-sdk": "1.2.0",
+    "chalk": "^5.3.0",
+    "effect": "^3.22.1",
+    "rxjs": "^7.8.2",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.9.2"
+  },
+  "overrides": {
+    "@midnight-ntwrk/wallet-sdk": "1.2.0",
+    "@midnight-ntwrk/onchain-runtime-v3": "3.0.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// zkperp — private perpetuals against a GMX-style liquidity pool.
+//
+// ── The model ──────────────────────────────────────────────────────────────
+//
+// As in GMX v1, there is no order book and no counterparty trader. Liquidity
+// providers deposit pUSDC into one pool and receive zLP shares; the pool is the
+// counterparty to every position. When a long closes in profit the pool pays
+// the profit; when it closes at a loss the pool keeps the collateral lost.
+// Prices come from an oracle (here: a mock, set by the admin).
+//
+// Pool and positions live in ONE contract because they have to: a Midnight
+// contract can neither call another nor read another's ledger, so a pool in a
+// separate contract could not see a position it is meant to settle.
+//
+// ── What is private, and what is not ───────────────────────────────────────
+//
+// PUBLIC, deliberately — the same things GMX publishes:
+//   · pool liquidity (`poolValue`) and LP share supply (`lpSupply`), and so
+//     each LP deposit's size, as the difference between two reads.
+//   · the mark price, and therefore the entry price of anything opened at it.
+//   · that a position was opened (`openPositions`), and when.
+//
+// PRIVATE — never on chain in any form a reader can recover:
+//   · the position's size, collateral and leverage;
+//   · who owns it. The owner is a hash of a secret only the trader holds, not
+//     a wallet key, so positions are not linkable to each other or to the
+//     trader's other activity through the ledger.
+//
+// A position exists on chain only as a commitment: a hash over its fields plus
+// a random salt, appended to `positions`. The salt is what stops a reader from
+// guessing sizes and hashing until one matches.
+//
+// The collateral is a pUSDC coin sent to this contract and deliberately NOT
+// written to the ledger. Storing a coin publishes its value, and the value is
+// the collateral. The coin sits in the Zswap tree as an ordinary shielded
+// output owned by this contract; only the trader knows its nonce and value,
+// and the position commitment binds them, so only the trader can later name
+// it to be spent.
+//
+// ⚠️ NOT YET MODELLED — the pool does not reserve liquidity for open positions.
+// GMX locks `size` worth of pool assets per position so profits are always
+// payable. Doing that here means writing a per-position number to a public
+// field, which publishes the size this contract exists to hide. Until there is
+// a private way to do it (bucketed reservations, or a proven aggregate), the
+// pool can in principle owe more than it holds.
+//
+// Not yet here: close, liquidation, shorts, fees, funding and LP withdrawal.
+
+// ── Configuration, frozen at deploy ────────────────────────────────────────
+
+// The only token accepted as liquidity or collateral: pUSDC's `tokenId`.
+export sealed ledger usdc: Bytes<32>;
+
+// Hash of the admin's secret; see `adminKey`. Controls the mock oracle only.
+export sealed ledger admin: Bytes<32>;
+
+// Largest size / collateral a position may open at. GMX v1 allowed 50x.
+export sealed ledger maxLeverage: Uint<8>;
+
+// Smallest collateral a position may post, in pUSDC minor units.
+export sealed ledger minCollateral: Uint<64>;
+
+// ── Oracle ─────────────────────────────────────────────────────────────────
+
+// Price of the traded asset in USD, 6 decimals: 3000_000000 is $3,000.
+export ledger markPrice: Uint<64>;
+
+// ── Pool ───────────────────────────────────────────────────────────────────
+
+// All liquidity, merged into one coin owned by this contract. Stored on the
+// ledger — which publishes its value — because anyone must be able to spend it
+// to settle: an LP adding liquidity, a trader closing in profit. That is the
+// public pool GMX has too.
+export ledger pool: QualifiedShieldedCoinInfo;
+
+// `pool.value`, narrowed to 64 bits for arithmetic. Zero means no pool coin
+// exists yet.
+export ledger poolValue: Uint<64>;
+
+// zLP: shares in the pool, a shielded token minted by this contract.
+export ledger lpToken: Bytes<32>;
+export ledger lpSupply: Uint<64>;
+export ledger lpMintCounter: Counter;
+
+// ── Positions ──────────────────────────────────────────────────────────────
+
+// Everything a position commits to. Never stored; only its hash is.
+export struct Position {
+  // `ownerKey(secret)`: proves ownership at close without naming a wallet.
+  owner: Bytes<32>;
+  isLong: Boolean;
+  // Notional, in pUSDC minor units. Size / collateral is the leverage.
+  size: Uint<64>;
+  collateral: Uint<64>;
+  entryPrice: Uint<64>;
+  // Identifies the collateral coin this contract holds for this position.
+  collateralNonce: Bytes<32>;
+  // Random, 32 bytes. Without it the commitment is guessable.
+  salt: Bytes<32>;
+}
+
+// Commitments to every position ever opened. A Merkle tree rather than a set
+// so that closing can later prove membership WITHOUT naming which leaf — a set
+// lookup would link the close to the open. Depth 20: about a million positions.
+export ledger positions: HistoricMerkleTree<20, Bytes<32>>;
+
+// How many positions have been opened. Public by nature: each open is a
+// transaction anyone can see.
+export ledger openPositions: Counter;
+
+constructor(
+  usdcToken: Bytes<32>,
+  adminCommitment: Bytes<32>,
+  initialPrice: Uint<64>,
+  leverageCap: Uint<8>,
+  collateralFloor: Uint<64>
+) {
+  usdc = disclose(usdcToken);
+  admin = disclose(adminCommitment);
+  assert(disclose(initialPrice) > 0, "price must be positive");
+  markPrice = disclose(initialPrice);
+  assert(disclose(leverageCap) >= 1, "leverage cap must be at least 1x");
+  maxLeverage = disclose(leverageCap);
+  minCollateral = disclose(collateralFloor);
+  lpToken = default<Bytes<32>>;
+}
+
+// Domain-separated, so an admin secret and a position owner secret can never
+// be confused even if someone reuses one.
+export pure circuit adminKey(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:admin"), secret]);
+}
+
+export pure circuit ownerKey(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:owner"), secret]);
+}
+
+export pure circuit positionCommitment(p: Position): Bytes<32> {
+  return persistentHash<Position>(p);
+}
+
+// ── Mock oracle ────────────────────────────────────────────────────────────
+
+// Sets the mark price. Authorised by a secret, not by `ownPublicKey()`: the
+// caller supplies that key themselves, so checking it proves nothing.
+export circuit setPrice(price: Uint<64>, secret: Bytes<32>): [] {
+  assert(admin == disclose(adminKey(secret)), "not the admin");
+  assert(disclose(price) > 0, "price must be positive");
+  markPrice = disclose(price);
+}
+
+// ── Liquidity ──────────────────────────────────────────────────────────────
+
+// Deposits a pUSDC coin into the pool and mints zLP shares to the caller.
+//
+// `shares` is computed by the caller and checked here, because circuits cannot
+// divide: it must be floor(amount * lpSupply / poolValue), or `amount` for the
+// first deposit. The two inequalities below pin it to exactly that.
+export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>): [] {
+  const c = disclose(coin);
+  const s = disclose(shares);
+  assert(c.color == usdc, "the pool only takes pUSDC");
+  assert(c.value > 0, "a deposit of nothing");
+  assert(c.value <= 18446744073709551615, "deposit too large");
+  const amount = c.value as Uint<64>;
+
+  if (lpSupply == 0) {
+    assert(s == amount, "the first deposit mints one share per unit");
+  } else {
+    assert(s * poolValue <= amount * lpSupply, "too many shares for this deposit");
+    assert((s + 1) * poolValue > amount * lpSupply, "too few shares for this deposit");
+  }
+  assert(s > 0, "deposit too small to mint a share");
+
+  receiveShielded(c);
+  // The pool stays one coin: the first deposit becomes it, every later one is
+  // merged into it in the same transaction.
+  if (poolValue == 0) {
+    pool.writeCoin(c, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  } else {
+    pool.writeCoin(
+      mergeCoinImmediate(pool, c),
+      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+    );
+  }
+
+  const nextValue = poolValue + amount;
+  assert(nextValue <= 18446744073709551615, "pool would overflow");
+  poolValue = nextValue as Uint<64>;
+  const nextSupply = lpSupply + s;
+  assert(nextSupply <= 18446744073709551615, "share supply would overflow");
+  lpSupply = nextSupply as Uint<64>;
+
+  lpToken = tokenType(pad(32, "zkperp:zLP"), kernel.self());
+  lpMintCounter.increment(1);
+  mintShieldedToken(
+    pad(32, "zkperp:zLP"),
+    s,
+    evolveNonce(lpMintCounter, kernel.self().bytes),
+    left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+  );
+}
+
+// ── Trading ────────────────────────────────────────────────────────────────
+
+// Opens a long at the current mark price, with `coin` as collateral.
+//
+// `size`, `ownerSecret` and `salt` are circuit arguments, which are private:
+// they reach the proof, not the transaction. So do the coin's value and nonce.
+// What leaves this circuit is the commitment and the collateral coin's Zswap
+// commitment, both hiding.
+//
+// The trader must keep the opening — every field of `Position` — or the
+// position can never be closed. It is not recoverable from the chain; that is
+// the point.
+export circuit openLong(
+  coin: ShieldedCoinInfo,
+  size: Uint<64>,
+  ownerSecret: Bytes<32>,
+  salt: Bytes<32>
+): [] {
+  assert(poolValue > 0, "no liquidity to trade against");
+  // The token type is the same for every pUSDC coin, so disclosing it
+  // reveals only that the collateral is pUSDC — which the contract requires.
+  assert(disclose(coin.color) == usdc, "collateral must be pUSDC");
+
+  // Leverage bounds, checked in the proof against private values. A failed
+  // assert aborts proving, so a reader learns only that the bounds held.
+  assert(coin.value <= 18446744073709551615, "collateral too large");
+  const collateral = coin.value as Uint<64>;
+  assert(collateral >= minCollateral, "collateral below the minimum");
+  assert(size >= collateral, "size below collateral: leverage under 1x");
+  assert(size <= collateral * maxLeverage, "leverage above the maximum");
+
+  receiveShielded(disclose(coin));
+
+  const position = Position {
+    owner: ownerKey(ownerSecret),
+    isLong: true,
+    size: size,
+    collateral: collateral,
+    entryPrice: markPrice,
+    collateralNonce: coin.nonce,
+    salt: salt
+  };
+  positions.insert(disclose(positionCommitment(position)));
+  openPositions.increment(1);
+}
