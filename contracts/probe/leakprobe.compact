@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// TEST ONLY — never deployed with zkperp.
+//
+// A positive control for the privacy search in src/leak-search.ts. It
+// disclose()s amounts on purpose, in each way a zkperp amount could end up
+// public: written to a Uint<64> field, to a Uint<128> field (coin values are
+// Uint<128>), and as a set key. The search must find all three in this
+// contract's raw call transaction; any it misses is an encoding it is blind
+// to, and a "not found" from it for that encoding means nothing.
+
+export ledger stored64: Uint<64>;
+export ledger stored128: Uint<128>;
+export ledger seen: Set<Uint<64>>;
+
+export circuit leak(a: Uint<64>, b: Uint<128>, c: Uint<64>): [] {
+  stored64 = disclose(a);
+  stored128 = disclose(b);
+  seen.insert(disclose(c));
+}

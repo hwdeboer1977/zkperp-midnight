@@ -2,11 +2,12 @@
 
 import fs from "fs";
 import path from "path";
+import { createHash } from "crypto";
 import { CompiledContract } from "@midnight-ntwrk/compact-js";
 import { pipe } from "effect";
 import { managedPath } from "./providers.js";
 
-export type ContractName = "pusdc" | "zkperp";
+export type ContractName = "pusdc" | "zkperp" | "leakprobe";
 
 /** The generated module for a contract: `Contract`, `ledger`, `pureCircuits`. */
 export async function contractModule(name: ContractName): Promise<any> {
@@ -29,21 +30,38 @@ export async function loadCompiledContract(name: ContractName) {
 }
 
 // ── deployment.json: where the contracts are ──────────────────────────────
+//
+// Each address is stored with a fingerprint of the compiled contract module.
+// A contract recompiled from changed source is a different contract — its
+// verifier keys no longer match the deployed ones — so a changed fingerprint
+// means "deploy again", never "reuse".
 
 const DEPLOYMENTS = path.join(process.cwd(), "deployment.json");
 
-type Deployments = Record<string, Partial<Record<ContractName, string>>>;
+interface DeploymentRecord {
+  address: string;
+  fingerprint: string;
+}
+type Deployments = Record<string, Partial<Record<ContractName, DeploymentRecord>>>;
 
 function readDeployments(): Deployments {
   return fs.existsSync(DEPLOYMENTS) ? JSON.parse(fs.readFileSync(DEPLOYMENTS, "utf8")) : {};
 }
 
+export function fingerprint(name: ContractName): string {
+  const file = path.join(managedPath(name), "contract", "index.js");
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 16);
+}
+
+/** The deployed address, if this network has one built from the current code. */
 export function getDeployment(networkId: string, name: ContractName): string | undefined {
-  return readDeployments()[networkId]?.[name];
+  const record = readDeployments()[networkId]?.[name];
+  if (!record || typeof record !== "object") return undefined;
+  return record.fingerprint === fingerprint(name) ? record.address : undefined;
 }
 
 export function saveDeployment(networkId: string, name: ContractName, address: string): void {
   const all = readDeployments();
-  all[networkId] = { ...all[networkId], [name]: address };
+  all[networkId] = { ...all[networkId], [name]: { address, fingerprint: fingerprint(name) } };
   fs.writeFileSync(DEPLOYMENTS, JSON.stringify(all, null, 2) + "\n");
 }

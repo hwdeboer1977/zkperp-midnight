@@ -21,7 +21,13 @@ import path from "path";
 const FILE = path.join(process.cwd(), ".zkperp", "positions.json");
 
 export interface PositionRecord {
-  status: "pending" | "open";
+  /**
+   * pending — written, open not yet confirmed; may or may not exist on chain.
+   * open    — the commitment is in the positions tree.
+   * failed  — the open was never accepted; nothing on chain to recover.
+   * closed  — settled; kept as a record, holds nothing spendable.
+   */
+  status: "pending" | "open" | "failed" | "closed";
   contractAddress: string;
   networkId: string;
   /** hex */
@@ -37,6 +43,7 @@ export interface PositionRecord {
   };
   createdAt: string;
   txHash?: string;
+  closeTxHash?: string;
 }
 
 function readAll(): PositionRecord[] {
@@ -52,10 +59,50 @@ export function recordPending(record: Omit<PositionRecord, "status" | "createdAt
   writeAll([...readAll(), { ...record, status: "pending", createdAt: new Date().toISOString() }]);
 }
 
+function update(commitment: string, patch: Partial<PositionRecord>): void {
+  writeAll(readAll().map((r) => (r.commitment === commitment ? { ...r, ...patch } : r)));
+}
+
 export function confirmOpen(commitment: string, txHash: string): void {
+  update(commitment, { status: "open", txHash });
+}
+
+export function markFailed(commitment: string): void {
+  update(commitment, { status: "failed" });
+}
+
+export function markClosed(commitment: string, closeTxHash: string): void {
+  update(commitment, { status: "closed", closeTxHash });
+}
+
+/**
+ * Settles `pending` records against the chain: a commitment in the tree was
+ * opened (the process died after submitting), one that is not never landed.
+ * Only safe once any in-flight open has finished, which is why it runs at
+ * start-up rather than concurrently with a trade, and why a record is only
+ * called failed once it is ten minutes old: an indexer running behind must not
+ * turn a real position into a "failed" one. Nothing is ever deleted — a
+ * mislabelled record still holds everything needed to close.
+ */
+export function reconcile(contractAddress: string, isInTree: (commitmentHex: string) => boolean): {
+  opened: number;
+  failed: number;
+} {
+  let opened = 0;
+  let failed = 0;
   writeAll(
-    readAll().map((r) => (r.commitment === commitment ? { ...r, status: "open", txHash } : r))
+    readAll().map((r) => {
+      if (r.status !== "pending" || r.contractAddress !== contractAddress) return r;
+      if (isInTree(r.commitment)) {
+        opened += 1;
+        return { ...r, status: "open" };
+      }
+      if (Date.now() - Date.parse(r.createdAt) < 10 * 60 * 1000) return r;
+      failed += 1;
+      return { ...r, status: "failed" };
+    })
   );
+  return { opened, failed };
 }
 
 export function positionsFile(): string {

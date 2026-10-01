@@ -49,6 +49,7 @@ const TRADER = key(0x30);
 const PRICE = 3_000_000_000n; // $3,000.000000
 const MAX_LEVERAGE = 50n;
 const MIN_COLLATERAL = 10_000_000n; // 10 pUSDC
+const MAX_PAYOUT = 100_000_000_000n; // 100,000 pUSDC: a 500k pool holds 4 positions
 
 const ADDRESS = sampleContractAddress();
 const contract = new Contract({});
@@ -60,7 +61,8 @@ const deploy = () =>
     pureCircuits.adminKey(ADMIN_SECRET),
     PRICE,
     MAX_LEVERAGE,
-    MIN_COLLATERAL
+    MIN_COLLATERAL,
+    MAX_PAYOUT
   ).currentContractState;
 
 /** Runs a circuit against `state`; reports rather than throws. */
@@ -198,6 +200,7 @@ const commitment = pureCircuits.positionCommitment(position);
 {
   expect("one position is counted", after.openPositions === 1n);
   expect("the pool is untouched by an open", after.poolValue === ledger(pooled).poolValue);
+  expect("an open reserves exactly maxPayout", after.reserved === MAX_PAYOUT, String(after.reserved));
   expect(
     "the trader's opening is in the positions tree",
     after.positions.findPathForLeaf(commitment) !== undefined
@@ -268,6 +271,156 @@ expect("the owner secret is not on chain", !found([hex(OWNER_SECRET)]));
 expect("the owner key is not on chain", !found([hex(position.owner)]));
 expect("the salt is not on chain", !found([hex(SALT)]));
 expect("the collateral coin nonce is not on chain", !found([hex(collateralCoin.nonce)]));
+
+
+// ── Closing ─────────────────────────────────────────────────────────────────
+
+console.log("\n  closing\n");
+
+const RECIPIENT = key(0x77);
+const qualified = { ...collateralCoin, mt_index: 0n };
+const pathFor = (state) => ledger(state).positions.findPathForLeaf(commitment);
+const at = (price) => {
+  const r = call(DEPLOYER, opened.state, "setPrice", price, ADMIN_SECRET);
+  if (!r.ok) throw new Error(r.error);
+  return r.state;
+};
+const close = (state, overrides = {}) => {
+  const o = { position, secret: OWNER_SECRET, coin: qualified, pnl: 0n, to: RECIPIENT, ...overrides };
+  return call(TRADER, state, "closeLong", o.position, o.secret, pathFor(state), o.coin, o.pnl, o.to);
+};
+const paidTo = (r, who) =>
+  r.zswap.outputs
+    .filter((o) => o.recipient.is_left && hex(o.recipient.left.bytes) === hex(who.bytes))
+    .reduce((sum, o) => sum + o.coinInfo.value, 0n);
+const toContract = (r) => r.zswap.outputs.filter((o) => !o.recipient.is_left);
+const floorDiv = (a, b) => a / b;
+const ceilDiv = (a, b) => (a + b - 1n) / b;
+
+// Unchanged price: the custody test. Full collateral back, pool untouched.
+const flat = close(opened.state);
+expect("close at an unchanged price is accepted", flat.ok, why(flat));
+if (flat.ok) {
+  const l = ledger(flat.state);
+  expect("the whole collateral goes to the recipient", paidTo(flat, RECIPIENT) === COLLATERAL, String(paidTo(flat, RECIPIENT)));
+  expect("nothing else is created", flat.zswap.outputs.length === 1);
+  expect("the pool is untouched", l.poolValue === after.poolValue);
+  expect("the close is counted", l.closedPositions === 1n);
+  expect(
+    "the nullifier is recorded",
+    l.closed.member(pureCircuits.positionNullifier(OWNER_SECRET, SALT))
+  );
+  const twice = close(flat.state);
+  expect("a position cannot close twice", !twice.ok && /already closed/.test(twice.error), why(twice));
+
+  // Privacy of the close itself.
+  const closeHaystack = [flat.state.toString(), render(flat.transcript)].join("\n").toLowerCase();
+  const inClose = (needles) => needles.some((s) => closeHaystack.includes(s.toLowerCase()));
+  expect(
+    "control: the close's nullifier is visible",
+    inClose([hex(pureCircuits.positionNullifier(OWNER_SECRET, SALT))])
+  );
+  expect("close: size is not published", !inClose(encodings(SIZE)));
+  expect("close: collateral is not published", !inClose(encodings(COLLATERAL)));
+  expect("close: the recipient's key is not published", !inClose([hex(RECIPIENT.bytes)]));
+  expect("close: the owner secret is not published", !inClose([hex(OWNER_SECRET)]));
+  expect("close: the salt is not published", !inClose([hex(SALT)]));
+  expect("close: the collateral nonce is not published", !inClose([hex(collateralCoin.nonce)]));
+}
+
+{
+  const stranger = close(opened.state, { secret: bytes32(0x99) });
+  expect("a wrong owner secret cannot close", !stranger.ok && /not the owner/.test(stranger.error), why(stranger));
+  const otherCoin = close(opened.state, { coin: { ...qualified, nonce: bytes32(0x42) } });
+  expect("a different collateral coin is refused", !otherCoin.ok && /not this position's collateral/.test(otherCoin.error), why(otherCoin));
+  const forged = close(opened.state, { position: { ...position, size: SIZE * 2n } });
+  expect("an altered opening is not in the tree", !forged.ok, why(forged));
+  const greedy = close(opened.state, { pnl: 1n });
+  expect("a profit at an unchanged price is refused", !greedy.ok && /profit overstated/.test(greedy.error), why(greedy));
+}
+
+// ── Solvency ────────────────────────────────────────────────────────────────
+{
+  expect("a close releases the reservation", flat.ok && ledger(flat.state).reserved === 0n);
+
+  // 500k pool, 100k per position: four fit (400k < 500k), a fifth does not.
+  let state = pooled;
+  let accepted = 0;
+  let refusal = "";
+  for (let i = 0; i < 5; i += 1) {
+    const r = call(TRADER, state, "openLong", coin(COLLATERAL), SIZE, OWNER_SECRET, bytes32(0xa0 + i));
+    if (r.ok) {
+      accepted += 1;
+      state = r.state;
+    } else refusal = r.error;
+  }
+  expect("four 100k reservations fit a 500k pool", accepted === 4, `${accepted} accepted`);
+  expect("the fifth is refused while reserved would reach the pool", /no room/.test(refusal), refusal);
+  expect("reserved is positions × maxPayout", ledger(state).reserved === 4n * MAX_PAYOUT);
+
+  // Price ×10: the raw profit (9 × size ≈ 111k) exceeds the 100k cap.
+  const moon = at(30_000_000_000n);
+  const raw = floorDiv(SIZE * 27_000_000_000n, PRICE);
+  expect("(the raw profit here is above the cap)", raw > MAX_PAYOUT);
+  const uncapped = close(moon, { pnl: raw });
+  expect("a profit above the cap is refused", !uncapped.ok && /payout cap/.test(uncapped.error), why(uncapped));
+  const underCap = close(moon, { pnl: MAX_PAYOUT - 1n });
+  expect("less than the cap is refused when the cap binds", !underCap.ok && /understated/.test(underCap.error), why(underCap));
+  const capped = close(moon, { pnl: MAX_PAYOUT });
+  expect("the capped profit is paid — an enforced take-profit", capped.ok, why(capped));
+  if (capped.ok) {
+    expect("the recipient gets collateral plus exactly the cap", paidTo(capped, RECIPIENT) === COLLATERAL + MAX_PAYOUT);
+    expect("the pool pays exactly the cap", ledger(capped.state).poolValue === after.poolValue - MAX_PAYOUT);
+    expect("the reservation is released", ledger(capped.state).reserved === 0n);
+  }
+}
+
+// Price up 10%: profit = floor(size × 300 / 3000), paid by the pool.
+{
+  const up = at(3_300_000_000n);
+  const profit = floorDiv(SIZE * 300_000_000n, PRICE);
+  const over = close(up, { pnl: profit + 1n });
+  expect("an overstated profit is refused", !over.ok && /overstated/.test(over.error), why(over));
+  const under = close(up, { pnl: profit - 1n });
+  expect("an understated profit is refused", !under.ok && /understated/.test(under.error), why(under));
+  const win = close(up, { pnl: profit });
+  expect("a winning long closes", win.ok, why(win));
+  if (win.ok) {
+    expect(
+      "the recipient gets collateral plus profit",
+      paidTo(win, RECIPIENT) === COLLATERAL + profit,
+      `${paidTo(win, RECIPIENT)} vs ${COLLATERAL + profit}`
+    );
+    expect("the pool pays exactly the profit", ledger(win.state).poolValue === after.poolValue - profit);
+    expect("the pool keeps its change", toContract(win).length === 1 && toContract(win)[0].coinInfo.value === after.poolValue - profit);
+  }
+}
+
+// Price down 5%: loss = ceil(size × 150 / 3000), kept by the pool.
+{
+  const down = at(2_850_000_000n);
+  const loss = ceilDiv(SIZE * 150_000_000n, PRICE);
+  const low = close(down, { pnl: loss - 1n });
+  expect("an understated loss is refused", !low.ok && /loss understated/.test(low.error), why(low));
+  const lose = close(down, { pnl: loss });
+  expect("a losing long closes", lose.ok, why(lose));
+  if (lose.ok) {
+    expect("the recipient gets collateral minus loss", paidTo(lose, RECIPIENT) === COLLATERAL - loss);
+    expect("the pool gains exactly the loss", ledger(lose.state).poolValue === after.poolValue + loss);
+  }
+}
+
+// Price down 20% at ~10x: the loss exceeds the collateral.
+{
+  const crash = at(2_400_000_000n);
+  const loss = ceilDiv(SIZE * 600_000_000n, PRICE);
+  const wiped = close(crash, { pnl: loss });
+  expect("a wiped-out long closes", wiped.ok, why(wiped));
+  if (wiped.ok) {
+    expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
+    expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === after.poolValue + COLLATERAL);
+  }
+}
 
 console.log(failures ? `\n${failures} failure(s)\n` : "\nall passed\n");
 process.exit(failures ? 1 : 0);

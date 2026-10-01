@@ -43,14 +43,33 @@ import CompactStandardLibrary;
 // and the position commitment binds them, so only the trader can later name
 // it to be spent.
 //
-// ⚠️ NOT YET MODELLED — the pool does not reserve liquidity for open positions.
-// GMX locks `size` worth of pool assets per position so profits are always
-// payable. Doing that here means writing a per-position number to a public
-// field, which publishes the size this contract exists to hide. Until there is
-// a private way to do it (bucketed reservations, or a proven aggregate), the
-// pool can in principle owe more than it holds.
+// ── Solvency without per-position numbers ──────────────────────────────────
 //
-// Not yet here: close, liquidation, shorts, fees, funding and LP withdrawal.
+// GMX reserves `size` worth of pool assets per position so profits are always
+// payable. Here that would publish every size. Instead, every position's
+// profit is capped at one public constant, `maxPayout` — an enforced
+// take-profit — and every open reserves exactly that much, whatever the real
+// size. The reservation says nothing about the position; the total is just
+// (live positions × maxPayout), and the position count is public anyway.
+//
+// Invariant: poolValue > reserved. An open that would break it is refused. A
+// close pays at most maxPayout and releases maxPayout, and a loss only adds to
+// the pool, so every open position's profit is always payable.
+//
+// Why a constant cap and not k × collateral: a position that hits a cap is
+// paid exactly the cap, publicly, so a collateral-relative cap publishes the
+// collateral whenever it binds. A constant one publishes only that it bound.
+// The price is capital efficiency: the pool must hold maxPayout per position.
+//
+// ⚠️ Closing publishes the PnL. Profit leaves the public pool and a loss
+// enters it, so the pool's change IS the position's PnL. Opens and closes are
+// unlinkable (a close names a nullifier, not a leaf), and the entry price is
+// not published at close — but PnL = size × (exit − entry) / entry, so an
+// observer who guesses the entry from the price history narrows the size to a
+// few candidates. A close at an unchanged price moves nothing and reveals
+// nothing beyond "a position closed".
+//
+// Not yet here: liquidation, shorts, fees, funding and LP withdrawal.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
 
@@ -65,6 +84,10 @@ export sealed ledger maxLeverage: Uint<8>;
 
 // Smallest collateral a position may post, in pUSDC minor units.
 export sealed ledger minCollateral: Uint<64>;
+
+// The most any position can win, in pUSDC minor units, and so the liquidity
+// each open position reserves. See "Solvency" above.
+export sealed ledger maxPayout: Uint<64>;
 
 // ── Oracle ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +110,10 @@ export ledger poolValue: Uint<64>;
 export ledger lpToken: Bytes<32>;
 export ledger lpSupply: Uint<64>;
 export ledger lpMintCounter: Counter;
+
+// Pool liquidity set aside for open positions: maxPayout per position.
+// Always less than `poolValue`.
+export ledger reserved: Uint<64>;
 
 // ── Positions ──────────────────────────────────────────────────────────────
 
@@ -114,12 +141,17 @@ export ledger positions: HistoricMerkleTree<20, Bytes<32>>;
 // transaction anyone can see.
 export ledger openPositions: Counter;
 
+// Nullifiers of closed positions; see `positionNullifier`.
+export ledger closed: Set<Bytes<32>>;
+export ledger closedPositions: Counter;
+
 constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
   initialPrice: Uint<64>,
   leverageCap: Uint<8>,
-  collateralFloor: Uint<64>
+  collateralFloor: Uint<64>,
+  payoutCap: Uint<64>
 ) {
   usdc = disclose(usdcToken);
   admin = disclose(adminCommitment);
@@ -128,6 +160,8 @@ constructor(
   assert(disclose(leverageCap) >= 1, "leverage cap must be at least 1x");
   maxLeverage = disclose(leverageCap);
   minCollateral = disclose(collateralFloor);
+  assert(disclose(payoutCap) > 0, "the payout cap must be positive");
+  maxPayout = disclose(payoutCap);
   lpToken = default<Bytes<32>>;
 }
 
@@ -143,6 +177,14 @@ export pure circuit ownerKey(secret: Bytes<32>): Bytes<32> {
 
 export pure circuit positionCommitment(p: Position): Bytes<32> {
   return persistentHash<Position>(p);
+}
+
+// Published when a position closes, so it cannot close twice. Derived from the
+// owner secret and the salt — neither of which anyone else knows — so it cannot
+// be matched to the commitment it retires. That unlinkability is why a close
+// proves membership in `positions` instead of naming a leaf.
+export pure circuit positionNullifier(ownerSecret: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "zkperp:nullifier"), ownerSecret, salt]);
 }
 
 // ── Mock oracle ────────────────────────────────────────────────────────────
@@ -238,6 +280,11 @@ export circuit openLong(
   assert(size >= collateral, "size below collateral: leverage under 1x");
   assert(size <= collateral * maxLeverage, "leverage above the maximum");
 
+  // A constant reservation, so it tells nobody anything about this position.
+  const nextReserved = reserved + maxPayout;
+  assert(nextReserved < poolValue, "the pool has no room for another position");
+  reserved = nextReserved as Uint<64>;
+
   receiveShielded(disclose(coin));
 
   const position = Position {
@@ -251,4 +298,121 @@ export circuit openLong(
   };
   positions.insert(disclose(positionCommitment(position)));
   openPositions.increment(1);
+}
+
+// Closes a long at the current mark price and settles against the pool.
+//
+// The caller proves, without saying which, that `position` is in `positions`
+// and that they hold its owner secret. They then name the collateral coin the
+// position committed to — nonce, value and Merkle index, which only they know
+// — and the contract spends it:
+//
+//   profit       collateral back in full, plus the profit (at most
+//                maxPayout) out of the pool;
+//   loss < coll. collateral minus the loss back, the loss merged into the pool;
+//   loss ≥ coll. the whole collateral merged into the pool, nothing back.
+//
+// `pnl` is |PnL| in pUSDC minor units, computed by the caller because circuits
+// cannot divide, and pinned here: a profit must be min(floor(size × Δ / entry),
+// maxPayout) and a loss ceil(size × Δ / entry), each in the pool's favour.
+//
+// `recipient` receives the payout. It is disclosed to build the output, but a
+// shielded output carries only a commitment, so it is not linkable to the key.
+export circuit closeLong(
+  position: Position,
+  ownerSecret: Bytes<32>,
+  path: MerkleTreePath<20, Bytes<32>>,
+  collateral: QualifiedShieldedCoinInfo,
+  pnl: Uint<64>,
+  recipient: ZswapCoinPublicKey
+): [] {
+  assert(position.isLong, "not a long");
+  assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
+  assert(path.leaf == positionCommitment(position), "path is for a different position");
+  assert(
+    positions.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(path))),
+    "no such position"
+  );
+
+  const nullifier = disclose(positionNullifier(ownerSecret, position.salt));
+  assert(!closed.member(nullifier), "position already closed");
+  closed.insert(nullifier);
+
+  // The coin must be the one this position committed to, or a trader could
+  // close their position against someone else's collateral.
+  assert(collateral.nonce == position.collateralNonce, "not this position's collateral coin");
+  assert(disclose(collateral.color) == usdc, "collateral must be pUSDC");
+  assert(collateral.value == position.collateral as Uint<128>, "collateral coin value does not match");
+
+  const exit = markPrice;
+  const entry = position.entryPrice;
+  const payTo = left<ZswapCoinPublicKey, ContractAddress>(disclose(recipient));
+  const coin = disclose(collateral);
+  const amount = disclose(pnl);
+
+  // PnL is checked against the price move in both directions. Each pair only
+  // binds when its direction is the real one; see the note below on branches.
+  const isProfit = disclose(exit >= entry);
+  if (isProfit) {
+    const gain = position.size * (exit - entry);
+    assert(pnl <= maxPayout, "profit above the payout cap");
+    assert(pnl * entry <= gain, "profit overstated");
+    // Exact, unless capped: the cap is an enforced take-profit.
+    assert(pnl == maxPayout || (pnl + 1) * entry > gain, "profit understated");
+  } else {
+    const drop = position.size * (entry - exit);
+    assert(pnl * entry >= drop, "loss understated");
+    assert(pnl * entry < drop + entry, "loss overstated");
+  }
+  // Wiped out: the loss reaches the collateral. The pool's change publishes
+  // the collateral here — the one case where it becomes public, since all of
+  // it is the loss.
+  const wiped = disclose(!isProfit && pnl >= position.collateral);
+
+  // ⚠️ Why the amounts are chosen here, before any branch, and why `pool` is
+  // read once up front.
+  //
+  // In the proof, EVERY branch of an `if` is evaluated; only the taken one's
+  // effects are kept. A ledger read inside an untaken branch yields a default
+  // (a zero-value coin), and a value that goes negative there is still fed to
+  // the coin-commitment hash — which then rejects the whole proof ("Inputs did
+  // not match alignment"), though that branch never ran. The JS runtime runs
+  // only the taken branch, so local tests cannot see it; the first devnet loss
+  // close failed exactly this way (0 − loss as a pool change).
+  //
+  // So each stdlib call below gets values that are in range whichever branch
+  // is taken: profit and loss amounts are selected, not recomputed per branch,
+  // and neither exceeds what it is subtracted from.
+  const poolCoin = pool;
+  const profitAmt: Uint<64> = isProfit ? amount : 0;
+  // Disclosed: in a wipe-out it IS the collateral, which the pool's change
+  // publishes anyway; otherwise it is `amount`, already public.
+  const lossAmt: Uint<64> = disclose(isProfit ? 0 : (wiped ? position.collateral : amount));
+  // Holds by the reservation invariant (profit ≤ maxPayout ≤ reserved <
+  // poolValue); checked anyway, since a send of the whole pool would leave no
+  // coin to write back.
+  assert(profitAmt < poolValue, "the pool cannot pay this profit");
+
+  if (isProfit) {
+    // The whole coin, so there is no change to strand.
+    sendShielded(coin, payTo, coin.value);
+    if (profitAmt > 0) {
+      const paid = sendShielded(poolCoin, payTo, profitAmt as Uint<128>);
+      pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+    }
+  } else if (wiped) {
+    pool.writeCoin(
+      mergeCoin(poolCoin, coin),
+      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+    );
+  } else {
+    const back = sendShielded(coin, payTo, coin.value - lossAmt);
+    pool.writeCoin(
+      mergeCoinImmediate(poolCoin, back.change.value),
+      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+    );
+  }
+  poolValue = (poolValue + lossAmt - profitAmt) as Uint<64>;
+  reserved = (reserved - maxPayout) as Uint<64>;
+  closedPositions.increment(1);
 }
