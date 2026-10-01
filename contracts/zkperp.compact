@@ -10,8 +10,9 @@ import CompactStandardLibrary;
 //
 // As in GMX v1, there is no order book and no counterparty trader. Liquidity
 // providers deposit pUSDC into one pool and receive zLP shares; the pool is the
-// counterparty to every position. When a long closes in profit the pool pays
-// the profit; when it closes at a loss the pool keeps the collateral lost.
+// counterparty to every position, long or short. When a position closes in
+// profit the pool pays the profit; when it closes at a loss the pool keeps
+// the collateral lost.
 // Prices come from an oracle (here: a mock, set by the admin).
 //
 // Pool and positions live in ONE contract because they have to: a Midnight
@@ -28,6 +29,10 @@ import CompactStandardLibrary;
 //
 // PRIVATE — never on chain in any form a reader can recover:
 //   · the position's size, collateral and leverage;
+//   · its direction, at open. Longs and shorts open through one circuit and
+//     differ only inside the commitment. At close the direction follows from
+//     whether the pool paid or gained and which way the price moved, unless
+//     the price did not move.
 //   · who owns it. The owner is a hash of a secret only the trader holds, not
 //     a wallet key, so positions are not linkable to each other or to the
 //     trader's other activity through the ledger.
@@ -70,7 +75,7 @@ import CompactStandardLibrary;
 // few candidates. A close at an unchanged price moves nothing and reveals
 // nothing beyond "a position closed".
 //
-// Not yet here: liquidation, shorts, fees and funding.
+// Not yet here: liquidation, fees and funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
 
@@ -122,6 +127,7 @@ export ledger reserved: Uint<64>;
 export struct Position {
   // `ownerKey(secret)`: proves ownership at close without naming a wallet.
   owner: Bytes<32>;
+  // Long profits when the price rises, short when it falls.
   isLong: Boolean;
   // Notional, in pUSDC minor units. Size / collateral is the leverage.
   size: Uint<64>;
@@ -287,7 +293,7 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
 
   receiveShielded(c);
 
-  // As in closeLong: both branches below are evaluated in the proof, so the
+  // As in closePosition: both branches below are evaluated in the proof, so the
   // send happens before the branch and each branch only writes the result.
   // When the whole pool leaves there is no change; the untaken writeCoin then
   // sees a zero-value default coin, which is in range.
@@ -307,9 +313,11 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
 
 // ── Trading ────────────────────────────────────────────────────────────────
 
-// Opens a long at the current mark price, with `coin` as collateral.
+// Opens a long or a short at the current mark price, with `coin` as
+// collateral.
 //
-// `size`, `ownerSecret` and `salt` are circuit arguments, which are private:
+// `size`, `isLong`, `ownerSecret` and `salt` are circuit arguments, which are
+// private:
 // they reach the proof, not the transaction. So do the coin's value and nonce.
 // What leaves this circuit is the commitment and the collateral coin's Zswap
 // commitment, both hiding.
@@ -317,9 +325,10 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
 // The trader must keep the opening — every field of `Position` — or the
 // position can never be closed. It is not recoverable from the chain; that is
 // the point.
-export circuit openLong(
+export circuit openPosition(
   coin: ShieldedCoinInfo,
   size: Uint<64>,
+  isLong: Boolean,
   ownerSecret: Bytes<32>,
   salt: Bytes<32>
 ): [] {
@@ -345,7 +354,7 @@ export circuit openLong(
 
   const position = Position {
     owner: ownerKey(ownerSecret),
-    isLong: true,
+    isLong: isLong,
     size: size,
     collateral: collateral,
     entryPrice: markPrice,
@@ -356,7 +365,7 @@ export circuit openLong(
   openPositions.increment(1);
 }
 
-// Closes a long at the current mark price and settles against the pool.
+// Closes a position at the current mark price and settles against the pool.
 //
 // The caller proves, without saying which, that `position` is in `positions`
 // and that they hold its owner secret. They then name the collateral coin the
@@ -368,13 +377,15 @@ export circuit openLong(
 //   loss < coll. collateral minus the loss back, the loss merged into the pool;
 //   loss ≥ coll. the whole collateral merged into the pool, nothing back.
 //
-// `pnl` is |PnL| in pUSDC minor units, computed by the caller because circuits
-// cannot divide, and pinned here: a profit must be min(floor(size × Δ / entry),
-// maxPayout) and a loss ceil(size × Δ / entry), each in the pool's favour.
+// A long profits when the price rose, a short when it fell; at an unchanged
+// price both are flat. `pnl` is |PnL| in pUSDC minor units, computed by the
+// caller because circuits cannot divide, and pinned here: with Δ = |exit −
+// entry|, a profit must be min(floor(size × Δ / entry), maxPayout) and a loss
+// ceil(size × Δ / entry), each in the pool's favour.
 //
 // `recipient` receives the payout. It is disclosed to build the output, but a
 // shielded output carries only a commitment, so it is not linkable to the key.
-export circuit closeLong(
+export circuit closePosition(
   position: Position,
   ownerSecret: Bytes<32>,
   path: MerkleTreePath<20, Bytes<32>>,
@@ -382,7 +393,6 @@ export circuit closeLong(
   pnl: Uint<64>,
   recipient: ZswapCoinPublicKey
 ): [] {
-  assert(position.isLong, "not a long");
   assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
   assert(path.leaf == positionCommitment(position), "path is for a different position");
   assert(
@@ -406,19 +416,24 @@ export circuit closeLong(
   const coin = disclose(collateral);
   const amount = disclose(pnl);
 
-  // PnL is checked against the price move in both directions. Each pair only
-  // binds when its direction is the real one; see the note below on branches.
-  const isProfit = disclose(exit >= entry);
+  // The move's size, whichever way it went; its direction only decides who
+  // is paid. Disclosed: whether the trader won is what the pool's change
+  // publishes anyway.
+  const rose = exit >= entry;
+  const move = rose ? exit - entry : entry - exit;
+  const delta = position.size * move;
+  const isProfit = disclose(position.isLong ? rose : exit <= entry);
+
+  // PnL is checked against the move in both directions. Each pair only binds
+  // when its direction is the real one; see the note below on branches.
   if (isProfit) {
-    const gain = position.size * (exit - entry);
     assert(pnl <= maxPayout, "profit above the payout cap");
-    assert(pnl * entry <= gain, "profit overstated");
+    assert(pnl * entry <= delta, "profit overstated");
     // Exact, unless capped: the cap is an enforced take-profit.
-    assert(pnl == maxPayout || (pnl + 1) * entry > gain, "profit understated");
+    assert(pnl == maxPayout || (pnl + 1) * entry > delta, "profit understated");
   } else {
-    const drop = position.size * (entry - exit);
-    assert(pnl * entry >= drop, "loss understated");
-    assert(pnl * entry < drop + entry, "loss overstated");
+    assert(pnl * entry >= delta, "loss understated");
+    assert(pnl * entry < delta + entry, "loss overstated");
   }
   // Wiped out: the loss reaches the collateral. The pool's change publishes
   // the collateral here — the one case where it becomes public, since all of

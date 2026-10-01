@@ -10,16 +10,17 @@
  *
  * CUSTODY — does collateral come back out?
  *   The contract never records a position's collateral coin; only the trader
- *   knows its nonce. This opens a long and closes it at an unchanged price,
- *   and requires the trader's pUSDC balance to return to exactly where it was.
+ *   knows its nonce. This opens a long and a short and closes each at an
+ *   unchanged price, and requires the trader's pUSDC balance to return to exactly where it was.
  *
  * SOLVENCY — every open reserves the constant `maxPayout` and every close
  *   releases it; a profit beyond the cap is paid exactly the cap.
  *
- * PNL — does the pool settle both ways?
- *   Opens, moves the price up 10%, closes: the trader gains exactly the
- *   profit and the pool loses exactly that. Then the same with the price down
- *   5%: the trader loses exactly the loss and the pool gains it.
+ * PNL — does the pool settle both ways, for both directions?
+ *   Opens, moves the price, closes: the trader gains exactly the profit and
+ *   the pool loses exactly that, or the trader loses exactly the loss and the
+ *   pool gains it. Every settlement path, once for a long and once for a
+ *   short, mirrored: a short's profit is a long's loss.
  *
  * LIQUIDITY — can LPs get out, and only what is not reserved?
  *   Redeems a tenth of the dev wallet's zLP; is refused emptying the pool
@@ -41,7 +42,7 @@ import { buildWallet, makeWalletProviders, waitForSync, type BuiltWallet } from 
 import { makeProviders } from "./providers.js";
 import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
 import { readyTrader, traderSeed } from "./trader.js";
-import { closeLong, longPnl, openLong, readLedger, type ContractHandle } from "./perp.js";
+import { closePosition, openPosition, positionPnl, readLedger, type ContractHandle } from "./perp.js";
 import { positionsFile, reconcile } from "./positions.js";
 import { redeemable, removeLiquidity } from "./pool.js";
 import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
@@ -169,15 +170,16 @@ async function main() {
     info(`pool ${fmt((await readLedger(devPerp)).poolValue)} pUSDC at $${fmt(PRICE)}`);
 
     // ── Step 3: custody ───────────────────────────────────────────────────
-    section = "custody";
-    step("Custody — open and close at an unchanged price");
-    {
+    for (const isLong of [true, false]) {
+      const dir = isLong ? "long" : "short";
+      section = `custody, ${dir}`;
+      step(`Custody — open and close a ${dir} at an unchanged price`);
       const before = await balance(trader.wallet, usdc);
       const poolBefore = (await readLedger(devPerp)).poolValue;
       const devBefore = await balance(dev.wallet, usdc);
 
       const reservedBefore = (await readLedger(devPerp)).reserved;
-      const opened = await openLong(trader.perp, usdc, COLLATERAL, SIZE, network.networkId);
+      const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened ${opened.txHash}`);
       check(
         "the open reserved exactly maxPayout — the same for every position",
@@ -187,7 +189,7 @@ async function main() {
       check(`the trader paid exactly the collateral (${fmt(before)} → ${fmt(whileOpen)})`, before - whileOpen === COLLATERAL);
       await privacy("open", opened.txHash, trader, opened.record, perpAddress, usdc);
 
-      const closed = await closeLong(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
       info(`closed ${closed.txHash}`);
       const afterClose = await waitForBalance(trader.wallet, usdc, (b) => b > whileOpen);
       check(`the collateral came back in full (${fmt(whileOpen)} → ${fmt(afterClose)})`, afterClose === before);
@@ -198,29 +200,35 @@ async function main() {
     }
 
     // ── Step 4: PnL against the pool ──────────────────────────────────────
-    for (const [label, exit] of [
-      ["profit — price up 10%", 3_300_000_000n],
-      ["loss — price down 5%", 2_850_000_000n],
+    for (const [label, isLong, exit] of [
+      ["long profit — price up 10%", true, 3_300_000_000n],
+      ["long loss — price down 5%", true, 2_850_000_000n],
       // Each of these exercises a branch combination that only the real
       // circuit can check: the JS runtime skips untaken branches, the proof
-      // does not (see the note in closeLong).
-      ["profit above the collateral — price up 25%", 3_750_000_000n],
-      ["wipe-out — price down 20%", 2_400_000_000n],
+      // does not (see the note in closePosition).
+      ["long profit above the collateral — price up 25%", true, 3_750_000_000n],
+      ["long wipe-out — price down 20%", true, 2_400_000_000n],
       // Raw profit ≈ 6,173 pUSDC; the cap pays 5,000 — an enforced take-profit.
-      ["payout cap — price up 50%", 4_500_000_000n],
+      ["long payout cap — price up 50%", true, 4_500_000_000n],
+      // The same paths for a short, with the price moving the other way.
+      ["short profit — price down 10%", false, 2_700_000_000n],
+      ["short loss — price up 5%", false, 3_150_000_000n],
+      ["short profit above the collateral — price down 25%", false, 2_250_000_000n],
+      ["short wipe-out — price up 20%", false, 3_600_000_000n],
+      ["short payout cap — price down 50%", false, 1_500_000_000n],
     ] as const) {
       section = label;
       step(`PnL, ${label}`);
       await setPrice(devPerp, PRICE, adminSecret);
       const before = await balance(trader.wallet, usdc);
-      const opened = await openLong(trader.perp, usdc, COLLATERAL, SIZE, network.networkId);
+      const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened at $${fmt(PRICE)}: ${opened.txHash}`);
       const whileOpen = await waitForBalance(trader.wallet, usdc, (b) => b < before);
 
       await setPrice(devPerp, exit, adminSecret);
       const poolBefore = (await readLedger(devPerp)).poolValue;
-      const closed = await closeLong(trader.perp, opened.record, usdc, trader.coinPublicKey);
-      const expected = longPnl(SIZE, PRICE, exit, MAX_PAYOUT);
+      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      const expected = positionPnl(isLong, SIZE, PRICE, exit, MAX_PAYOUT);
       info(`closed at $${fmt(exit)}: ${closed.txHash}`);
       info(`${closed.profit ? "profit" : "loss"} ${fmt(closed.pnl)} pUSDC${closed.capped ? " (capped at maxPayout)" : ""}`);
       check(
@@ -229,7 +237,7 @@ async function main() {
           : "the PnL is size × Δprice / entry, rounded for the pool",
         closed.pnl === expected.pnl && closed.profit === expected.profit && closed.capped === expected.capped
       );
-      if (label.startsWith("payout cap")) check("the cap bound, as intended", closed.capped);
+      if (label.includes("payout cap")) check("the cap bound, as intended", closed.capped);
 
       // A loss beyond the collateral costs only the collateral.
       const signed = closed.profit ? closed.pnl : -(closed.pnl < COLLATERAL ? closed.pnl : COLLATERAL);
@@ -273,7 +281,7 @@ async function main() {
       check("the LP's zLP balance drops by them", (await waitForBalance(dev.wallet, lpToken, (b) => b < shares)) === shares - part);
 
       // An open position reserves maxPayout: the pool cannot be emptied.
-      const opened = await openLong(trader.perp, usdc, COLLATERAL, SIZE, network.networkId);
+      const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, true, network.networkId);
       info(`opened ${opened.txHash}`);
       let refusal = "";
       try {
@@ -282,7 +290,7 @@ async function main() {
         refusal = String(error instanceof Error ? error.message : error);
       }
       check("emptying the pool is refused while a position is open", /reserved for open positions/.test(refusal));
-      await closeLong(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
       info("closed it at an unchanged price");
 
       // Nothing open: the last LP may take everything.

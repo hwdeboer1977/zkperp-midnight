@@ -115,7 +115,7 @@ const genesis = deploy().data;
 
 // ── Trading needs a pool ────────────────────────────────────────────────────
 {
-  const early = call(TRADER, genesis, "openLong", coin(100_000_000n), 1_000_000_000n, bytes32(1), bytes32(2));
+  const early = call(TRADER, genesis, "openPosition", coin(100_000_000n), 1_000_000_000n, true, bytes32(1), bytes32(2));
   expect("no long can open against an empty pool", !early.ok && /no liquidity/.test(early.error), why(early));
 }
 
@@ -166,20 +166,20 @@ const OWNER_SECRET = bytes32(0x5e);
 const SALT = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 
 {
-  const tooMuch = call(TRADER, pooled, "openLong", coin(COLLATERAL), COLLATERAL * 51n, OWNER_SECRET, SALT);
+  const tooMuch = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 51n, true, OWNER_SECRET, SALT);
   expect("51x is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
-  const atCap = call(TRADER, pooled, "openLong", coin(COLLATERAL), COLLATERAL * 50n, OWNER_SECRET, SALT);
+  const atCap = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 50n, true, OWNER_SECRET, SALT);
   expect("50x is accepted", atCap.ok, why(atCap));
-  const under = call(TRADER, pooled, "openLong", coin(COLLATERAL), COLLATERAL - 1n, OWNER_SECRET, SALT);
+  const under = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL - 1n, true, OWNER_SECRET, SALT);
   expect("under 1x is refused", !under.ok && /under 1x/.test(under.error), why(under));
-  const small = call(TRADER, pooled, "openLong", coin(MIN_COLLATERAL - 1n), MIN_COLLATERAL, OWNER_SECRET, SALT);
+  const small = call(TRADER, pooled, "openPosition", coin(MIN_COLLATERAL - 1n), MIN_COLLATERAL, true, OWNER_SECRET, SALT);
   expect("collateral below the minimum is refused", !small.ok && /below the minimum/.test(small.error), why(small));
-  const other = call(TRADER, pooled, "openLong", coin(COLLATERAL, OTHER_TOKEN), SIZE, OWNER_SECRET, SALT);
+  const other = call(TRADER, pooled, "openPosition", coin(COLLATERAL, OTHER_TOKEN), SIZE, true, OWNER_SECRET, SALT);
   expect("collateral that is not pUSDC is refused", !other.ok && /must be pUSDC/.test(other.error), why(other));
 }
 
 const collateralCoin = coin(COLLATERAL);
-const opened = call(TRADER, pooled, "openLong", collateralCoin, SIZE, OWNER_SECRET, SALT);
+const opened = call(TRADER, pooled, "openPosition", collateralCoin, SIZE, true, OWNER_SECRET, SALT);
 expect("a 10x long opens", opened.ok, why(opened));
 if (!opened.ok) {
   console.error(`\n${failures} failure(s)\n`);
@@ -287,7 +287,7 @@ const at = (price) => {
 };
 const close = (state, overrides = {}) => {
   const o = { position, secret: OWNER_SECRET, coin: qualified, pnl: 0n, to: RECIPIENT, ...overrides };
-  return call(TRADER, state, "closeLong", o.position, o.secret, pathFor(state), o.coin, o.pnl, o.to);
+  return call(TRADER, state, "closePosition", o.position, o.secret, pathFor(state), o.coin, o.pnl, o.to);
 };
 const paidTo = (r, who) =>
   r.zswap.outputs
@@ -348,7 +348,7 @@ if (flat.ok) {
   let accepted = 0;
   let refusal = "";
   for (let i = 0; i < 5; i += 1) {
-    const r = call(TRADER, state, "openLong", coin(COLLATERAL), SIZE, OWNER_SECRET, bytes32(0xa0 + i));
+    const r = call(TRADER, state, "openPosition", coin(COLLATERAL), SIZE, true, OWNER_SECRET, bytes32(0xa0 + i));
     if (r.ok) {
       accepted += 1;
       state = r.state;
@@ -422,6 +422,137 @@ let afterLoss;
     expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
     expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === after.poolValue + COLLATERAL);
   }
+}
+
+// ── Shorts ──────────────────────────────────────────────────────────────────
+
+console.log("\n  shorts\n");
+
+const shortCoin = coin(COLLATERAL);
+const SHORT_SALT = bytes32(0x5a);
+const shortPosition = { ...position, isLong: false, collateralNonce: shortCoin.nonce, salt: SHORT_SALT };
+const shortCommitment = pureCircuits.positionCommitment(shortPosition);
+const shortOpened = call(TRADER, pooled, "openPosition", shortCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
+expect("a 10x short opens", shortOpened.ok, why(shortOpened));
+
+{
+  const tooMuch = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 51n, false, OWNER_SECRET, SALT);
+  expect("a 51x short is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
+  const l = ledger(shortOpened.state);
+  expect("a short reserves the same maxPayout as a long", l.reserved === MAX_PAYOUT);
+  expect("the short's opening is in the tree", l.positions.findPathForLeaf(shortCommitment) !== undefined);
+  expect(
+    "a short's commitment differs from the same long's",
+    hex(shortCommitment) !== hex(pureCircuits.positionCommitment({ ...shortPosition, isLong: true }))
+  );
+
+  // Direction privacy: the same open as a long and as a short must leave the
+  // same public footprint, except for values derived from the commitment.
+  const sameCoin = { ...shortCoin };
+  const asLong = call(TRADER, pooled, "openPosition", sameCoin, SIZE, true, OWNER_SECRET, SHORT_SALT);
+  const asShort = call(TRADER, pooled, "openPosition", sameCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
+  const ta = asLong.transcript.map((op) => render(op));
+  const tb = asShort.transcript.map((op) => render(op));
+  const differing = ta.flatMap((op, i) => (op === tb[i] ? [] : [op]));
+  expect("long and short opens publish the same number of operations", ta.length === tb.length, `${ta.length} vs ${tb.length}`);
+  // The one value that may differ is the new leaf, 32 bytes derived from the
+  // commitment. A second differing operation would tell the directions apart.
+  expect(
+    "they differ in one operation only: the 32-byte leaf",
+    differing.length === 1 && /bytes,length:32/.test(differing[0]),
+    differing.join("\n")
+  );
+  const outsA = asLong.zswap.outputs.map((o) => render(o)).join();
+  const outsB = asShort.zswap.outputs.map((o) => render(o)).join();
+  expect("their coin outputs are identical", outsA === outsB);
+}
+
+const shortAt = (price) => {
+  const r = call(DEPLOYER, shortOpened.state, "setPrice", price, ADMIN_SECRET);
+  if (!r.ok) throw new Error(r.error);
+  return r.state;
+};
+const closeShort = (state, overrides = {}) => {
+  const o = {
+    position: shortPosition,
+    secret: OWNER_SECRET,
+    coin: { ...shortCoin, mt_index: 0n },
+    pnl: 0n,
+    to: RECIPIENT,
+    ...overrides,
+  };
+  const path = ledger(state).positions.findPathForLeaf(pureCircuits.positionCommitment(o.position)) ??
+    ledger(state).positions.findPathForLeaf(shortCommitment);
+  return call(TRADER, state, "closePosition", o.position, o.secret, path, o.coin, o.pnl, o.to);
+};
+const shortPool = ledger(shortOpened.state).poolValue;
+
+{
+  const flatShort = closeShort(shortOpened.state);
+  expect("a short at an unchanged price returns the whole collateral", flatShort.ok && paidTo(flatShort, RECIPIENT) === COLLATERAL, why(flatShort));
+  const asLong = closeShort(shortOpened.state, { position: { ...shortPosition, isLong: true } });
+  expect("a short cannot be closed as a long", !asLong.ok, why(asLong));
+}
+
+// Price down 10%: the short wins floor(size × 300 / 3000).
+{
+  const down = shortAt(2_700_000_000n);
+  const profit = floorDiv(SIZE * 300_000_000n, PRICE);
+  const over = closeShort(down, { pnl: profit + 1n });
+  expect("a short's overstated profit is refused", !over.ok && /overstated/.test(over.error), why(over));
+  const under = closeShort(down, { pnl: profit - 1n });
+  expect("a short's understated profit is refused", !under.ok && /understated/.test(under.error), why(under));
+  const win = closeShort(down, { pnl: profit });
+  expect("a short wins when the price falls", win.ok, why(win));
+  if (win.ok) {
+    expect("the recipient gets collateral plus profit", paidTo(win, RECIPIENT) === COLLATERAL + profit);
+    expect("the pool pays exactly the profit", ledger(win.state).poolValue === shortPool - profit);
+    expect("the short's reservation is released", ledger(win.state).reserved === 0n);
+  }
+}
+
+// Price up 5%: the short loses ceil(size × 150 / 3000).
+{
+  const up = shortAt(3_150_000_000n);
+  const loss = ceilDiv(SIZE * 150_000_000n, PRICE);
+  const greedy = closeShort(up, { pnl: 1n });
+  expect("a short cannot claim a profit when the price rose", !greedy.ok, why(greedy));
+  const low = closeShort(up, { pnl: loss - 1n });
+  expect("a short's understated loss is refused", !low.ok && /loss understated/.test(low.error), why(low));
+  const lose = closeShort(up, { pnl: loss });
+  expect("a short loses when the price rises", lose.ok, why(lose));
+  if (lose.ok) {
+    expect("the recipient gets collateral minus loss", paidTo(lose, RECIPIENT) === COLLATERAL - loss);
+    expect("the pool gains exactly the loss", ledger(lose.state).poolValue === shortPool + loss);
+  }
+}
+
+// Price up 20% at ~10x: the short's loss exceeds its collateral.
+{
+  const squeeze = shortAt(3_600_000_000n);
+  const wiped = closeShort(squeeze, { pnl: ceilDiv(SIZE * 600_000_000n, PRICE) });
+  expect("a wiped-out short closes", wiped.ok, why(wiped));
+  if (wiped.ok) {
+    expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
+    expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === shortPool + COLLATERAL);
+  }
+}
+
+// A 50x short of 10,000 pUSDC and a 50% fall: raw profit 250k, cap 100k.
+{
+  const BIG = 10_000_000_000n;
+  const bigCoin = coin(BIG);
+  const big = { ...shortPosition, size: BIG * 50n, collateral: BIG, collateralNonce: bigCoin.nonce, salt: bytes32(0x5b) };
+  const opened50 = call(TRADER, pooled, "openPosition", bigCoin, big.size, false, OWNER_SECRET, big.salt);
+  expect("a 50x short opens", opened50.ok, why(opened50));
+  const crash = call(DEPLOYER, opened50.state, "setPrice", 1_500_000_000n, ADMIN_SECRET).state;
+  const bigPath = ledger(crash).positions.findPathForLeaf(pureCircuits.positionCommitment(big));
+  const closeBig = (pnl) =>
+    call(TRADER, crash, "closePosition", big, OWNER_SECRET, bigPath, { ...bigCoin, mt_index: 0n }, pnl, RECIPIENT);
+  const raw = closeBig(floorDiv(big.size * 1_500_000_000n, PRICE));
+  expect("a short's profit above the cap is refused", !raw.ok && /payout cap/.test(raw.error), why(raw));
+  const capped = closeBig(MAX_PAYOUT);
+  expect("a short's capped profit is paid", capped.ok && paidTo(capped, RECIPIENT) === BIG + MAX_PAYOUT, why(capped));
 }
 
 // ── Withdrawing liquidity ───────────────────────────────────────────────────

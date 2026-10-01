@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * The trader's side of zkperp: opening and closing longs.
+ * The trader's side of zkperp: opening and closing positions, long or short.
  *
  * Everything that makes a position closable lives off chain, in
  * `.zkperp/positions.json` (see positions.ts). This module is where that
- * record is turned back into the arguments `closeLong` needs — including the
+ * record is turned back into the arguments `closePosition` needs — including the
  * one the chain has but will not hand over by name: the collateral coin's
  * Merkle index.
  */
@@ -55,14 +55,15 @@ export interface Opened {
 }
 
 /**
- * Opens a long for the wallet behind `perp.providers`. The opening is saved
- * BEFORE submitting and marked open or failed after; see positions.ts.
+ * Opens a long or a short for the wallet behind `perp.providers`. The opening
+ * is saved BEFORE submitting and marked open or failed after; see positions.ts.
  */
-export async function openLong(
+export async function openPosition(
   perp: ContractHandle,
   usdc: Uint8Array,
   collateral: bigint,
   size: bigint,
+  isLong: boolean,
   networkId: string
 ): Promise<Opened> {
   const ledger = await readLedger(perp);
@@ -75,7 +76,7 @@ export async function openLong(
     createdAt: new Date().toISOString(),
     opening: {
       ownerSecret: hex(ownerSecret),
-      isLong: true,
+      isLong,
       size: size.toString(),
       collateral: collateral.toString(),
       entryPrice: ledger.markPrice.toString(),
@@ -88,9 +89,10 @@ export async function openLong(
 
   recordPending(record);
   try {
-    const tx = await perp.deployed.callTx.openLong(
+    const tx = await perp.deployed.callTx.openPosition(
       { nonce: position.collateralNonce, color: usdc, value: collateral },
       size,
+      isLong,
       ownerSecret,
       position.salt
     );
@@ -105,23 +107,25 @@ export async function openLong(
 }
 
 /**
- * |PnL| of a long at `exit`, as the circuit demands: a profit rounded down and
- * capped at `maxPayout`, a loss rounded up — each in the pool's favour.
+ * |PnL| of a position at `exit`, as the circuit demands: a profit rounded down
+ * and capped at `maxPayout`, a loss rounded up — each in the pool's favour. A
+ * long profits when the price rose, a short when it fell; unchanged is flat.
  */
-export function longPnl(
+export function positionPnl(
+  isLong: boolean,
   size: bigint,
   entry: bigint,
   exit: bigint,
   maxPayout: bigint
 ): { profit: boolean; pnl: bigint; capped: boolean } {
-  if (exit >= entry) {
-    const raw = (size * (exit - entry)) / entry;
+  const delta = size * (exit >= entry ? exit - entry : entry - exit);
+  if (isLong ? exit >= entry : exit <= entry) {
+    const raw = delta / entry;
     return raw > maxPayout
       ? { profit: true, pnl: maxPayout, capped: true }
       : { profit: true, pnl: raw, capped: false };
   }
-  const drop = size * (entry - exit);
-  return { profit: false, pnl: (drop + entry - 1n) / entry, capped: false };
+  return { profit: false, pnl: (delta + entry - 1n) / entry, capped: false };
 }
 
 /**
@@ -196,10 +200,10 @@ export interface Closed {
 }
 
 /**
- * Closes a long at the current mark price, paying out to the wallet behind
+ * Closes a position at the current mark price, paying out to the wallet behind
  * `perp.providers` (whose coin public key is `recipient`).
  */
-export async function closeLong(
+export async function closePosition(
   perp: ContractHandle,
   record: PositionRecord,
   usdc: Uint8Array,
@@ -216,10 +220,16 @@ export async function closeLong(
   const mt_index = await collateralIndex(perp, coin);
 
   const exit: bigint = ledger.markPrice;
-  const { profit, pnl, capped } = longPnl(position.size, position.entryPrice, exit, ledger.maxPayout);
+  const { profit, pnl, capped } = positionPnl(
+    position.isLong,
+    position.size,
+    position.entryPrice,
+    exit,
+    ledger.maxPayout
+  );
   const ownerSecret = bytes(record.opening.ownerSecret);
 
-  const tx = await perp.deployed.callTx.closeLong(
+  const tx = await perp.deployed.callTx.closePosition(
     position,
     ownerSecret,
     path,

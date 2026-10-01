@@ -1,6 +1,6 @@
 # ZKPERP on Midnight
 
-Private perpetuals on [Midnight](https://midnight.network): trade a leveraged long against a GMX-style liquidity pool without publishing your position's size, collateral or leverage, or linking it to your wallet.
+Private perpetuals on [Midnight](https://midnight.network): go leveraged long or short against a GMX-style liquidity pool without publishing your position's direction, size, collateral or leverage, or linking it to your wallet.
 
 > ⚠️ **pUSDC is a mock token. Anyone can mint any amount of it.** It exists so the devnet can hand out collateral without a faucet, and it has none of the supply control a real stablecoin needs. zkperp itself only accepts the one token it was deployed with; swapping pUSDC for a real shielded stablecoin changes nothing in zkperp's contract.
 >
@@ -17,14 +17,14 @@ Private perpetuals on [Midnight](https://midnight.network): trade a leveraged lo
 
 **Withdrawing.** An LP sends zLP back and receives `shares × pool / supply` pUSDC, rounded down in the pool's favour. Only liquidity that is not reserved can leave: the pool must stay worth more than `reserved` afterwards. The last LP may empty an idle pool completely. Redeemed zLP is retired: the contract receives it and has no circuit that can spend it.
 
-**Opening a long.** The trader sends a pUSDC collateral coin to the contract and chooses a size (1×–50× the collateral). The contract appends a **commitment** to the `positions` Merkle tree: a hash of the size, collateral, entry price, the collateral coin's nonce, the owner's key and a random salt. The leverage bounds are checked inside the zero-knowledge proof.
+**Opening a position.** The trader sends a pUSDC collateral coin to the contract and chooses a direction (long or short) and a size (1×–50× the collateral). The contract appends a **commitment** to the `positions` Merkle tree: a hash of the direction, size, collateral, entry price, the collateral coin's nonce, the owner's key and a random salt. The leverage bounds are checked inside the zero-knowledge proof. Longs and shorts open through the same circuit, so an open does not reveal which one it is: its public footprint differs only in the commitment.
 
 **Closing.** The trader proves that one of the commitments in the tree is theirs without saying which one, and publishes a **nullifier**, a one-time tag that prevents a second close and can't be linked back to the commitment. The contract then:
 - **Profit:** returns the whole collateral plus the profit, paid from the pool.
 - **Partial loss:** returns the collateral minus the loss; the loss is merged into the pool.
 - **Loss of the whole collateral:** merges all of it into the pool; nothing comes back.
 
-Circuits can't divide, so the trader supplies the PnL and the circuit checks it is exactly `size × Δprice / entry`, rounded in the pool's favour.
+A long profits when the price rose, a short when it fell. Circuits can't divide, so the trader supplies the PnL and the circuit checks it is exactly `size × |Δprice| / entry`, rounded in the pool's favour.
 
 **Solvency.** GMX sets aside pool funds for each position, sized by the position, so profits are always payable. Doing that here would publish every size. Instead, every position's profit is capped at one public constant, `maxPayout` (an enforced take-profit), and every open reserves exactly `maxPayout`, whatever the position's real size. The reservation reveals nothing about the position: `reserved` is always live positions × `maxPayout`, and the position count is already public. An open is refused unless `reserved` stays below the pool's value, so every open position's maximum profit is always covered. LP withdrawals are held to the same rule.
 
@@ -37,6 +37,7 @@ The cap is a constant rather than a multiple of collateral on purpose. A positio
 | Public | Private |
 |---|---|
 | Pool liquidity and zLP supply, and so each LP deposit and withdrawal | A position's size, collateral and leverage |
+| | A position's direction, at open |
 | Reserved liquidity: live positions × `maxPayout` | |
 | The mark price, and so the entry price of anything opened at it | Who owns a position: the owner is a hash of a per-position secret, not a wallet key |
 | That a position opened or closed, and when | Which open a close belongs to |
@@ -45,6 +46,7 @@ The cap is a constant rather than a multiple of collateral on purpose. A positio
 Known limits:
 
 - **PnL at close.** The pool's balance change equals the PnL. Opens and closes are unlinkable, but an observer who guesses the entry price from the price history can narrow the size to a few candidates. A close at an unchanged price reveals nothing.
+- **Direction at close.** Whether the pool paid or gained, together with the public price move, shows whether the position was a long or a short. A close at an unchanged price does not.
 - **Wipe-outs publish the collateral**, since all of it moves into the pool.
 - **A capped profit shows that the cap bound**, which means `size × Δprice / entry ≥ maxPayout`.
 - **Funding rates** need the long/short skew, which is private. The design for that is open (bucketed or batch-published skew are the candidates).
@@ -55,7 +57,7 @@ The privacy claims are tested, not just asserted:
 - `npm run probe:leak` deploys a test-only contract that publishes three amounts on purpose, and checks that the search finds them. On-chain they appear as little-endian bytes. This shows which encodings the search covers, so a "not found" elsewhere can be trusted for those encodings.
 - `npm run demo` searches the raw bytes of every trade transaction on the devnet.
 
-**Local tests are not enough for Compact.** The zero-knowledge proof evaluates every branch of an `if`; only the taken branch's effects are kept. The JavaScript runtime that local tests use runs only the taken branch. A value that goes negative in an untaken branch still breaks the proof. The first loss close on the devnet failed this way, while every local test passed (see the note in `closeLong`). So `npm run demo` runs every settlement path through the real proof server: flat, profit, loss, profit larger than the collateral, wipe-out, and capped profit.
+**Local tests are not enough for Compact.** The zero-knowledge proof evaluates every branch of an `if`; only the taken branch's effects are kept. The JavaScript runtime that local tests use runs only the taken branch. A value that goes negative in an untaken branch still breaks the proof. The first loss close on the devnet failed this way, while every local test passed (see the note in `closePosition`). So `npm run demo` runs every settlement path through the real proof server, for a long and for a short: flat, profit, loss, profit larger than the collateral, wipe-out, and capped profit.
 
 ## Running it
 
@@ -72,8 +74,8 @@ npm run probe:leak      # check the privacy search's coverage
 ```
 
 `npm run demo` uses the devnet's pre-funded dev wallet as deployer, LP and oracle, plus a **separate trader wallet** that it funds on first run. It:
-- opens and closes a long at an unchanged price, where the collateral must come back in full;
-- closes one long through each of the other settlement paths, where the trader and the pool must each move by exactly the settled amount;
+- opens and closes a long and a short at an unchanged price, where the collateral must come back in full;
+- closes one long and one short through each of the other settlement paths, where the trader and the pool must each move by exactly the settled amount;
 - checks that every open reserves exactly `maxPayout` and every close releases it;
 - redeems part of the LP's zLP, is refused emptying the pool while a position is open, then empties it once nothing is open (the next run deposits again);
 - runs the privacy search on every trade transaction.
@@ -82,4 +84,4 @@ npm run probe:leak      # check the privacy search's coverage
 
 ## Not built yet
 
-Liquidation, shorts, fees and funding rates.
+Liquidation, fees and funding rates.
