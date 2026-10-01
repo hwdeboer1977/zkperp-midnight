@@ -15,6 +15,8 @@ Private perpetuals on [Midnight](https://midnight.network): trade a leveraged lo
 
 **The pool (GMX-style).** LPs deposit pUSDC and receive zLP shares. The pool is the counterparty to every trade: it pays out traders' profits and keeps their losses. The pool is one pUSDC coin, stored on the ledger so anyone can settle against it.
 
+**Withdrawing.** An LP sends zLP back and receives `shares × pool / supply` pUSDC, rounded down in the pool's favour. Only liquidity that is not reserved can leave: the pool must stay worth more than `reserved` afterwards. The last LP may empty an idle pool completely. Redeemed zLP is retired: the contract receives it and has no circuit that can spend it.
+
 **Opening a long.** The trader sends a pUSDC collateral coin to the contract and chooses a size (1×–50× the collateral). The contract appends a **commitment** to the `positions` Merkle tree: a hash of the size, collateral, entry price, the collateral coin's nonce, the owner's key and a random salt. The leverage bounds are checked inside the zero-knowledge proof.
 
 **Closing.** The trader proves that one of the commitments in the tree is theirs without saying which one, and publishes a **nullifier**, a one-time tag that prevents a second close and can't be linked back to the commitment. The contract then:
@@ -24,7 +26,7 @@ Private perpetuals on [Midnight](https://midnight.network): trade a leveraged lo
 
 Circuits can't divide, so the trader supplies the PnL and the circuit checks it is exactly `size × Δprice / entry`, rounded in the pool's favour.
 
-**Solvency.** GMX sets aside pool funds for each position, sized by the position, so profits are always payable. Doing that here would publish every size. Instead, every position's profit is capped at one public constant, `maxPayout` (an enforced take-profit), and every open reserves exactly `maxPayout`, whatever the position's real size. The reservation reveals nothing about the position: `reserved` is always live positions × `maxPayout`, and the position count is already public. An open is refused unless `reserved` stays below the pool's value, so every open position's maximum profit is always covered.
+**Solvency.** GMX sets aside pool funds for each position, sized by the position, so profits are always payable. Doing that here would publish every size. Instead, every position's profit is capped at one public constant, `maxPayout` (an enforced take-profit), and every open reserves exactly `maxPayout`, whatever the position's real size. The reservation reveals nothing about the position: `reserved` is always live positions × `maxPayout`, and the position count is already public. An open is refused unless `reserved` stays below the pool's value, so every open position's maximum profit is always covered. LP withdrawals are held to the same rule.
 
 The cap is a constant rather than a multiple of collateral on purpose. A position that hits the cap is paid exactly the cap, in public, so a cap of `k × collateral` would publish the collateral every time it binds. A constant cap reveals only that it bound. The cost is capital efficiency: the pool must hold `maxPayout` for every open position.
 
@@ -34,7 +36,7 @@ The cap is a constant rather than a multiple of collateral on purpose. A positio
 
 | Public | Private |
 |---|---|
-| Pool liquidity and zLP supply, and so each LP deposit | A position's size, collateral and leverage |
+| Pool liquidity and zLP supply, and so each LP deposit and withdrawal | A position's size, collateral and leverage |
 | Reserved liquidity: live positions × `maxPayout` | |
 | The mark price, and so the entry price of anything opened at it | Who owns a position: the owner is a hash of a per-position secret, not a wallet key |
 | That a position opened or closed, and when | Which open a close belongs to |
@@ -73,10 +75,11 @@ npm run probe:leak      # check the privacy search's coverage
 - opens and closes a long at an unchanged price, where the collateral must come back in full;
 - closes one long through each of the other settlement paths, where the trader and the pool must each move by exactly the settled amount;
 - checks that every open reserves exactly `maxPayout` and every close releases it;
+- redeems part of the LP's zLP, is refused emptying the pool while a position is open, then empties it once nothing is open (the next run deposits again);
 - runs the privacy search on every trade transaction.
 
 `npm run devnet:reset` wipes the chain and all local state.
 
 ## Not built yet
 
-Liquidation, shorts, fees, funding rates and LP withdrawal. LP withdrawal must keep the solvency invariant: it can only take out what is not reserved.
+Liquidation, shorts, fees and funding rates.

@@ -21,6 +21,11 @@
  *   profit and the pool loses exactly that. Then the same with the price down
  *   5%: the trader loses exactly the loss and the pool gains it.
  *
+ * LIQUIDITY — can LPs get out, and only what is not reserved?
+ *   Redeems a tenth of the dev wallet's zLP; is refused emptying the pool
+ *   while a position is open; then empties it once nothing is open. The next
+ *   run deposits afresh.
+ *
  * Every trade transaction is fetched raw from the indexer and searched for the
  * position's size, collateral, secrets and the trader's key, with the search
  * whose coverage `npm run probe:leak` verifies.
@@ -38,6 +43,7 @@ import { getDeployment, loadCompiledContract, saveDeployment, type ContractName 
 import { readyTrader, traderSeed } from "./trader.js";
 import { closeLong, longPnl, openLong, readLedger, type ContractHandle } from "./perp.js";
 import { positionsFile, reconcile } from "./positions.js";
+import { redeemable, removeLiquidity } from "./pool.js";
 import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
 
 const PUSDC = 1_000_000n;
@@ -244,6 +250,51 @@ async function main() {
       await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier);
     }
     await setPrice(devPerp, PRICE, adminSecret);
+
+    // ── Step 5: LP withdrawal ─────────────────────────────────────────────
+    section = "liquidity";
+    step("Liquidity — withdraw only what is not reserved");
+    {
+      const l = await readLedger(devPerp);
+      const lpToken: Uint8Array = l.lpToken;
+      const shares = await balance(dev.wallet, lpToken);
+      check(`the dev wallet holds every zLP share (${fmt(shares)})`, shares === l.lpSupply);
+
+      const part = shares / 10n;
+      const devBefore = await balance(dev.wallet, usdc);
+      const expected = redeemable(l, part);
+      const out = await removeLiquidity(devPerp, part);
+      info(`redeemed ${fmt(part)} zLP for ${fmt(out.amount)} pUSDC: ${out.txHash}`);
+      const devAfter = await waitForBalance(dev.wallet, usdc, (b) => b > devBefore);
+      check("the LP is paid shares × poolValue / lpSupply, rounded down", out.amount === expected && devAfter - devBefore === expected);
+      const l2 = await readLedger(devPerp);
+      check("the pool shrinks by exactly that", l2.poolValue === l.poolValue - expected);
+      check("the redeemed shares are retired", l2.lpSupply === l.lpSupply - part);
+      check("the LP's zLP balance drops by them", (await waitForBalance(dev.wallet, lpToken, (b) => b < shares)) === shares - part);
+
+      // An open position reserves maxPayout: the pool cannot be emptied.
+      const opened = await openLong(trader.perp, usdc, COLLATERAL, SIZE, network.networkId);
+      info(`opened ${opened.txHash}`);
+      let refusal = "";
+      try {
+        await removeLiquidity(devPerp, l2.lpSupply);
+      } catch (error) {
+        refusal = String(error instanceof Error ? error.message : error);
+      }
+      check("emptying the pool is refused while a position is open", /reserved for open positions/.test(refusal));
+      await closeLong(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      info("closed it at an unchanged price");
+
+      // Nothing open: the last LP may take everything.
+      const l3 = await readLedger(devPerp);
+      const devBeforeAll = await balance(dev.wallet, usdc);
+      const all = await removeLiquidity(devPerp, l3.lpSupply);
+      info(`redeemed the remaining ${fmt(l3.lpSupply)} zLP for ${fmt(all.amount)} pUSDC: ${all.txHash}`);
+      const devAfterAll = await waitForBalance(dev.wallet, usdc, (b) => b > devBeforeAll);
+      check("the last LP receives the whole pool", all.amount === l3.poolValue && devAfterAll - devBeforeAll === l3.poolValue);
+      const l4 = await readLedger(devPerp);
+      check("the pool is empty and has no shares left", l4.poolValue === 0n && l4.lpSupply === 0n);
+    }
 
     // ── Summary ───────────────────────────────────────────────────────────
     const l = await readLedger(devPerp);

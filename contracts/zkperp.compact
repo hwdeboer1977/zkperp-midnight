@@ -52,9 +52,10 @@ import CompactStandardLibrary;
 // size. The reservation says nothing about the position; the total is just
 // (live positions × maxPayout), and the position count is public anyway.
 //
-// Invariant: poolValue > reserved. An open that would break it is refused. A
-// close pays at most maxPayout and releases maxPayout, and a loss only adds to
-// the pool, so every open position's profit is always payable.
+// Invariant: poolValue > reserved. An open or an LP withdrawal that would
+// break it is refused (an idle pool may be emptied entirely). A close pays at
+// most maxPayout and releases maxPayout, and a loss only adds to the pool, so
+// every open position's profit is always payable.
 //
 // Why a constant cap and not k × collateral: a position that hits a cap is
 // paid exactly the cap, publicly, so a collateral-relative cap publishes the
@@ -69,7 +70,7 @@ import CompactStandardLibrary;
 // few candidates. A close at an unchanged price moves nothing and reveals
 // nothing beyond "a position closed".
 //
-// Not yet here: liquidation, shorts, fees, funding and LP withdrawal.
+// Not yet here: liquidation, shorts, fees and funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
 
@@ -247,6 +248,61 @@ export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>): [] {
     evolveNonce(lpMintCounter, kernel.self().bytes),
     left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
   );
+}
+
+// Redeems a zLP coin for its share of the pool, paid to the caller.
+//
+// `amount` is computed by the caller, because circuits cannot divide: it must
+// be floor(shares * poolValue / lpSupply), rounded in the pool's favour. The
+// two inequalities below pin it to exactly that.
+//
+// Only liquidity that is not reserved can leave: after the withdrawal the pool
+// must still be worth more than `reserved`, so every open position's maximum
+// profit stays payable. The one exception is the last LP leaving an idle pool
+// (no open positions, every share redeemed), which empties it completely.
+//
+// The zLP coin is received and never spent: no circuit in this contract can
+// name it, so it is retired for good, and `lpSupply` drops by its value. A
+// future circuit that spends contract-held coins must keep it that way.
+export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
+  const c = disclose(lp);
+  const a = disclose(amount);
+  assert(lpSupply > 0, "the pool has no shares");
+  assert(c.color == lpToken, "only zLP redeems liquidity");
+  assert(c.value > 0, "a withdrawal of nothing");
+  assert(c.value <= lpSupply as Uint<128>, "more shares than exist");
+  const shares = c.value as Uint<64>;
+
+  assert(a * lpSupply <= shares * poolValue, "too much pUSDC for these shares");
+  assert((a + 1) * lpSupply > shares * poolValue, "too little pUSDC for these shares");
+  assert(a > 0, "too few shares to redeem a unit");
+
+  // a <= poolValue follows from shares <= lpSupply and the bound above.
+  const nextValue = (poolValue - a) as Uint<64>;
+  const drained = nextValue == 0;
+  assert(
+    nextValue > reserved || (drained && reserved == 0),
+    "that liquidity is reserved for open positions"
+  );
+
+  receiveShielded(c);
+
+  // As in closeLong: both branches below are evaluated in the proof, so the
+  // send happens before the branch and each branch only writes the result.
+  // When the whole pool leaves there is no change; the untaken writeCoin then
+  // sees a zero-value default coin, which is in range.
+  const paid = sendShielded(
+    pool,
+    left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey()),
+    a as Uint<128>
+  );
+  if (drained) {
+    pool.resetToDefault();
+  } else {
+    pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  }
+  poolValue = nextValue;
+  lpSupply = (lpSupply - shares) as Uint<64>;
 }
 
 // ── Trading ────────────────────────────────────────────────────────────────

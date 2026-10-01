@@ -397,6 +397,7 @@ if (flat.ok) {
 }
 
 // Price down 5%: loss = ceil(size × 150 / 3000), kept by the pool.
+let afterLoss;
 {
   const down = at(2_850_000_000n);
   const loss = ceilDiv(SIZE * 150_000_000n, PRICE);
@@ -407,6 +408,7 @@ if (flat.ok) {
   if (lose.ok) {
     expect("the recipient gets collateral minus loss", paidTo(lose, RECIPIENT) === COLLATERAL - loss);
     expect("the pool gains exactly the loss", ledger(lose.state).poolValue === after.poolValue + loss);
+    afterLoss = lose.state;
   }
 }
 
@@ -420,6 +422,95 @@ if (flat.ok) {
     expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
     expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === after.poolValue + COLLATERAL);
   }
+}
+
+// ── Withdrawing liquidity ───────────────────────────────────────────────────
+
+console.log("\n  withdrawing liquidity\n");
+
+const zlp = (state, shares) => coin(shares, ledger(state).lpToken);
+const withdraw = (state, shares, amount) => call(LP, state, "removeLiquidity", zlp(state, shares), amount);
+const pusdcToContract = (r) => toContract(r).filter((o) => hex(o.coinInfo.color) === hex(USDC));
+const redeemable = (state, shares) => {
+  const l = ledger(state);
+  return floorDiv(shares * l.poolValue, l.lpSupply);
+};
+
+{
+  // An idle pool, value = supply = 500k: one share is one unit.
+  const SHARES = 100_000_000_000n;
+  const part = withdraw(pooled, SHARES, SHARES);
+  expect("an LP redeems shares for their pro-rata pUSDC", part.ok, why(part));
+  if (part.ok) {
+    const l = ledger(part.state);
+    expect("the LP is paid exactly that amount", paidTo(part, LP) === SHARES, String(paidTo(part, LP)));
+    expect("the pool shrinks by it", l.poolValue === 400_000_000_000n && l.pool.value === 400_000_000_000n);
+    expect("the shares are retired", l.lpSupply === 400_000_000_000n);
+    expect(
+      "the pool keeps its change as one coin",
+      pusdcToContract(part).length === 1 && pusdcToContract(part)[0].coinInfo.value === 400_000_000_000n
+    );
+    const retired = toContract(part).filter((o) => hex(o.coinInfo.color) === hex(l.lpToken));
+    expect("the zLP goes to the contract", retired.length === 1 && retired[0].coinInfo.value === SHARES);
+    const again = withdraw(part.state, SHARES, SHARES);
+    expect("a later withdrawal still prices shares correctly", again.ok && ledger(again.state).poolValue === 300_000_000_000n, why(again));
+  }
+
+  const greedy = withdraw(pooled, SHARES, SHARES + 1n);
+  expect("more pUSDC than the shares are worth is refused", !greedy.ok && /too much/.test(greedy.error), why(greedy));
+  const shy = withdraw(pooled, SHARES, SHARES - 1n);
+  expect("less than the shares are worth is refused", !shy.ok && /too little/.test(shy.error), why(shy));
+  const fake = call(LP, pooled, "removeLiquidity", coin(SHARES), SHARES);
+  expect("pUSDC is not accepted as shares", !fake.ok && /only zLP/.test(fake.error), why(fake));
+  const inflated = withdraw(pooled, 500_000_000_001n, 500_000_000_001n);
+  expect("more shares than exist are refused", !inflated.ok && /more shares than exist/.test(inflated.error), why(inflated));
+  const none = call(LP, genesis, "removeLiquidity", coin(1n, bytes32(0)), 1n);
+  expect("nothing can be withdrawn from an empty pool", !none.ok && /no shares/.test(none.error), why(none));
+
+  // Every share redeemed, nothing open: the pool empties and can start over.
+  const all = withdraw(pooled, 500_000_000_000n, 500_000_000_000n);
+  expect("the last LP may empty an idle pool", all.ok, why(all));
+  if (all.ok) {
+    const l = ledger(all.state);
+    expect("the LP gets the whole pool", paidTo(all, LP) === 500_000_000_000n);
+    expect("the pool is empty, with no coin left behind", l.poolValue === 0n && l.lpSupply === 0n && l.pool.value === 0n && pusdcToContract(all).length === 0);
+    const reopen = call(LP, all.state, "addLiquidity", coin(1_000n), 1_000n);
+    expect("an emptied pool takes a fresh first deposit", reopen.ok && ledger(reopen.state).poolValue === 1_000n, why(reopen));
+  }
+}
+
+{
+  // One open position reserves 100k of the 500k pool: 400k may leave, but
+  // the pool must stay above the reservation, so not all of it.
+  const toEdge = withdraw(opened.state, 400_000_000_000n, 400_000_000_000n);
+  expect(
+    "a withdrawal down to the reservation is refused",
+    !toEdge.ok && /reserved for open positions/.test(toEdge.error),
+    why(toEdge)
+  );
+  const underEdge = withdraw(opened.state, 399_999_999_999n, 399_999_999_999n);
+  expect("a withdrawal that leaves more than the reservation is accepted", underEdge.ok, why(underEdge));
+  if (underEdge.ok) {
+    const l = ledger(underEdge.state);
+    expect("the reservation still fits the pool", l.poolValue > l.reserved, `${l.poolValue} vs ${l.reserved}`);
+    const trader = close(underEdge.state);
+    expect("the open position still closes afterwards", trader.ok, why(trader));
+  }
+  const all = withdraw(opened.state, 500_000_000_000n, 500_000_000_000n);
+  expect("a pool with an open position cannot be emptied", !all.ok && /reserved/.test(all.error), why(all));
+}
+
+if (afterLoss) {
+  // A trader's loss raised the pool's value above its share supply, so each
+  // share now redeems for more than one unit — rounded down, for the pool.
+  const SHARES = 3n;
+  const amount = redeemable(afterLoss, SHARES);
+  expect("(a trader's loss made each share worth more than a unit)", ledger(afterLoss).poolValue > ledger(afterLoss).lpSupply);
+  const win = withdraw(afterLoss, 100_000_000_000n, redeemable(afterLoss, 100_000_000_000n));
+  expect("LPs share the trader's loss pro rata", win.ok && paidTo(win, LP) > 100_000_000_000n, why(win));
+  const exact = withdraw(afterLoss, SHARES, amount);
+  const over = withdraw(afterLoss, SHARES, amount + 1n);
+  expect("a small redemption rounds down", exact.ok && !over.ok, `${why(exact)} / ${why(over)}`);
 }
 
 console.log(failures ? `\n${failures} failure(s)\n` : "\nall passed\n");
