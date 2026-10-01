@@ -38,13 +38,11 @@
  */
 
 import chalk from "chalk";
-import * as Rx from "rxjs";
-import { deployContract, findDeployedContract } from "@midnight-ntwrk/midnight-js-contracts";
+import { deployContract } from "@midnight-ntwrk/midnight-js-contracts";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { createHash, randomBytes } from "crypto";
 import { LOCAL, walletSeed } from "./network.js";
-import { buildWallet, makeWalletProviders, waitForSync, type BuiltWallet } from "./wallet.js";
-import { makeProviders } from "./providers.js";
+import { buildWallet, waitForSync, type BuiltWallet } from "./wallet.js";
 import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
 import { readyTrader, traderSeed } from "./trader.js";
 import {
@@ -61,6 +59,7 @@ import {
 import { openPositionsOn, positionsFile, reconcile } from "./positions.js";
 import { depositFees, redeemable, removeLiquidity } from "./pool.js";
 import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
+import { balance, coinKey, handle, providersFor, waitForBalance } from "./session.js";
 
 const PUSDC = 1_000_000n;
 const DEV_MINT = 1_000_000n * PUSDC;
@@ -499,56 +498,10 @@ async function deployOrFind(
   return address;
 }
 
-function providersFor(wallet: BuiltWallet, seed: string, name: ContractName) {
-  const { walletProvider, midnightProvider } = makeWalletProviders(wallet);
-  return makeProviders({
-    contractName: name,
-    network: LOCAL,
-    seedHex: seed,
-    accountId: wallet.unshieldedAddress,
-    walletProvider,
-    midnightProvider,
-  });
-}
-
-async function handle(wallet: BuiltWallet, seed: string, name: ContractName, address: string): Promise<ContractHandle> {
-  const providers = providersFor(wallet, seed, name);
-  const { module, compiledContract } = await loadCompiledContract(name);
-  const deployed: any = await findDeployedContract(providers as any, {
-    contractAddress: address,
-    compiledContract: compiledContract as any,
-  } as any);
-  return { address, deployed, providers, module };
-}
-
 async function setPrice(perp: ContractHandle, price: bigint, adminSecret: Uint8Array) {
   if ((await readLedger(perp)).markPrice === price) return;
   info(`oracle: price → $${fmt(price)}`);
   await perp.deployed.callTx.setPrice(price, adminSecret);
-}
-
-function coinKey(wallet: BuiltWallet): Uint8Array {
-  return Uint8Array.from(Buffer.from(String(wallet.shieldedSecretKeys.coinPublicKey), "hex"));
-}
-
-function shieldedBalance(state: any, usdc: Uint8Array): bigint {
-  const balances = (state.shielded as any).balances as Record<string, bigint>;
-  return balances[hex(usdc)] ?? balances[`0x${hex(usdc)}`] ?? 0n;
-}
-
-async function balance(wallet: BuiltWallet, usdc: Uint8Array): Promise<bigint> {
-  return shieldedBalance(await Rx.firstValueFrom(wallet.facade.state()), usdc);
-}
-
-/** Wallets see a transaction's coins a moment after it lands. */
-function waitForBalance(wallet: BuiltWallet, usdc: Uint8Array, ok: (b: bigint) => boolean): Promise<bigint> {
-  return Rx.firstValueFrom(
-    wallet.facade.state().pipe(
-      Rx.map((s) => shieldedBalance(s, usdc)),
-      Rx.filter(ok),
-      Rx.timeout(180_000)
-    )
-  );
 }
 
 main().catch((error) => {

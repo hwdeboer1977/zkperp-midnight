@@ -15,7 +15,8 @@
     "proof:up": "docker run -d --name proof-server --restart unless-stopped -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v",
     "compile:probe": "compact compile contracts/probe/leakprobe.compact contracts/managed/leakprobe",
     "probe:leak": "npm run build && node dist/probe-leak.js",
-    "demo": "npm run build && node dist/demo.js"
+    "demo": "npm run build && node dist/demo.js",
+    "race": "npm run build && node dist/race.js"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.1",

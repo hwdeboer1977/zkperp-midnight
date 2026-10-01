@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Wallet and contract plumbing shared by the devnet scripts (demo, race):
+ * providers and contract handles per wallet, and shielded balances.
+ */
+
+import * as Rx from "rxjs";
+import { findDeployedContract } from "@midnight-ntwrk/midnight-js-contracts";
+import { LOCAL } from "./network.js";
+import { makeWalletProviders, type BuiltWallet } from "./wallet.js";
+import { makeProviders } from "./providers.js";
+import { loadCompiledContract, type ContractName } from "./contracts.js";
+import type { ContractHandle } from "./perp.js";
+
+const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+
+export function providersFor(wallet: BuiltWallet, seed: string, name: ContractName) {
+  const { walletProvider, midnightProvider } = makeWalletProviders(wallet);
+  return makeProviders({
+    contractName: name,
+    network: LOCAL,
+    seedHex: seed,
+    accountId: wallet.unshieldedAddress,
+    walletProvider,
+    midnightProvider,
+  });
+}
+
+export async function handle(wallet: BuiltWallet, seed: string, name: ContractName, address: string): Promise<ContractHandle> {
+  const providers = providersFor(wallet, seed, name);
+  const { module, compiledContract } = await loadCompiledContract(name);
+  const deployed: any = await findDeployedContract(providers as any, {
+    contractAddress: address,
+    compiledContract: compiledContract as any,
+  } as any);
+  return { address, deployed, providers, module };
+}
+
+export function coinKey(wallet: BuiltWallet): Uint8Array {
+  return Uint8Array.from(Buffer.from(String(wallet.shieldedSecretKeys.coinPublicKey), "hex"));
+}
+
+export function shieldedBalance(state: any, usdc: Uint8Array): bigint {
+  const balances = (state.shielded as any).balances as Record<string, bigint>;
+  return balances[hex(usdc)] ?? balances[`0x${hex(usdc)}`] ?? 0n;
+}
+
+export async function balance(wallet: BuiltWallet, usdc: Uint8Array): Promise<bigint> {
+  return shieldedBalance(await Rx.firstValueFrom(wallet.facade.state()), usdc);
+}
+
+/** Wallets see a transaction's coins a moment after it lands. */
+export function waitForBalance(wallet: BuiltWallet, usdc: Uint8Array, ok: (b: bigint) => boolean): Promise<bigint> {
+  return Rx.firstValueFrom(
+    wallet.facade.state().pipe(
+      Rx.map((s) => shieldedBalance(s, usdc)),
+      Rx.filter(ok),
+      Rx.timeout(180_000)
+    )
+  );
+}
