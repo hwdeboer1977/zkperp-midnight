@@ -8,7 +8,8 @@
  * Two halves:
  *
  *   · RULES. The pool accepts only pUSDC and mints the right share count; a
- *     long respects the leverage bounds; only the admin moves the price.
+ *     position respects the leverage bounds and pays exactly its fees; only
+ *     the admin moves the price.
  *
  *   · PRIVACY. Opens a long, then renders everything a reader can pull off the
  *     chain — the ledger state and the call's public transcript — and searches
@@ -47,9 +48,25 @@ const LP = key(0x20);
 const TRADER = key(0x30);
 
 const PRICE = 3_000_000_000n; // $3,000.000000
-const MAX_LEVERAGE = 50n;
+const MAX_LEVERAGE = 20n;
 const MIN_COLLATERAL = 10_000_000n; // 10 pUSDC
 const MAX_PAYOUT = 100_000_000_000n; // 100,000 pUSDC: a 500k pool holds 4 positions
+const OPEN_FEE_BPS = 10n; // 0.10%
+const CLOSE_FEE_BPS = 10n;
+const BORROW_RATE = 1_000_000n; // 10^-6 of size per second
+const CLOCK_SLACK = 600n;
+const TREASURY = key(0x7e);
+
+// Block times: positions open at T0 and close an hour later at T1.
+const T0 = 1_800_000_000n;
+const HELD = 3_600n;
+const T1 = T0 + HELD;
+
+const ceilDiv = (a, b) => (a + b - 1n) / b;
+const floorDiv = (a, b) => a / b;
+const openFeeOf = (size) => ceilDiv(size * OPEN_FEE_BPS, 10_000n);
+const closeFeeOf = (size) => ceilDiv(size * CLOSE_FEE_BPS, 10_000n);
+const borrowFeeOf = (size, seconds) => ceilDiv(size * BORROW_RATE * seconds, 1_000_000_000_000n);
 
 const ADDRESS = sampleContractAddress();
 const contract = new Contract({});
@@ -62,16 +79,21 @@ const deploy = () =>
     PRICE,
     MAX_LEVERAGE,
     MIN_COLLATERAL,
-    MAX_PAYOUT
+    MAX_PAYOUT,
+    OPEN_FEE_BPS,
+    CLOSE_FEE_BPS,
+    BORROW_RATE,
+    TREASURY,
+    CLOCK_SLACK
   ).currentContractState;
 
-/** Runs a circuit against `state`; reports rather than throws. */
-function call(caller, state, circuit, ...args) {
+/** Runs a circuit against `state` at block time `time`; reports rather than throws. */
+function callAt(time, caller, state, circuit, ...args) {
   const wrapper = deploy();
   wrapper.data = state;
   try {
     const r = contract.impureCircuits[circuit](
-      createCircuitContext(ADDRESS, hex(caller.bytes), wrapper, {}),
+      createCircuitContext(ADDRESS, hex(caller.bytes), wrapper, {}, undefined, undefined, Number(time)),
       ...args
     );
     return {
@@ -84,10 +106,23 @@ function call(caller, state, circuit, ...args) {
     return { ok: false, error: String(cause?.message ?? cause) };
   }
 }
+const call = (...args) => callAt(T0, ...args);
 const why = (r) => (r.ok ? "accepted" : r.error);
 
 let nonceByte = 0;
 const coin = (value, color = USDC) => ({ nonce: bytes32(++nonceByte), color, value });
+
+/**
+ * Opens a position whose collateral, net of the opening fee, is `c.value`:
+ * the coin posted is that plus the fee, which is what a trader does.
+ */
+function openCall(caller, state, c, size, isLong, secret, salt, overrides = {}) {
+  const o = { fee: openFeeOf(size), openTime: T0, time: T0, ...overrides };
+  const posted = { ...c, value: c.value + o.fee };
+  return callAt(o.time, caller, state, "openPosition", posted, size, isLong, o.fee, o.openTime, secret, salt);
+}
+/** The collateral coin as the contract holds it: net collateral plus opening fee. */
+const held = (c, size) => ({ ...c, value: c.value + openFeeOf(size), mt_index: 0n });
 
 console.log("\nzkperp\n");
 
@@ -99,6 +134,7 @@ const genesis = deploy().data;
   expect("the admin is stored as a hash, not the secret", hex(l.admin) !== hex(ADMIN_SECRET));
   expect("the mark price is the initial price", l.markPrice === PRICE);
   expect("the pool starts empty", l.poolValue === 0n && l.lpSupply === 0n);
+  expect("the fees and treasury are as configured", l.openFeeBps === OPEN_FEE_BPS && l.borrowRate === BORROW_RATE && hex(l.treasury.bytes) === hex(TREASURY.bytes));
 }
 
 // ── Oracle ──────────────────────────────────────────────────────────────────
@@ -115,7 +151,7 @@ const genesis = deploy().data;
 
 // ── Trading needs a pool ────────────────────────────────────────────────────
 {
-  const early = call(TRADER, genesis, "openPosition", coin(100_000_000n), 1_000_000_000n, true, bytes32(1), bytes32(2));
+  const early = openCall(TRADER, genesis, coin(100_000_000n), 1_000_000_000n, true, bytes32(1), bytes32(2));
   expect("no long can open against an empty pool", !early.ok && /no liquidity/.test(early.error), why(early));
 }
 
@@ -166,20 +202,38 @@ const OWNER_SECRET = bytes32(0x5e);
 const SALT = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
 
 {
-  const tooMuch = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 51n, true, OWNER_SECRET, SALT);
-  expect("51x is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
-  const atCap = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 50n, true, OWNER_SECRET, SALT);
-  expect("50x is accepted", atCap.ok, why(atCap));
-  const under = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL - 1n, true, OWNER_SECRET, SALT);
+  const tooMuch = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL * 21n, true, OWNER_SECRET, SALT);
+  expect("21x is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
+  const atCap = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL * 20n, true, OWNER_SECRET, SALT);
+  expect("20x of the collateral net of the fee is accepted", atCap.ok, why(atCap));
+  // The fee comes out of the coin first, so 20x of the whole coin is too much.
+  const grossTooBig = callAt(T0, TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 20n, true, openFeeOf(COLLATERAL * 20n), T0, OWNER_SECRET, SALT);
+  expect("leverage is checked on the collateral net of the fee", !grossTooBig.ok && /leverage above/.test(grossTooBig.error), why(grossTooBig));
+  const under = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL - 1n, true, OWNER_SECRET, SALT);
   expect("under 1x is refused", !under.ok && /under 1x/.test(under.error), why(under));
-  const small = call(TRADER, pooled, "openPosition", coin(MIN_COLLATERAL - 1n), MIN_COLLATERAL, true, OWNER_SECRET, SALT);
+  const small = openCall(TRADER, pooled, coin(MIN_COLLATERAL - 1n), MIN_COLLATERAL, true, OWNER_SECRET, SALT);
   expect("collateral below the minimum is refused", !small.ok && /below the minimum/.test(small.error), why(small));
-  const other = call(TRADER, pooled, "openPosition", coin(COLLATERAL, OTHER_TOKEN), SIZE, true, OWNER_SECRET, SALT);
+  const other = openCall(TRADER, pooled, coin(COLLATERAL, OTHER_TOKEN), SIZE, true, OWNER_SECRET, SALT);
   expect("collateral that is not pUSDC is refused", !other.ok && /must be pUSDC/.test(other.error), why(other));
+
+  const fee = openFeeOf(SIZE);
+  const lowFee = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { fee: fee - 1n });
+  expect("an opening fee one unit short is refused", !lowFee.ok && /opening fee understated/.test(lowFee.error), why(lowFee));
+  const highFee = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { fee: fee + 1n });
+  expect("an opening fee one unit over is refused", !highFee.ok && /opening fee overstated/.test(highFee.error), why(highFee));
+  // 1 unit of size at 10 bps is 0.001 of a unit: rounded up, it costs 1.
+  expect("(fees round up: size 1 pays 1)", openFeeOf(1n) === 1n);
+
+  const future = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { openTime: T0 + 1n });
+  expect("an open time in the future is refused", !future.ok && /in the future/.test(future.error), why(future));
+  const stale = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { openTime: T0 - CLOCK_SLACK });
+  expect("an open time older than the slack is refused", !stale.ok && /too far in the past/.test(stale.error), why(stale));
+  const lagging = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { openTime: T0 - CLOCK_SLACK + 1n });
+  expect("an open time within the slack is accepted", lagging.ok, why(lagging));
 }
 
 const collateralCoin = coin(COLLATERAL);
-const opened = call(TRADER, pooled, "openPosition", collateralCoin, SIZE, true, OWNER_SECRET, SALT);
+const opened = openCall(TRADER, pooled, collateralCoin, SIZE, true, OWNER_SECRET, SALT);
 expect("a 10x long opens", opened.ok, why(opened));
 if (!opened.ok) {
   console.error(`\n${failures} failure(s)\n`);
@@ -192,7 +246,9 @@ const position = {
   isLong: true,
   size: SIZE,
   collateral: COLLATERAL,
+  openFee: openFeeOf(SIZE),
   entryPrice: PRICE,
+  openTime: T0,
   collateralNonce: collateralCoin.nonce,
   salt: SALT,
 };
@@ -212,8 +268,8 @@ const commitment = pureCircuits.positionCommitment(position);
   );
   const outs = opened.zswap.outputs;
   expect(
-    "the collateral coin goes to the contract, not into the pool coin",
-    outs.length === 1 && !outs[0].recipient.is_left && outs[0].coinInfo.value === COLLATERAL
+    "the whole coin, fee included, goes to the contract, not into the pool coin",
+    outs.length === 1 && !outs[0].recipient.is_left && outs[0].coinInfo.value === COLLATERAL + openFeeOf(SIZE)
   );
 }
 
@@ -267,6 +323,8 @@ expect("the collateral's token type is visible", render(opened.transcript).inclu
 console.log("\n  privacy — the position (must NOT be found)\n");
 expect("size is not on chain", !found(encodings(SIZE)));
 expect("collateral is not on chain", !found(encodings(COLLATERAL)));
+expect("the coin's value is not on chain", !found(encodings(COLLATERAL + openFeeOf(SIZE))));
+expect("the opening fee is not on chain", !found(encodings(openFeeOf(SIZE))));
 expect("the owner secret is not on chain", !found([hex(OWNER_SECRET)]));
 expect("the owner key is not on chain", !found([hex(position.owner)]));
 expect("the salt is not on chain", !found([hex(SALT)]));
@@ -278,33 +336,53 @@ expect("the collateral coin nonce is not on chain", !found([hex(collateralCoin.n
 console.log("\n  closing\n");
 
 const RECIPIENT = key(0x77);
-const qualified = { ...collateralCoin, mt_index: 0n };
+const qualified = held(collateralCoin, SIZE);
+const OPEN_FEE = openFeeOf(SIZE);
+const CLOSE_FEE = closeFeeOf(SIZE);
+const BORROW_FEE = borrowFeeOf(SIZE, HELD);
+const FEES = OPEN_FEE + CLOSE_FEE + BORROW_FEE;
+// What the trader gets from the coin when nothing is lost: the collateral
+// less the closing and borrow fees.
+const KEEP = COLLATERAL - CLOSE_FEE - BORROW_FEE;
 const pathFor = (state) => ledger(state).positions.findPathForLeaf(commitment);
 const at = (price) => {
   const r = call(DEPLOYER, opened.state, "setPrice", price, ADMIN_SECRET);
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
+const closeArgs = (o) => [o.position, o.secret, o.path, o.coin, o.pnl, o.closeFee, o.borrowFee, o.closeTime, o.to];
 const close = (state, overrides = {}) => {
-  const o = { position, secret: OWNER_SECRET, coin: qualified, pnl: 0n, to: RECIPIENT, ...overrides };
-  return call(TRADER, state, "closePosition", o.position, o.secret, pathFor(state), o.coin, o.pnl, o.to);
+  const o = {
+    position,
+    secret: OWNER_SECRET,
+    path: pathFor(state),
+    coin: qualified,
+    pnl: 0n,
+    closeFee: CLOSE_FEE,
+    borrowFee: BORROW_FEE,
+    closeTime: T1,
+    time: T1,
+    to: RECIPIENT,
+    ...overrides,
+  };
+  return callAt(o.time, TRADER, state, "closePosition", ...closeArgs(o));
 };
 const paidTo = (r, who) =>
   r.zswap.outputs
     .filter((o) => o.recipient.is_left && hex(o.recipient.left.bytes) === hex(who.bytes))
     .reduce((sum, o) => sum + o.coinInfo.value, 0n);
 const toContract = (r) => r.zswap.outputs.filter((o) => !o.recipient.is_left);
-const floorDiv = (a, b) => a / b;
-const ceilDiv = (a, b) => (a + b - 1n) / b;
 
-// Unchanged price: the custody test. Full collateral back, pool untouched.
+// Unchanged price: the custody test. The collateral back less closing and
+// borrow fees, all three fees to the treasury, the pool untouched.
 const flat = close(opened.state);
 expect("close at an unchanged price is accepted", flat.ok, why(flat));
 if (flat.ok) {
   const l = ledger(flat.state);
-  expect("the whole collateral goes to the recipient", paidTo(flat, RECIPIENT) === COLLATERAL, String(paidTo(flat, RECIPIENT)));
-  expect("nothing else is created", flat.zswap.outputs.length === 1);
-  expect("the pool is untouched", l.poolValue === after.poolValue);
+  expect("the recipient gets the collateral less the closing and borrow fees", paidTo(flat, RECIPIENT) === KEEP, `${paidTo(flat, RECIPIENT)} vs ${KEEP}`);
+  expect("the treasury gets all three fees", paidTo(flat, TREASURY) === FEES, `${paidTo(flat, TREASURY)} vs ${FEES}`);
+  expect("no one else is paid", flat.zswap.outputs.filter((o) => o.recipient.is_left).length === 2);
+  expect("the pool is untouched: no fee reaches it", l.poolValue === after.poolValue);
   expect("the close is counted", l.closedPositions === 1n);
   expect(
     "the nullifier is recorded",
@@ -322,6 +400,10 @@ if (flat.ok) {
   );
   expect("close: size is not published", !inClose(encodings(SIZE)));
   expect("close: collateral is not published", !inClose(encodings(COLLATERAL)));
+  expect("close: the fees to the treasury are not published", !inClose(encodings(FEES)));
+  expect("close: the closing fee is not published", !inClose(encodings(CLOSE_FEE)));
+  expect("close: the trader's payout is not published", !inClose(encodings(KEEP)));
+  expect("control: the close time is visible", inClose(encodings(T1)));
   expect("close: the recipient's key is not published", !inClose([hex(RECIPIENT.bytes)]));
   expect("close: the owner secret is not published", !inClose([hex(OWNER_SECRET)]));
   expect("close: the salt is not published", !inClose([hex(SALT)]));
@@ -337,6 +419,26 @@ if (flat.ok) {
   expect("an altered opening is not in the tree", !forged.ok, why(forged));
   const greedy = close(opened.state, { pnl: 1n });
   expect("a profit at an unchanged price is refused", !greedy.ok && /profit overstated/.test(greedy.error), why(greedy));
+
+  const lowClose = close(opened.state, { closeFee: CLOSE_FEE - 1n });
+  expect("a closing fee one unit short is refused", !lowClose.ok && /closing fee understated/.test(lowClose.error), why(lowClose));
+  const highClose = close(opened.state, { closeFee: CLOSE_FEE + 1n });
+  expect("a closing fee one unit over is refused", !highClose.ok && /closing fee overstated/.test(highClose.error), why(highClose));
+  const lowBorrow = close(opened.state, { borrowFee: BORROW_FEE - 1n });
+  expect("a borrow fee one unit short is refused", !lowBorrow.ok && /borrow fee understated/.test(lowBorrow.error), why(lowBorrow));
+  const highBorrow = close(opened.state, { borrowFee: BORROW_FEE + 1n });
+  expect("a borrow fee one unit over is refused", !highBorrow.ok && /borrow fee overstated/.test(highBorrow.error), why(highBorrow));
+
+  // Naming the close time early would shrink the borrow fee: at most the
+  // slack is tolerated.
+  const backdated = close(opened.state, { closeTime: T1 - CLOCK_SLACK, borrowFee: borrowFeeOf(SIZE, HELD - CLOCK_SLACK) });
+  expect("a close time older than the slack is refused", !backdated.ok && /too far in the past/.test(backdated.error), why(backdated));
+  const ahead = close(opened.state, { closeTime: T1 + 1n, borrowFee: borrowFeeOf(SIZE, HELD + 1n) });
+  expect("a close time in the future is refused", !ahead.ok && /in the future/.test(ahead.error), why(ahead));
+  const beforeOpen = close(opened.state, { time: T0, closeTime: T0 - 1n, borrowFee: 0n });
+  expect("a close time before the open is refused", !beforeOpen.ok && /before the open/.test(beforeOpen.error), why(beforeOpen));
+  const instant = close(opened.state, { time: T0, closeTime: T0, borrowFee: 0n });
+  expect("a position closed in the second it opened owes no borrow fee", instant.ok && paidTo(instant, TREASURY) === OPEN_FEE + CLOSE_FEE, why(instant));
 }
 
 // ── Solvency ────────────────────────────────────────────────────────────────
@@ -348,7 +450,7 @@ if (flat.ok) {
   let accepted = 0;
   let refusal = "";
   for (let i = 0; i < 5; i += 1) {
-    const r = call(TRADER, state, "openPosition", coin(COLLATERAL), SIZE, true, OWNER_SECRET, bytes32(0xa0 + i));
+    const r = openCall(TRADER, state, coin(COLLATERAL), SIZE, true, OWNER_SECRET, bytes32(0xa0 + i));
     if (r.ok) {
       accepted += 1;
       state = r.state;
@@ -369,7 +471,8 @@ if (flat.ok) {
   const capped = close(moon, { pnl: MAX_PAYOUT });
   expect("the capped profit is paid — an enforced take-profit", capped.ok, why(capped));
   if (capped.ok) {
-    expect("the recipient gets collateral plus exactly the cap", paidTo(capped, RECIPIENT) === COLLATERAL + MAX_PAYOUT);
+    expect("the recipient gets collateral less fees plus exactly the cap", paidTo(capped, RECIPIENT) === KEEP + MAX_PAYOUT);
+    expect("the treasury gets the fees", paidTo(capped, TREASURY) === FEES);
     expect("the pool pays exactly the cap", ledger(capped.state).poolValue === after.poolValue - MAX_PAYOUT);
     expect("the reservation is released", ledger(capped.state).reserved === 0n);
   }
@@ -387,12 +490,13 @@ if (flat.ok) {
   expect("a winning long closes", win.ok, why(win));
   if (win.ok) {
     expect(
-      "the recipient gets collateral plus profit",
-      paidTo(win, RECIPIENT) === COLLATERAL + profit,
-      `${paidTo(win, RECIPIENT)} vs ${COLLATERAL + profit}`
+      "the recipient gets collateral less fees plus profit",
+      paidTo(win, RECIPIENT) === KEEP + profit,
+      `${paidTo(win, RECIPIENT)} vs ${KEEP + profit}`
     );
-    expect("the pool pays exactly the profit", ledger(win.state).poolValue === after.poolValue - profit);
-    expect("the pool keeps its change", toContract(win).length === 1 && toContract(win)[0].coinInfo.value === after.poolValue - profit);
+    expect("the treasury gets the fees", paidTo(win, TREASURY) === FEES);
+    expect("the pool pays exactly the profit, fees aside", ledger(win.state).poolValue === after.poolValue - profit);
+    expect("the pool keeps its change", toContract(win).some((o) => o.coinInfo.value === after.poolValue - profit));
   }
 }
 
@@ -406,8 +510,9 @@ let afterLoss;
   const lose = close(down, { pnl: loss });
   expect("a losing long closes", lose.ok, why(lose));
   if (lose.ok) {
-    expect("the recipient gets collateral minus loss", paidTo(lose, RECIPIENT) === COLLATERAL - loss);
-    expect("the pool gains exactly the loss", ledger(lose.state).poolValue === after.poolValue + loss);
+    expect("the recipient gets collateral minus loss and fees", paidTo(lose, RECIPIENT) === KEEP - loss);
+    expect("the treasury gets the fees", paidTo(lose, TREASURY) === FEES);
+    expect("the pool gains exactly the loss, no fees", ledger(lose.state).poolValue === after.poolValue + loss);
     afterLoss = lose.state;
   }
 }
@@ -420,6 +525,7 @@ let afterLoss;
   expect("a wiped-out long closes", wiped.ok, why(wiped));
   if (wiped.ok) {
     expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
+    expect("the treasury gets the opening fee only: the others are forgiven", paidTo(wiped, TREASURY) === OPEN_FEE);
     expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === after.poolValue + COLLATERAL);
   }
 }
@@ -432,12 +538,12 @@ const shortCoin = coin(COLLATERAL);
 const SHORT_SALT = bytes32(0x5a);
 const shortPosition = { ...position, isLong: false, collateralNonce: shortCoin.nonce, salt: SHORT_SALT };
 const shortCommitment = pureCircuits.positionCommitment(shortPosition);
-const shortOpened = call(TRADER, pooled, "openPosition", shortCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
+const shortOpened = openCall(TRADER, pooled, shortCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
 expect("a 10x short opens", shortOpened.ok, why(shortOpened));
 
 {
-  const tooMuch = call(TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 51n, false, OWNER_SECRET, SALT);
-  expect("a 51x short is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
+  const tooMuch = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL * 21n, false, OWNER_SECRET, SALT);
+  expect("a 21x short is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
   const l = ledger(shortOpened.state);
   expect("a short reserves the same maxPayout as a long", l.reserved === MAX_PAYOUT);
   expect("the short's opening is in the tree", l.positions.findPathForLeaf(shortCommitment) !== undefined);
@@ -449,8 +555,8 @@ expect("a 10x short opens", shortOpened.ok, why(shortOpened));
   // Direction privacy: the same open as a long and as a short must leave the
   // same public footprint, except for values derived from the commitment.
   const sameCoin = { ...shortCoin };
-  const asLong = call(TRADER, pooled, "openPosition", sameCoin, SIZE, true, OWNER_SECRET, SHORT_SALT);
-  const asShort = call(TRADER, pooled, "openPosition", sameCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
+  const asLong = openCall(TRADER, pooled, sameCoin, SIZE, true, OWNER_SECRET, SHORT_SALT);
+  const asShort = openCall(TRADER, pooled, sameCoin, SIZE, false, OWNER_SECRET, SHORT_SALT);
   const ta = asLong.transcript.map((op) => render(op));
   const tb = asShort.transcript.map((op) => render(op));
   const differing = ta.flatMap((op, i) => (op === tb[i] ? [] : [op]));
@@ -476,20 +582,25 @@ const closeShort = (state, overrides = {}) => {
   const o = {
     position: shortPosition,
     secret: OWNER_SECRET,
-    coin: { ...shortCoin, mt_index: 0n },
+    coin: held(shortCoin, SIZE),
     pnl: 0n,
+    closeFee: CLOSE_FEE,
+    borrowFee: BORROW_FEE,
+    closeTime: T1,
+    time: T1,
     to: RECIPIENT,
     ...overrides,
   };
-  const path = ledger(state).positions.findPathForLeaf(pureCircuits.positionCommitment(o.position)) ??
+  o.path =
+    ledger(state).positions.findPathForLeaf(pureCircuits.positionCommitment(o.position)) ??
     ledger(state).positions.findPathForLeaf(shortCommitment);
-  return call(TRADER, state, "closePosition", o.position, o.secret, path, o.coin, o.pnl, o.to);
+  return callAt(o.time, TRADER, state, "closePosition", ...closeArgs(o));
 };
 const shortPool = ledger(shortOpened.state).poolValue;
 
 {
   const flatShort = closeShort(shortOpened.state);
-  expect("a short at an unchanged price returns the whole collateral", flatShort.ok && paidTo(flatShort, RECIPIENT) === COLLATERAL, why(flatShort));
+  expect("a short at an unchanged price returns the collateral less fees", flatShort.ok && paidTo(flatShort, RECIPIENT) === KEEP, why(flatShort));
   const asLong = closeShort(shortOpened.state, { position: { ...shortPosition, isLong: true } });
   expect("a short cannot be closed as a long", !asLong.ok, why(asLong));
 }
@@ -505,7 +616,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   const win = closeShort(down, { pnl: profit });
   expect("a short wins when the price falls", win.ok, why(win));
   if (win.ok) {
-    expect("the recipient gets collateral plus profit", paidTo(win, RECIPIENT) === COLLATERAL + profit);
+    expect("the recipient gets collateral less fees plus profit", paidTo(win, RECIPIENT) === KEEP + profit);
     expect("the pool pays exactly the profit", ledger(win.state).poolValue === shortPool - profit);
     expect("the short's reservation is released", ledger(win.state).reserved === 0n);
   }
@@ -522,7 +633,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   const lose = closeShort(up, { pnl: loss });
   expect("a short loses when the price rises", lose.ok, why(lose));
   if (lose.ok) {
-    expect("the recipient gets collateral minus loss", paidTo(lose, RECIPIENT) === COLLATERAL - loss);
+    expect("the recipient gets collateral minus loss and fees", paidTo(lose, RECIPIENT) === KEEP - loss);
     expect("the pool gains exactly the loss", ledger(lose.state).poolValue === shortPool + loss);
   }
 }
@@ -534,25 +645,104 @@ const shortPool = ledger(shortOpened.state).poolValue;
   expect("a wiped-out short closes", wiped.ok, why(wiped));
   if (wiped.ok) {
     expect("the recipient gets nothing", paidTo(wiped, RECIPIENT) === 0n);
+    expect("the treasury gets the opening fee only", paidTo(wiped, TREASURY) === OPEN_FEE);
     expect("the pool gains the whole collateral, no more", ledger(wiped.state).poolValue === shortPool + COLLATERAL);
   }
 }
 
-// A 50x short of 10,000 pUSDC and a 50% fall: raw profit 250k, cap 100k.
+// A 20x short of 10,000 pUSDC and a 60% fall: raw profit 120k, cap 100k.
 {
   const BIG = 10_000_000_000n;
   const bigCoin = coin(BIG);
-  const big = { ...shortPosition, size: BIG * 50n, collateral: BIG, collateralNonce: bigCoin.nonce, salt: bytes32(0x5b) };
-  const opened50 = call(TRADER, pooled, "openPosition", bigCoin, big.size, false, OWNER_SECRET, big.salt);
-  expect("a 50x short opens", opened50.ok, why(opened50));
-  const crash = call(DEPLOYER, opened50.state, "setPrice", 1_500_000_000n, ADMIN_SECRET).state;
-  const bigPath = ledger(crash).positions.findPathForLeaf(pureCircuits.positionCommitment(big));
+  const bigSize = BIG * 20n;
+  const big = {
+    ...shortPosition,
+    size: bigSize,
+    collateral: BIG,
+    openFee: openFeeOf(bigSize),
+    collateralNonce: bigCoin.nonce,
+    salt: bytes32(0x5b),
+  };
+  const opened20 = openCall(TRADER, pooled, bigCoin, bigSize, false, OWNER_SECRET, big.salt);
+  expect("a 20x short opens", opened20.ok, why(opened20));
+  const crash = call(DEPLOYER, opened20.state, "setPrice", 1_200_000_000n, ADMIN_SECRET).state;
   const closeBig = (pnl) =>
-    call(TRADER, crash, "closePosition", big, OWNER_SECRET, bigPath, { ...bigCoin, mt_index: 0n }, pnl, RECIPIENT);
-  const raw = closeBig(floorDiv(big.size * 1_500_000_000n, PRICE));
+    callAt(T1, TRADER, crash, "closePosition", ...closeArgs({
+      position: big,
+      secret: OWNER_SECRET,
+      path: ledger(crash).positions.findPathForLeaf(pureCircuits.positionCommitment(big)),
+      coin: held(bigCoin, bigSize),
+      pnl,
+      closeFee: closeFeeOf(bigSize),
+      borrowFee: borrowFeeOf(bigSize, HELD),
+      closeTime: T1,
+      to: RECIPIENT,
+    }));
+  const raw = closeBig(floorDiv(bigSize * 1_800_000_000n, PRICE));
   expect("a short's profit above the cap is refused", !raw.ok && /payout cap/.test(raw.error), why(raw));
   const capped = closeBig(MAX_PAYOUT);
-  expect("a short's capped profit is paid", capped.ok && paidTo(capped, RECIPIENT) === BIG + MAX_PAYOUT, why(capped));
+  expect(
+    "a short's capped profit is paid",
+    capped.ok && paidTo(capped, RECIPIENT) === BIG - closeFeeOf(bigSize) - borrowFeeOf(bigSize, HELD) + MAX_PAYOUT,
+    why(capped)
+  );
+}
+
+// ── Fees beyond the collateral ──────────────────────────────────────────────
+
+console.log("\n  fees beyond the collateral\n");
+
+// Held about 2.3 days at 10^-6 of size per second: the borrow fee (~2,469
+// pUSDC) exceeds the ~1,235 collateral.
+{
+  const LONG_HOLD = 200_000n;
+  const T2 = T0 + LONG_HOLD;
+  const borrow = borrowFeeOf(SIZE, LONG_HOLD);
+  expect("(the closing and borrow fees exceed the collateral)", CLOSE_FEE + borrow > COLLATERAL);
+  const late = (state, pnl) => close(state, { time: T2, closeTime: T2, borrowFee: borrow, pnl });
+
+  const idle = late(opened.state, 0n);
+  expect("a position whose fees exceed its collateral still closes", idle.ok, why(idle));
+  if (idle.ok) {
+    expect("the trader gets nothing", paidTo(idle, RECIPIENT) === 0n);
+    expect("the treasury gets the opening fee and all the collateral", paidTo(idle, TREASURY) === OPEN_FEE + COLLATERAL);
+    expect("the pool is untouched", ledger(idle.state).poolValue === after.poolValue);
+  }
+
+  // Price up 25%: the profit (~3,086) covers the shortfall (~1,247), which
+  // stays in the pool; the trader gets the rest of the profit.
+  const up = at(3_750_000_000n);
+  const profit = floorDiv(SIZE * 750_000_000n, PRICE);
+  const shortfall = CLOSE_FEE + borrow - COLLATERAL;
+  const win = late(up, profit);
+  expect("a profit pays the fees the collateral could not", win.ok, why(win));
+  if (win.ok) {
+    expect("the trader gets the profit less the shortfall", paidTo(win, RECIPIENT) === profit - shortfall, `${paidTo(win, RECIPIENT)} vs ${profit - shortfall}`);
+    expect("the treasury still gets only what the coin held", paidTo(win, TREASURY) === OPEN_FEE + COLLATERAL);
+    expect("the pool pays out only profit less shortfall", ledger(win.state).poolValue === after.poolValue - (profit - shortfall));
+  }
+}
+
+// ── Fee epoch ───────────────────────────────────────────────────────────────
+
+console.log("\n  fee epoch\n");
+
+{
+  const DEPOSIT = 7_000_000n;
+  const paid = call(DEPLOYER, pooled, "depositFees", coin(DEPOSIT));
+  expect("the treasury can pay fees into the pool", paid.ok, why(paid));
+  if (paid.ok) {
+    const before = ledger(pooled);
+    const l = ledger(paid.state);
+    expect("the pool grows by exactly the deposit", l.poolValue === before.poolValue + DEPOSIT && l.pool.value === before.poolValue + DEPOSIT);
+    expect("no shares are minted for it", l.lpSupply === before.lpSupply);
+    const SHARES = 100_000_000_000n;
+    expect("each zLP share now redeems for more", floorDiv(SHARES * l.poolValue, l.lpSupply) > SHARES);
+  }
+  const other = call(DEPLOYER, pooled, "depositFees", coin(DEPOSIT, OTHER_TOKEN));
+  expect("a deposit that is not pUSDC is refused", !other.ok && /paid in pUSDC/.test(other.error), why(other));
+  const nobody = call(DEPLOYER, genesis, "depositFees", coin(DEPOSIT));
+  expect("a deposit with no LPs to pay is refused", !nobody.ok && /no LPs/.test(nobody.error), why(nobody));
 }
 
 // ── Withdrawing liquidity ───────────────────────────────────────────────────

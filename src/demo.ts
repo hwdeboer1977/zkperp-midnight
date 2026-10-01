@@ -13,6 +13,11 @@
  *   knows its nonce. This opens a long and a short and closes each at an
  *   unchanged price, and requires the trader's pUSDC balance to return to exactly where it was.
  *
+ * FEES — opening, closing and borrow fees, each pinned and rounded up, go to
+ *   the treasury (the dev wallet here) as shielded outputs; none reaches the
+ *   pool at a close. Then the treasury deposits the LPs' 70% share in one
+ *   public epoch payment.
+ *
  * SOLVENCY — every open reserves the constant `maxPayout` and every close
  *   releases it; a profit beyond the cap is paid exactly the cap.
  *
@@ -42,9 +47,19 @@ import { buildWallet, makeWalletProviders, waitForSync, type BuiltWallet } from 
 import { makeProviders } from "./providers.js";
 import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
 import { readyTrader, traderSeed } from "./trader.js";
-import { closePosition, openPosition, positionPnl, readLedger, type ContractHandle } from "./perp.js";
-import { positionsFile, reconcile } from "./positions.js";
-import { redeemable, removeLiquidity } from "./pool.js";
+import {
+  borrowFeeOf,
+  closeFeeOf,
+  closePosition,
+  openFeeOf,
+  openPosition,
+  positionPnl,
+  readLedger,
+  settlement,
+  type ContractHandle,
+} from "./perp.js";
+import { openPositionsOn, positionsFile, reconcile } from "./positions.js";
+import { depositFees, redeemable, removeLiquidity } from "./pool.js";
 import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
 
 const PUSDC = 1_000_000n;
@@ -52,14 +67,23 @@ const DEV_MINT = 1_000_000n * PUSDC;
 const LIQUIDITY = 500_000n * PUSDC;
 const TRADER_MINT = 10_000n * PUSDC;
 const PRICE = 3_000_000_000n; // $3,000.000000
-const MAX_LEVERAGE = 50n;
+const MAX_LEVERAGE = 20n;
+// 0.10% of size to open and to close. The borrow rate is far above a real
+// one — 10^-6 of size per second, 0.36% an hour — so a demo position held
+// for a minute pays a fee big enough to see.
+const OPEN_FEE_BPS = 10n;
+const CLOSE_FEE_BPS = 10n;
+const BORROW_RATE = 1_000_000n;
+const CLOCK_SLACK = 600n;
+// The LPs' share of fees, paid into the pool at the end of the epoch.
+const LP_FEE_SHARE_PCT = 70n;
 const MIN_COLLATERAL = 10n * PUSDC;
 // The most any position can win, and so what each open reserves. Small enough
 // that a 50% move at 10x hits it, so the demo can show the cap binding.
 const MAX_PAYOUT = 5_000n * PUSDC;
 
 // Distinctive, so a match in raw bytes means a leak and not a coincidence.
-const COLLATERAL = 1_234_567_891n; // 1,234.567891 pUSDC
+const COLLATERAL = 1_234_567_891n; // 1,234.567891 pUSDC, the coin posted
 const SIZE = 12_345_678_912n; //    ~10x
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
@@ -125,6 +149,11 @@ async function main() {
       MAX_LEVERAGE,
       MIN_COLLATERAL,
       MAX_PAYOUT,
+      OPEN_FEE_BPS,
+      CLOSE_FEE_BPS,
+      BORROW_RATE,
+      { bytes: coinKey(devWallet) },
+      CLOCK_SLACK,
     ]);
     const devPerp = await handle(devWallet, devSeed, "zkperp", perpAddress);
     info(`zkperp ${perpAddress}`);
@@ -170,33 +199,75 @@ async function main() {
     info(`pool ${fmt((await readLedger(devPerp)).poolValue)} pUSDC at $${fmt(PRICE)}`);
 
     // ── Step 3: custody ───────────────────────────────────────────────────
+    // The treasury publishes its encryption key, as any payee publishes an
+    // address; traders need it to pay fees the treasury's wallet can find.
+    const treasuryEncKey = String(devWallet.shieldedSecretKeys.encryptionPublicKey);
+
+    // A run that died mid-way can leave positions open, and their reservations
+    // would throw off every check below. Close them first.
+    for (const leftover of openPositionsOn(perpAddress)) {
+      info(`closing a position left open by an earlier run (${leftover.commitment.slice(0, 12)}…)`);
+      await closePosition(trader.perp, leftover, usdc, trader.coinPublicKey, treasuryEncKey);
+    }
+    if ((await readLedger(devPerp)).reserved !== 0n) {
+      throw new Error("liquidity is still reserved for positions this machine has no record of");
+    }
+
+    // Fees go to the treasury, which is the dev wallet here; the run's total
+    // is paid out to LPs at the end.
+    let feesCollected = 0n;
+    const openFee = openFeeOf(SIZE, OPEN_FEE_BPS);
+    const closeFee = closeFeeOf(SIZE, CLOSE_FEE_BPS);
+    info(`fees on a ${fmt(SIZE)} position: ${fmt(openFee)} to open, ${fmt(closeFee)} to close, plus borrow`);
+
     for (const isLong of [true, false]) {
       const dir = isLong ? "long" : "short";
       section = `custody, ${dir}`;
       step(`Custody — open and close a ${dir} at an unchanged price`);
       const before = await balance(trader.wallet, usdc);
       const poolBefore = (await readLedger(devPerp)).poolValue;
-      const devBefore = await balance(dev.wallet, usdc);
-
       const reservedBefore = (await readLedger(devPerp)).reserved;
+
       const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened ${opened.txHash}`);
       check(
         "the open reserved exactly maxPayout — the same for every position",
         (await readLedger(devPerp)).reserved === reservedBefore + MAX_PAYOUT
       );
+      check("the pool is untouched by an open, fee included", (await readLedger(devPerp)).poolValue === poolBefore);
       const whileOpen = await waitForBalance(trader.wallet, usdc, (b) => b < before);
-      check(`the trader paid exactly the collateral (${fmt(before)} → ${fmt(whileOpen)})`, before - whileOpen === COLLATERAL);
+      check(`the trader posted exactly the coin (${fmt(before)} → ${fmt(whileOpen)})`, before - whileOpen === COLLATERAL);
+      check(
+        "the position's collateral is the coin less the opening fee",
+        BigInt(opened.record.opening.collateral) === COLLATERAL - openFee && BigInt(opened.record.opening.openFee) === openFee
+      );
       await privacy("open", opened.txHash, trader, opened.record, perpAddress, usdc);
 
-      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
-      info(`closed ${closed.txHash}`);
+      const devBefore = await balance(dev.wallet, usdc);
+      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
+      info(`closed ${closed.txHash} after ${closed.held}s: borrow fee ${fmt(closed.borrowFee)}`);
+      const fees = openFee + closed.closeFee + closed.borrowFee;
+      check("the closing fee is size × 0.10%, rounded up", closed.closeFee === closeFee);
+      check(
+        "the borrow fee is size × rate × seconds held, rounded up",
+        closed.borrowFee === borrowFeeOf(SIZE, BORROW_RATE, closed.held) && closed.borrowFee > 0n
+      );
       const afterClose = await waitForBalance(trader.wallet, usdc, (b) => b > whileOpen);
-      check(`the collateral came back in full (${fmt(whileOpen)} → ${fmt(afterClose)})`, afterClose === before);
-      check("the pool did not move", (await readLedger(devPerp)).poolValue === poolBefore);
-      check("the dev wallet did not receive it", (await balance(dev.wallet, usdc)) === devBefore);
+      check(
+        `the trader gets the coin back less all three fees (${fmt(whileOpen)} → ${fmt(afterClose)})`,
+        afterClose === before - fees
+      );
+      const devAfter = await waitForBalance(dev.wallet, usdc, (b) => b > devBefore);
+      check(`the treasury receives exactly the fees (${fmt(fees)})`, devAfter - devBefore === fees);
+      check("the pool did not move: no fee reaches it", (await readLedger(devPerp)).poolValue === poolBefore);
       check("the close released the reservation", (await readLedger(devPerp)).reserved === reservedBefore);
-      await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier);
+      feesCollected += fees;
+      await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier, [
+        ["closing fee", closed.closeFee],
+        ["borrow fee", closed.borrowFee],
+        ["fees to the treasury", fees],
+        ["trader's payout", COLLATERAL - fees],
+      ]);
     }
 
     // ── Step 4: PnL against the pool ──────────────────────────────────────
@@ -223,14 +294,18 @@ async function main() {
       const before = await balance(trader.wallet, usdc);
       const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened at $${fmt(PRICE)}: ${opened.txHash}`);
-      const whileOpen = await waitForBalance(trader.wallet, usdc, (b) => b < before);
+      await waitForBalance(trader.wallet, usdc, (b) => b < before);
 
       await setPrice(devPerp, exit, adminSecret);
       const poolBefore = (await readLedger(devPerp)).poolValue;
-      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      const devBefore = await balance(dev.wallet, usdc);
+      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
       const expected = positionPnl(isLong, SIZE, PRICE, exit, MAX_PAYOUT);
       info(`closed at $${fmt(exit)}: ${closed.txHash}`);
-      info(`${closed.profit ? "profit" : "loss"} ${fmt(closed.pnl)} pUSDC${closed.capped ? " (capped at maxPayout)" : ""}`);
+      info(
+        `${closed.profit ? "profit" : "loss"} ${fmt(closed.pnl)} pUSDC${closed.capped ? " (capped at maxPayout)" : ""}; ` +
+          `fees ${fmt(openFee)} + ${fmt(closed.closeFee)} + ${fmt(closed.borrowFee)} borrow`
+      );
       check(
         closed.capped
           ? "the profit is exactly maxPayout, not the larger raw PnL"
@@ -239,25 +314,63 @@ async function main() {
       );
       if (label.includes("payout cap")) check("the cap bound, as intended", closed.capped);
 
-      // A loss beyond the collateral costs only the collateral.
-      const signed = closed.profit ? closed.pnl : -(closed.pnl < COLLATERAL ? closed.pnl : COLLATERAL);
+      // Worked out here from the opening, independently of closePosition.
+      const s = settlement(
+        { collateral: COLLATERAL - openFee, openFee },
+        expected,
+        closeFeeOf(SIZE, CLOSE_FEE_BPS),
+        borrowFeeOf(SIZE, BORROW_RATE, closed.held)
+      );
       const afterClose =
-        signed === -COLLATERAL
+        s.toTrader === 0n
           ? await balance(trader.wallet, usdc) // nothing comes back to wait for
-          : await waitForBalance(trader.wallet, usdc, (b) => b > whileOpen);
+          : await waitForBalance(trader.wallet, usdc, (b) => b > before - COLLATERAL);
       check(
-        `the trader ends at start ${signed >= 0n ? "+" : "−"} ${fmt(signed < 0n ? -signed : signed)} (${fmt(before)} → ${fmt(afterClose)})`,
-        afterClose === before + signed
+        `the trader receives ${fmt(s.toTrader)} for a ${fmt(COLLATERAL)} coin (${fmt(before)} → ${fmt(afterClose)})`,
+        afterClose === before - COLLATERAL + s.toTrader
       );
       const poolAfter = (await readLedger(devPerp)).poolValue;
       check(
-        `the pool moves by the opposite amount (${fmt(poolBefore)} → ${fmt(poolAfter)})`,
-        poolAfter === poolBefore - signed
+        `the pool moves by the PnL alone, no fees (${fmt(poolBefore)} → ${fmt(poolAfter)})`,
+        poolAfter === poolBefore + s.toPool - s.fromPool
       );
+      const devAfter = await waitForBalance(dev.wallet, usdc, (b) => b > devBefore);
+      check(`the treasury receives exactly ${fmt(s.toTreasury)} in fees`, devAfter - devBefore === s.toTreasury);
+      if (label.includes("wipe-out")) {
+        check("a wipe-out forgives the closing and borrow fees: the treasury gets the opening fee only", s.toTreasury === openFee);
+      }
       check("no reservation is left behind", (await readLedger(devPerp)).reserved === 0n);
-      await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier);
+      feesCollected += s.toTreasury;
+      await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier, [
+        ["closing fee", closed.closeFee],
+        ["borrow fee", closed.borrowFee],
+        ["fees to the treasury", s.toTreasury],
+        ...(s.toTrader > 0n ? ([["trader's payout from the coin", s.toTrader - s.fromPool]] as Array<[string, bigint]>) : []),
+      ]);
     }
     await setPrice(devPerp, PRICE, adminSecret);
+
+    // ── Fee epoch: the treasury pays the LPs their share ──────────────────
+    section = "fee epoch";
+    step("Fee epoch — the treasury pays the LPs' share into the pool");
+    {
+      const toLps = (feesCollected * LP_FEE_SHARE_PCT) / 100n;
+      info(`fees collected this run ${fmt(feesCollected)}; ${LP_FEE_SHARE_PCT}% to LPs: ${fmt(toLps)}`);
+      const l = await readLedger(devPerp);
+      const shareBefore = redeemable(l, 1_000_000n);
+      const treasuryBefore = await balance(dev.wallet, usdc);
+      const txHash = await depositFees(devPerp, usdc, toLps);
+      info(`deposited ${txHash}`);
+      // Wait for the wallet's change to come back, so later balances are settled.
+      await waitForBalance(dev.wallet, usdc, (b) => b === treasuryBefore - toLps);
+      const l2 = await readLedger(devPerp);
+      check("the pool grows by exactly the deposit", l2.poolValue === l.poolValue + toLps);
+      check("no shares are minted for it", l2.lpSupply === l.lpSupply);
+      check(
+        `each zLP share is worth more (${fmt(shareBefore)} → ${fmt(redeemable(l2, 1_000_000n))} per share)`,
+        redeemable(l2, 1_000_000n) > shareBefore
+      );
+    }
 
     // ── Step 5: LP withdrawal ─────────────────────────────────────────────
     section = "liquidity";
@@ -290,8 +403,12 @@ async function main() {
         refusal = String(error instanceof Error ? error.message : error);
       }
       check("emptying the pool is refused while a position is open", /reserved for open positions/.test(refusal));
-      await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey);
+      // The dev wallet is also the treasury: let the close's fees land before
+      // measuring what the withdrawal pays.
+      const feesBefore = await balance(dev.wallet, usdc);
+      const shut = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
       info("closed it at an unchanged price");
+      await waitForBalance(dev.wallet, usdc, (b) => b === feesBefore + shut.settled.toTreasury);
 
       // Nothing open: the last LP may take everything.
       const l3 = await readLedger(devPerp);
@@ -335,7 +452,8 @@ async function privacy(
   record: { commitment: string; opening: Record<string, any> },
   contractAddress: string,
   usdc: Uint8Array,
-  nullifier?: Uint8Array
+  nullifier?: Uint8Array,
+  amounts: Array<[string, bigint]> = []
 ) {
   const raw = await rawTransaction(LOCAL.indexer, txHash);
   const o = record.opening;
@@ -350,6 +468,9 @@ async function privacy(
     );
   absent("size", findNumber(raw, BigInt(o.size)));
   absent("collateral", findNumber(raw, BigInt(o.collateral)));
+  absent("coin value", findNumber(raw, BigInt(o.collateral) + BigInt(o.openFee)));
+  absent("opening fee", findNumber(raw, BigInt(o.openFee)));
+  for (const [label, n] of amounts) absent(label, findNumber(raw, n));
   absent("owner secret", findBytes(raw, o.ownerSecret));
   absent("salt", findBytes(raw, o.salt));
   absent("collateral coin nonce", findBytes(raw, o.collateralNonce));

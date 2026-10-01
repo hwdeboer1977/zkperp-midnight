@@ -36,8 +36,12 @@ export interface PositionRecord {
     ownerSecret: string;
     isLong: boolean;
     size: string;
+    /** Net of the opening fee; the coin holds collateral + openFee. */
     collateral: string;
+    openFee: string;
     entryPrice: string;
+    /** Seconds since the epoch. */
+    openTime: string;
     collateralNonce: string;
     salt: string;
   };
@@ -103,6 +107,11 @@ export function reconcile(contractAddress: string, isInTree: (commitmentHex: str
     })
   );
   return { opened, failed };
+}
+
+/** Positions recorded as open on `contractAddress`. */
+export function openPositionsOn(contractAddress: string): PositionRecord[] {
+  return readAll().filter((r) => r.status === "open" && r.contractAddress === contractAddress);
 }
 
 export function positionsFile(): string {

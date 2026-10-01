@@ -30,3 +30,16 @@ export async function removeLiquidity(
   );
   return { txHash: tx.public.txHash, amount };
 }
+
+/**
+ * The treasury's epoch payment: adds `amount` pUSDC to the pool without
+ * minting shares, raising every zLP share's value.
+ */
+export async function depositFees(perp: ContractHandle, usdc: Uint8Array, amount: bigint): Promise<string> {
+  const tx = await perp.deployed.callTx.depositFees({
+    nonce: new Uint8Array(randomBytes(32)),
+    color: usdc,
+    value: amount,
+  });
+  return tx.public.txHash;
+}

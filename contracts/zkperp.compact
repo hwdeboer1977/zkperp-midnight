@@ -75,7 +75,29 @@ import CompactStandardLibrary;
 // few candidates. A close at an unchanged price moves nothing and reveals
 // nothing beyond "a position closed".
 //
-// Not yet here: liquidation, fees and funding.
+// ── Fees, and why they never touch the pool per trade ──────────────────────
+//
+// Three fees, each proportional to size and rounded UP, so rounding never
+// favours the trader and many tiny positions cannot shave them off:
+//   opening  size × openFeeBps / 10 000, taken out of the collateral at open;
+//   closing  size × closeFeeBps / 10 000, taken out of the payout;
+//   borrow   size × borrowRate × seconds held / 10^12, at close.
+// As with PnL, the trader supplies each fee and the circuit pins it exactly.
+//
+// A fee is a fixed fraction of size, so a fee paid into the public pool would
+// publish the size. Fees therefore go to `treasury`, a wallet key, as shielded
+// outputs: the public sees neither the amount nor the recipient. The treasury
+// pays the LPs' share back into the pool per epoch with `depositFees`, so only
+// epoch totals become public. The pool's change at a close stays the PnL alone.
+//
+// ⚠️ This trusts the treasury: whoever holds its key sees every fee, and so
+// every position's size, and holds the LPs' share until it deposits it. The
+// contract cannot enforce the deposit or the LP/protocol split.
+//
+// The opening fee stays inside the collateral coin until close — moving it at
+// open would publish it — and leaves with the other two.
+//
+// Not yet here: liquidation and funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
 
@@ -85,7 +107,8 @@ export sealed ledger usdc: Bytes<32>;
 // Hash of the admin's secret; see `adminKey`. Controls the mock oracle only.
 export sealed ledger admin: Bytes<32>;
 
-// Largest size / collateral a position may open at. GMX v1 allowed 50x.
+// Largest size / collateral a position may open at, on the collateral net
+// of the opening fee.
 export sealed ledger maxLeverage: Uint<8>;
 
 // Smallest collateral a position may post, in pUSDC minor units.
@@ -94,6 +117,22 @@ export sealed ledger minCollateral: Uint<64>;
 // The most any position can win, in pUSDC minor units, and so the liquidity
 // each open position reserves. See "Solvency" above.
 export sealed ledger maxPayout: Uint<64>;
+
+// Fees; see "Fees" above. Basis points of size, and a per-second rate in
+// units of 10^-12 of size. The opening fee is at least one basis point, so
+// every close sends the treasury something and no send is of nothing.
+export sealed ledger openFeeBps: Uint<16>;
+export sealed ledger closeFeeBps: Uint<16>;
+export sealed ledger borrowRate: Uint<32>;
+
+// Receives every fee, shielded.
+export sealed ledger treasury: ZswapCoinPublicKey;
+
+// How far an open or close time may trail the block time, in seconds. The
+// trader names the time (a circuit cannot read the clock, only compare
+// against it) and gains from naming it early at close, so this bounds the
+// borrow fee they can dodge to `clockSlack` seconds' worth.
+export sealed ledger clockSlack: Uint<32>;
 
 // ── Oracle ─────────────────────────────────────────────────────────────────
 
@@ -131,8 +170,12 @@ export struct Position {
   isLong: Boolean;
   // Notional, in pUSDC minor units. Size / collateral is the leverage.
   size: Uint<64>;
+  // Net of the opening fee. The collateral coin holds collateral + openFee.
   collateral: Uint<64>;
+  openFee: Uint<64>;
   entryPrice: Uint<64>;
+  // Seconds since the epoch, as checked against the block time at open.
+  openTime: Uint<64>;
   // Identifies the collateral coin this contract holds for this position.
   collateralNonce: Bytes<32>;
   // Random, 32 bytes. Without it the commitment is guessable.
@@ -158,7 +201,12 @@ constructor(
   initialPrice: Uint<64>,
   leverageCap: Uint<8>,
   collateralFloor: Uint<64>,
-  payoutCap: Uint<64>
+  payoutCap: Uint<64>,
+  openFee: Uint<16>,
+  closeFee: Uint<16>,
+  rate: Uint<32>,
+  feeRecipient: ZswapCoinPublicKey,
+  slack: Uint<32>
 ) {
   usdc = disclose(usdcToken);
   admin = disclose(adminCommitment);
@@ -169,6 +217,14 @@ constructor(
   minCollateral = disclose(collateralFloor);
   assert(disclose(payoutCap) > 0, "the payout cap must be positive");
   maxPayout = disclose(payoutCap);
+  assert(disclose(openFee) >= 1 && disclose(openFee) <= 10000, "the opening fee must be 1 to 10 000 bps");
+  openFeeBps = disclose(openFee);
+  assert(disclose(closeFee) <= 10000, "the closing fee is at most 10 000 bps");
+  closeFeeBps = disclose(closeFee);
+  borrowRate = disclose(rate);
+  treasury = disclose(feeRecipient);
+  assert(disclose(slack) > 0, "the clock slack must be positive");
+  clockSlack = disclose(slack);
   lpToken = default<Bytes<32>>;
 }
 
@@ -316,11 +372,15 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
 // Opens a long or a short at the current mark price, with `coin` as
 // collateral.
 //
-// `size`, `isLong`, `ownerSecret` and `salt` are circuit arguments, which are
-// private:
-// they reach the proof, not the transaction. So do the coin's value and nonce.
-// What leaves this circuit is the commitment and the collateral coin's Zswap
-// commitment, both hiding.
+// `size`, `isLong`, `openFee`, `ownerSecret` and `salt` are circuit arguments,
+// which are private: they reach the proof, not the transaction. So do the
+// coin's value and nonce. What leaves this circuit is the commitment, the
+// collateral coin's Zswap commitment, both hiding, and `openTime`, which says
+// no more than the transaction's own timestamp.
+//
+// The opening fee is ceil(size × openFeeBps / 10 000). It stays in the coin;
+// the position's collateral is what remains, and the leverage bounds apply to
+// that.
 //
 // The trader must keep the opening — every field of `Position` — or the
 // position can never be closed. It is not recoverable from the chain; that is
@@ -329,6 +389,8 @@ export circuit openPosition(
   coin: ShieldedCoinInfo,
   size: Uint<64>,
   isLong: Boolean,
+  openFee: Uint<64>,
+  openTime: Uint<64>,
   ownerSecret: Bytes<32>,
   salt: Bytes<32>
 ): [] {
@@ -337,10 +399,21 @@ export circuit openPosition(
   // reveals only that the collateral is pUSDC — which the contract requires.
   assert(disclose(coin.color) == usdc, "collateral must be pUSDC");
 
-  // Leverage bounds, checked in the proof against private values. A failed
-  // assert aborts proving, so a reader learns only that the bounds held.
+  // The open time may not be in the future, nor trail the block by more than
+  // the slack. A later time would only lower the borrow fee, and the first
+  // check forbids it.
+  const t = disclose(openTime);
+  assert(blockTimeGte(t), "open time is in the future");
+  assert(blockTimeLt((t + clockSlack) as Uint<64>), "open time is too far in the past");
+
+  // Fee and leverage bounds, checked in the proof against private values. A
+  // failed assert aborts proving, so a reader learns only that they held.
   assert(coin.value <= 18446744073709551615, "collateral too large");
-  const collateral = coin.value as Uint<64>;
+  const gross = coin.value as Uint<64>;
+  assert(openFee * 10000 >= size * openFeeBps, "opening fee understated");
+  assert(openFee * 10000 < size * openFeeBps + 10000, "opening fee overstated");
+  assert(openFee < gross, "the opening fee exceeds the collateral");
+  const collateral = (gross - openFee) as Uint<64>;
   assert(collateral >= minCollateral, "collateral below the minimum");
   assert(size >= collateral, "size below collateral: leverage under 1x");
   assert(size <= collateral * maxLeverage, "leverage above the maximum");
@@ -357,7 +430,9 @@ export circuit openPosition(
     isLong: isLong,
     size: size,
     collateral: collateral,
+    openFee: openFee,
     entryPrice: markPrice,
+    openTime: t,
     collateralNonce: coin.nonce,
     salt: salt
   };
@@ -365,23 +440,36 @@ export circuit openPosition(
   openPositions.increment(1);
 }
 
-// Closes a position at the current mark price and settles against the pool.
+// Closes a position at the current mark price and settles: the PnL against
+// the pool, the fees to the treasury.
 //
 // The caller proves, without saying which, that `position` is in `positions`
 // and that they hold its owner secret. They then name the collateral coin the
 // position committed to — nonce, value and Merkle index, which only they know
-// — and the contract spends it:
+// — and the contract spends it. The coin holds the collateral plus the opening
+// fee, and is divided, in this order of priority:
 //
-//   profit       collateral back in full, plus the profit (at most
-//                maxPayout) out of the pool;
-//   loss < coll. collateral minus the loss back, the loss merged into the pool;
-//   loss ≥ coll. the whole collateral merged into the pool, nothing back.
+//   1. a loss, up to the whole collateral, merged into the pool;
+//   2. the fees: the opening fee in full, then the closing and borrow fees out
+//      of what collateral the loss left, to the treasury;
+//   3. the rest back to the trader.
+//
+// A profit is paid on top, out of the pool, less any closing and borrow fees
+// the collateral could not cover — those stay in the pool. A loss that takes
+// the whole collateral leaves nothing for the closing and borrow fees: they
+// are forgiven, and the pool keeps everything.
 //
 // A long profits when the price rose, a short when it fell; at an unchanged
 // price both are flat. `pnl` is |PnL| in pUSDC minor units, computed by the
 // caller because circuits cannot divide, and pinned here: with Δ = |exit −
 // entry|, a profit must be min(floor(size × Δ / entry), maxPayout) and a loss
-// ceil(size × Δ / entry), each in the pool's favour.
+// ceil(size × Δ / entry), each in the pool's favour. `closeFee` must be
+// ceil(size × closeFeeBps / 10 000) and `borrowFee` ceil(size × borrowRate ×
+// (closeTime − openTime) / 10^12).
+//
+// `closeTime` is public, like the transaction's timestamp. The open time is
+// not: it is inside the commitment, and publishing it would link the close to
+// its open.
 //
 // `recipient` receives the payout. It is disclosed to build the output, but a
 // shielded output carries only a commitment, so it is not linkable to the key.
@@ -391,6 +479,9 @@ export circuit closePosition(
   path: MerkleTreePath<20, Bytes<32>>,
   collateral: QualifiedShieldedCoinInfo,
   pnl: Uint<64>,
+  closeFee: Uint<64>,
+  borrowFee: Uint<64>,
+  closeTime: Uint<64>,
   recipient: ZswapCoinPublicKey
 ): [] {
   assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
@@ -408,7 +499,24 @@ export circuit closePosition(
   // close their position against someone else's collateral.
   assert(collateral.nonce == position.collateralNonce, "not this position's collateral coin");
   assert(disclose(collateral.color) == usdc, "collateral must be pUSDC");
-  assert(collateral.value == position.collateral as Uint<128>, "collateral coin value does not match");
+  assert(
+    collateral.value == (position.collateral + position.openFee) as Uint<128>,
+    "collateral coin value does not match"
+  );
+
+  // The trader gains from naming the close time early, so it may trail the
+  // block by at most the slack, and may not precede the open.
+  const now = disclose(closeTime);
+  assert(blockTimeGte(now), "close time is in the future");
+  assert(blockTimeLt((now + clockSlack) as Uint<64>), "close time is too far in the past");
+  assert(now >= position.openTime, "close time is before the open");
+  const held = now - position.openTime;
+
+  assert(closeFee * 10000 >= position.size * closeFeeBps, "closing fee understated");
+  assert(closeFee * 10000 < position.size * closeFeeBps + 10000, "closing fee overstated");
+  const accrued = position.size * borrowRate * held;
+  assert(borrowFee * 1000000000000 >= accrued, "borrow fee understated");
+  assert(borrowFee * 1000000000000 < accrued + 1000000000000, "borrow fee overstated");
 
   const exit = markPrice;
   const entry = position.entryPrice;
@@ -435,10 +543,6 @@ export circuit closePosition(
     assert(pnl * entry >= delta, "loss understated");
     assert(pnl * entry < delta + entry, "loss overstated");
   }
-  // Wiped out: the loss reaches the collateral. The pool's change publishes
-  // the collateral here — the one case where it becomes public, since all of
-  // it is the loss.
-  const wiped = disclose(!isProfit && pnl >= position.collateral);
 
   // ⚠️ Why the amounts are chosen here, before any branch, and why `pool` is
   // read once up front.
@@ -451,39 +555,90 @@ export circuit closePosition(
   // only the taken branch, so local tests cannot see it; the first devnet loss
   // close failed exactly this way (0 − loss as a pool change).
   //
-  // So each stdlib call below gets values that are in range whichever branch
-  // is taken: profit and loss amounts are selected, not recomputed per branch,
-  // and neither exceeds what it is subtracted from.
+  // So every amount is selected up front, and each stdlib call below gets
+  // values that are in range whichever branch is taken: no amount exceeds the
+  // coin it is taken from.
   const poolCoin = pool;
-  const profitAmt: Uint<64> = isProfit ? amount : 0;
-  // Disclosed: in a wipe-out it IS the collateral, which the pool's change
-  // publishes anyway; otherwise it is `amount`, already public.
-  const lossAmt: Uint<64> = disclose(isProfit ? 0 : (wiped ? position.collateral : amount));
+  const net = position.collateral;
+
+  // 1. The loss, at most the whole collateral. Disclosed: it is the pool's
+  //    change, public anyway. A wipe-out publishes the collateral this way.
+  const lossAmt: Uint<64> = disclose(isProfit ? 0 : (amount >= net ? net : amount));
+  const afterLoss = (net - lossAmt) as Uint<64>;
+
+  // 2. Fees. Closing and borrow fees come out of what the loss left; any
+  //    excess is the shortfall, taken from a profit below.
+  const fees = closeFee + borrowFee;
+  const feeTaken = (fees >= afterLoss ? afterLoss : fees) as Uint<64>;
+  const shortfall = fees - feeTaken;
+  // Disclosed to build the treasury's output; a shielded output's value is
+  // inside its commitment, so this publishes nothing.
+  const toTreasury = disclose((position.openFee + feeTaken) as Uint<64>);
+
+  // 3. The trader's share of the coin.
+  const back = disclose((afterLoss - feeTaken) as Uint<64>);
+
+  // A profit, less the shortfall. Disclosed: it is the pool's change.
+  const profitRaw: Uint<64> = isProfit ? amount : 0;
+  const profitAmt = disclose((profitRaw >= shortfall ? profitRaw - shortfall : 0) as Uint<64>);
   // Holds by the reservation invariant (profit ≤ maxPayout ≤ reserved <
   // poolValue); checked anyway, since a send of the whole pool would leave no
   // coin to write back.
   assert(profitAmt < poolValue, "the pool cannot pay this profit");
 
-  if (isProfit) {
-    // The whole coin, so there is no change to strand.
-    sendShielded(coin, payTo, coin.value);
-    if (profitAmt > 0) {
-      const paid = sendShielded(poolCoin, payTo, profitAmt as Uint<128>);
-      pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  // Whether the trader gets anything from the coin. Disclosed because it
+  // decides whether an output to them exists; it is false only when the loss
+  // and fees took the whole collateral.
+  const hasBack = disclose(back > 0);
+
+  // The treasury first: the opening fee is at least 1, so this send is never
+  // of nothing. The change holds exactly lossAmt + back.
+  const fromCoin = sendShielded(
+    coin,
+    left<ZswapCoinPublicKey, ContractAddress>(treasury),
+    toTreasury as Uint<128>
+  );
+  const rest = fromCoin.change.value;
+  if (hasBack) {
+    const paid = sendImmediateShielded(rest, payTo, back as Uint<128>);
+    if (lossAmt > 0) {
+      pool.writeCoin(
+        mergeCoinImmediate(poolCoin, paid.change.value),
+        right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
+      );
     }
-  } else if (wiped) {
+  } else if (lossAmt > 0) {
     pool.writeCoin(
-      mergeCoin(poolCoin, coin),
+      mergeCoinImmediate(poolCoin, rest),
       right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
     );
-  } else {
-    const back = sendShielded(coin, payTo, coin.value - lossAmt);
-    pool.writeCoin(
-      mergeCoinImmediate(poolCoin, back.change.value),
-      right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
-    );
+  }
+  if (profitAmt > 0) {
+    const paid = sendShielded(poolCoin, payTo, profitAmt as Uint<128>);
+    pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   }
   poolValue = (poolValue + lossAmt - profitAmt) as Uint<64>;
   reserved = (reserved - maxPayout) as Uint<64>;
   closedPositions.increment(1);
+}
+
+// The treasury's per-epoch payment of the LPs' share of fees. Adds `coin` to
+// the pool without minting shares, so every zLP share is worth more.
+//
+// Anyone may call it — it only gives — but it is how fees reach LPs. Only the
+// deposit is public, never the fees it sums. The split between LPs and the
+// protocol is the treasury's to make; the contract cannot see the fees.
+export circuit depositFees(coin: ShieldedCoinInfo): [] {
+  const c = disclose(coin);
+  assert(c.color == usdc, "fees are paid in pUSDC");
+  assert(c.value > 0, "a deposit of nothing");
+  assert(c.value <= 18446744073709551615, "deposit too large");
+  // With no LPs the deposit would belong to whoever deposits first.
+  assert(lpSupply > 0, "no LPs to pay");
+
+  receiveShielded(c);
+  pool.writeCoin(mergeCoinImmediate(pool, c), right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  const nextValue = poolValue + c.value as Uint<64>;
+  assert(nextValue <= 18446744073709551615, "pool would overflow");
+  poolValue = nextValue as Uint<64>;
 }

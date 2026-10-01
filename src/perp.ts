@@ -16,6 +16,7 @@ import {
   ShieldedCoinRecipientDescriptor,
   runtimeCoinCommitment,
 } from "@midnight-ntwrk/compact-runtime";
+import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js-contracts";
 import { confirmOpen, markClosed, markFailed, recordPending, type PositionRecord } from "./positions.js";
 
 export interface ContractHandle {
@@ -28,6 +29,26 @@ export interface ContractHandle {
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 const bytes = (h: string) => Uint8Array.from(Buffer.from(h.replace(/^0x/, ""), "hex"));
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
+
+/**
+ * A time for the circuit's clock checks: a little behind now, so the block
+ * that includes the transaction is not earlier than it. The contract allows
+ * `clockSlack` seconds between this and the block time.
+ */
+const CLOCK_LEAD_SECONDS = 2n;
+export const circuitNow = () => BigInt(Math.floor(Date.now() / 1000)) - CLOCK_LEAD_SECONDS;
+
+/** Fees as the circuit demands them, each rounded up. */
+export function openFeeOf(size: bigint, openFeeBps: bigint): bigint {
+  return ceilDiv(size * openFeeBps, 10_000n);
+}
+export function closeFeeOf(size: bigint, closeFeeBps: bigint): bigint {
+  return ceilDiv(size * closeFeeBps, 10_000n);
+}
+export function borrowFeeOf(size: bigint, borrowRate: bigint, seconds: bigint): bigint {
+  return ceilDiv(size * borrowRate * seconds, 1_000_000_000_000n);
+}
 
 export async function readLedger(c: ContractHandle): Promise<any> {
   const state = await c.providers.publicDataProvider.queryContractState(c.address);
@@ -43,7 +64,9 @@ export function positionOf(perp: ContractHandle, record: PositionRecord) {
     isLong: o.isLong,
     size: BigInt(o.size),
     collateral: BigInt(o.collateral),
+    openFee: BigInt(o.openFee),
     entryPrice: BigInt(o.entryPrice),
+    openTime: BigInt(o.openTime),
     collateralNonce: bytes(o.collateralNonce),
     salt: bytes(o.salt),
   };
@@ -55,18 +78,22 @@ export interface Opened {
 }
 
 /**
- * Opens a long or a short for the wallet behind `perp.providers`. The opening
- * is saved BEFORE submitting and marked open or failed after; see positions.ts.
+ * Opens a long or a short for the wallet behind `perp.providers`, posting a
+ * coin of `coinValue`. The opening fee comes out of it; the rest is the
+ * position's collateral. The opening is saved BEFORE submitting and marked
+ * open or failed after; see positions.ts.
  */
 export async function openPosition(
   perp: ContractHandle,
   usdc: Uint8Array,
-  collateral: bigint,
+  coinValue: bigint,
   size: bigint,
   isLong: boolean,
   networkId: string
 ): Promise<Opened> {
   const ledger = await readLedger(perp);
+  const openFee = openFeeOf(size, BigInt(ledger.openFeeBps));
+  const openTime = circuitNow();
   const ownerSecret = new Uint8Array(randomBytes(32));
   const record: PositionRecord = {
     status: "pending",
@@ -78,8 +105,10 @@ export async function openPosition(
       ownerSecret: hex(ownerSecret),
       isLong,
       size: size.toString(),
-      collateral: collateral.toString(),
+      collateral: (coinValue - openFee).toString(),
+      openFee: openFee.toString(),
       entryPrice: ledger.markPrice.toString(),
+      openTime: openTime.toString(),
       collateralNonce: hex(randomBytes(32)),
       salt: hex(randomBytes(32)),
     },
@@ -90,9 +119,11 @@ export async function openPosition(
   recordPending(record);
   try {
     const tx = await perp.deployed.callTx.openPosition(
-      { nonce: position.collateralNonce, color: usdc, value: collateral },
+      { nonce: position.collateralNonce, color: usdc, value: coinValue },
       size,
       isLong,
+      openFee,
+      openTime,
       ownerSecret,
       position.salt
     );
@@ -190,24 +221,61 @@ export async function collateralIndex(
   }
 }
 
+/**
+ * Where a closing position's coin and any profit go, as the circuit divides
+ * them: the loss to the pool, the fees to the treasury, the rest to the
+ * trader; a profit from the pool, less fees the collateral could not cover.
+ */
+export function settlement(
+  p: { collateral: bigint; openFee: bigint },
+  pnl: { profit: boolean; pnl: bigint },
+  closeFee: bigint,
+  borrowFee: bigint
+): { toPool: bigint; toTreasury: bigint; toTrader: bigint; fromPool: bigint } {
+  const loss = pnl.profit ? 0n : pnl.pnl < p.collateral ? pnl.pnl : p.collateral;
+  const afterLoss = p.collateral - loss;
+  const fees = closeFee + borrowFee;
+  const feeTaken = fees < afterLoss ? fees : afterLoss;
+  const shortfall = fees - feeTaken;
+  const profit = pnl.profit ? pnl.pnl : 0n;
+  const fromPool = profit > shortfall ? profit - shortfall : 0n;
+  return {
+    toPool: loss,
+    toTreasury: p.openFee + feeTaken,
+    toTrader: afterLoss - feeTaken + fromPool,
+    fromPool,
+  };
+}
+
 export interface Closed {
   txHash: string;
   profit: boolean;
   capped: boolean;
   pnl: bigint;
   exit: bigint;
+  closeFee: bigint;
+  borrowFee: bigint;
+  /** Seconds the position was held. */
+  held: bigint;
+  settled: ReturnType<typeof settlement>;
   nullifier: Uint8Array;
 }
 
 /**
  * Closes a position at the current mark price, paying out to the wallet behind
  * `perp.providers` (whose coin public key is `recipient`).
+ *
+ * The close creates a shielded output to the treasury, and a shielded output
+ * is encrypted to its recipient so their wallet can find it. The contract
+ * stores only the treasury's coin key; its encryption key, `treasuryEncKey`,
+ * has to come from the treasury itself, like any payee's address.
  */
 export async function closePosition(
   perp: ContractHandle,
   record: PositionRecord,
   usdc: Uint8Array,
-  recipient: Uint8Array
+  recipient: Uint8Array,
+  treasuryEncKey: string
 ): Promise<Closed> {
   if (record.status !== "open") throw new Error(`position ${record.commitment.slice(0, 12)}… is ${record.status}`);
   const position = positionOf(perp, record);
@@ -216,7 +284,7 @@ export async function closePosition(
   const path = ledger.positions.findPathForLeaf(bytes(record.commitment));
   if (!path) throw new Error("the position's commitment is not in the tree");
 
-  const coin = { nonce: position.collateralNonce, color: usdc, value: position.collateral };
+  const coin = { nonce: position.collateralNonce, color: usdc, value: position.collateral + position.openFee };
   const mt_index = await collateralIndex(perp, coin);
 
   const exit: bigint = ledger.markPrice;
@@ -228,14 +296,27 @@ export async function closePosition(
     ledger.maxPayout
   );
   const ownerSecret = bytes(record.opening.ownerSecret);
+  const closeTime = circuitNow();
+  const held = closeTime - position.openTime;
+  const closeFee = closeFeeOf(position.size, BigInt(ledger.closeFeeBps));
+  const borrowFee = borrowFeeOf(position.size, BigInt(ledger.borrowRate), held);
 
-  const tx = await perp.deployed.callTx.closePosition(
-    position,
-    ownerSecret,
-    path,
-    { ...coin, mt_index },
-    pnl,
-    { bytes: recipient }
+  const tx: any = await withContractScopedTransaction(
+    perp.providers,
+    (txCtx: any) =>
+      perp.deployed.callTx.closePosition(
+        txCtx,
+        position,
+        ownerSecret,
+        path,
+        { ...coin, mt_index },
+        pnl,
+        closeFee,
+        borrowFee,
+        closeTime,
+        { bytes: recipient }
+      ),
+    { additionalCoinEncPublicKeyMappings: new Map([[hex(ledger.treasury.bytes), treasuryEncKey]]) }
   );
   const txHash: string = tx.public.txHash;
   markClosed(record.commitment, txHash);
@@ -245,6 +326,10 @@ export async function closePosition(
     capped,
     pnl,
     exit,
+    closeFee,
+    borrowFee,
+    held,
+    settled: settlement(position, { profit, pnl }, closeFee, borrowFee),
     nullifier: perp.module.pureCircuits.positionNullifier(ownerSecret, position.salt),
   };
 }
