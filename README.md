@@ -15,7 +15,7 @@ Private perpetuals on [Midnight](https://midnight.network): go leveraged long or
 
 **The pool (GMX-style).** LPs deposit pUSDC and receive zLP shares. The pool is the counterparty to every trade: it pays out traders' profits and keeps their losses. The pool is one pUSDC coin, stored on the ledger so anyone can settle against it.
 
-**Withdrawing.** An LP sends zLP back and receives `shares × pool / supply` pUSDC, rounded down in the pool's favour. Only liquidity that is not reserved can leave: the pool must stay worth more than `reserved` afterwards. The last LP may empty an idle pool completely. Redeemed zLP is retired: the contract receives it and has no circuit that can spend it.
+**Withdrawing.** An LP sends zLP back and receives `shares × pool / supply` pUSDC, rounded down in the pool's favour. Only liquidity that is not reserved can leave: the pool must still back every open position's `maxPayout` afterwards. The last LP may empty an idle pool completely. Redeemed zLP is retired: the contract receives it and has no circuit that can spend it.
 
 **Opening a position.** The trader sends a pUSDC collateral coin to the contract and chooses a direction (long or short) and a size (1×–20× the collateral, net of the opening fee). The contract appends a **commitment** to the `positions` Merkle tree: a hash of the direction, size, collateral, entry price, the collateral coin's nonce, the owner's key and a random salt. The leverage bounds are checked inside the zero-knowledge proof. Longs and shorts open through the same circuit, so an open does not reveal which one it is: its public footprint differs only in the commitment.
 
@@ -42,7 +42,9 @@ A fee is a fixed fraction of size, so a fee paid into the public pool would publ
 
 If the closing and borrow fees exceed what the loss left of the collateral, the treasury gets what there is; the rest is taken from a profit and stays in the pool, or is forgiven.
 
-**Solvency.** GMX sets aside pool funds for each position, sized by the position, so profits are always payable. Doing that here would publish every size. Instead, every position's profit is capped at one public constant, `maxPayout` (an enforced take-profit), and every open reserves exactly `maxPayout`, whatever the position's real size. The reservation reveals nothing about the position: `reserved` is always live positions × `maxPayout`, and the position count is already public. An open is refused unless `reserved` stays below the pool's value, so every open position's maximum profit is always covered. LP withdrawals are held to the same rule.
+**Solvency.** GMX sets aside pool funds for each position, sized by the position, so profits are always payable. Doing that here would publish every size. Instead, every position's profit is capped at one public constant, `maxPayout` (an enforced take-profit), and every open reserves exactly `maxPayout`, whatever the position's real size. The reservation reveals nothing about the position: reserved liquidity is always live positions × `maxPayout`, and the position count is already public. An open is refused unless the pool stays worth more than that, so every open position's maximum profit is always covered. LP withdrawals are held to the same rule.
+
+The reservation is kept as a count of free **slots** of `maxPayout` each, in a `Counter`: an open checks `!freeSlots.lessThan(1)` and takes one, a close gives one back. That shape is what lets trades run concurrently; see below.
 
 The cap is a constant rather than a multiple of collateral on purpose. A position that hits the cap is paid exactly the cap, in public, so a cap of `k × collateral` would publish the collateral every time it binds. A constant cap reveals only that it bound. The cost is capital efficiency: the pool must hold `maxPayout` for every open position.
 
@@ -76,6 +78,15 @@ The privacy claims are tested, not just asserted:
 - `npm run probe:leak` deploys a test-only contract that publishes three amounts on purpose, and checks that the search finds them. On-chain they appear as little-endian bytes. This shows which encodings the search covers, so a "not found" elsewhere can be trusted for those encodings.
 - `npm run demo` searches the raw bytes of every trade transaction on the devnet.
 
+**Concurrent trades.** A Midnight transaction is proven against the state it read, and fails if a value it read *exactly* has changed by the time it lands. `npm run probe:race` measures which ledger operations conflict: exact reads of a changed cell do; `Counter` increments, decrements and `lessThan` checks, Merkle and set inserts, and historic root checks do not. zkperp is laid out on that basis, and `npm run race` checks it on zkperp itself:
+
+| Race | Outcome | Why |
+|---|---|---|
+| Two opens | both land | each takes a slot with a `lessThan` check and a decrement |
+| Two closes at an unchanged price | both land | neither reads the pool coin or its value |
+| A trade against a price update | the trade fails and is proven again | **by design**: pricing is strict, so a trade settles at the latest price or not at all. The oracle relayer updates only on a new Chainlink round |
+| Two closes that move the pool | one lands, the other must retry | both spend the one pool coin. The rejection is free; the frontend retries |
+
 **Local tests are not enough for Compact.** The zero-knowledge proof evaluates every branch of an `if`; only the taken branch's effects are kept. The JavaScript runtime that local tests use runs only the taken branch. A value that goes negative in an untaken branch still breaks the proof. The first loss close on the devnet failed this way, while every local test passed (see the note in `closePosition`). So `npm run demo` runs every settlement path through the real proof server, for a long and for a short: flat, profit, loss, profit larger than the collateral, wipe-out, and capped profit.
 
 ## Running it
@@ -90,6 +101,8 @@ npm run compile         # contracts + proving keys (~1 min)
 npm test                # circuit rules + privacy sweep, no chain needed
 npm run demo            # full lifecycle on the devnet, two wallets
 npm run probe:leak      # check the privacy search's coverage
+npm run race            # concurrent trades against each other and the oracle
+npm run probe:race      # which ledger operations conflict (npm run compile:probe first)
 ```
 
 `npm run demo` uses the devnet's pre-funded dev wallet as deployer, LP and oracle, plus a **separate trader wallet** that it funds on first run. It:

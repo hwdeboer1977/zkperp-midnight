@@ -39,6 +39,20 @@ const ceilDiv = (a: bigint, b: bigint) => (a + b - 1n) / b;
 const CLOCK_LEAD_SECONDS = 2n;
 export const circuitNow = () => BigInt(Math.floor(Date.now() / 1000)) - CLOCK_LEAD_SECONDS;
 
+/**
+ * The pool's slot capacity at `poolValue`, as the contract pins it: how many
+ * positions of `maxPayout` it can back, floor((poolValue − 1) / maxPayout).
+ * Every call that changes the pool's value passes the capacity afterwards.
+ */
+export function capacityOf(poolValue: bigint, maxPayout: bigint): bigint {
+  return poolValue === 0n ? 0n : (poolValue - 1n) / maxPayout;
+}
+
+/** Liquidity set aside for open positions: maxPayout per used slot. */
+export function reservedOf(ledger: { slotCapacity: bigint; freeSlots: bigint; maxPayout: bigint }): bigint {
+  return (ledger.slotCapacity - ledger.freeSlots) * ledger.maxPayout;
+}
+
 /** Fees as the circuit demands them, each rounded up. */
 export function openFeeOf(size: bigint, openFeeBps: bigint): bigint {
   return ceilDiv(size * openFeeBps, 10_000n);
@@ -300,6 +314,9 @@ export async function closePosition(
   const held = closeTime - position.openTime;
   const closeFee = closeFeeOf(position.size, BigInt(ledger.closeFeeBps));
   const borrowFee = borrowFeeOf(position.size, BigInt(ledger.borrowRate), held);
+  const settled = settlement(position, { profit, pnl }, closeFee, borrowFee);
+  // Ignored by the contract at an unchanged price, when the pool does not move.
+  const capacity = capacityOf(ledger.poolValue + settled.toPool - settled.fromPool, ledger.maxPayout);
 
   const tx: any = await withContractScopedTransaction(
     perp.providers,
@@ -314,7 +331,8 @@ export async function closePosition(
         closeFee,
         borrowFee,
         closeTime,
-        { bytes: recipient }
+        { bytes: recipient },
+        capacity
       ),
     { additionalCoinEncPublicKeyMappings: new Map([[hex(ledger.treasury.bytes), treasuryEncKey]]) }
   );
@@ -329,7 +347,7 @@ export async function closePosition(
     closeFee,
     borrowFee,
     held,
-    settled: settlement(position, { profit, pnl }, closeFee, borrowFee),
+    settled,
     nullifier: perp.module.pureCircuits.positionNullifier(ownerSecret, position.salt),
   };
 }

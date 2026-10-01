@@ -57,10 +57,31 @@ import CompactStandardLibrary;
 // size. The reservation says nothing about the position; the total is just
 // (live positions × maxPayout), and the position count is public anyway.
 //
-// Invariant: poolValue > reserved. An open or an LP withdrawal that would
-// break it is refused (an idle pool may be emptied entirely). A close pays at
-// most maxPayout and releases maxPayout, and a loss only adds to the pool, so
-// every open position's profit is always payable.
+// Invariant: poolValue > live positions × maxPayout. An open or an LP
+// withdrawal that would break it is refused (an idle pool may be emptied
+// entirely). A close pays at most maxPayout and frees one reservation, and a
+// loss only adds to the pool, so every open position's profit is payable.
+//
+// ── Concurrency: what a trade may read ─────────────────────────────────────
+//
+// A transaction is proven against the state it read, and fails if any value
+// it read EXACTLY has changed by the time it lands. Increments, decrements and
+// `lessThan` checks on a Counter, Merkle and set inserts, and writes that do
+// not read, all commute (measured with `npm run probe:race`). So trades are
+// kept off every value other trades write:
+//
+//   · the reservation is a Counter of free slots, one slot = maxPayout. An
+//     open checks `!freeSlots.lessThan(1)` and decrements; a close
+//     increments. Neither reads an exact value, so opens and closes do not
+//     invalidate each other.
+//   · how many slots the pool holds, `slotCapacity`, changes only when the
+//     pool's value does — LP deposits and withdrawals, fee deposits, closes
+//     with a profit or loss. Those already conflict over the pool coin.
+//   · a close at an unchanged price reads neither the pool coin nor
+//     `poolValue`.
+//
+// The mark price is read by every trade on purpose: pricing is strict, so a
+// trade proven at one price fails if the price changes before it lands.
 //
 // Why a constant cap and not k × collateral: a position that hits a cap is
 // paid exactly the cap, publicly, so a collateral-relative cap publishes the
@@ -156,9 +177,12 @@ export ledger lpToken: Bytes<32>;
 export ledger lpSupply: Uint<64>;
 export ledger lpMintCounter: Counter;
 
-// Pool liquidity set aside for open positions: maxPayout per position.
-// Always less than `poolValue`.
-export ledger reserved: Uint<64>;
+// Reservations, in slots of maxPayout each. `slotCapacity` is how many the
+// pool can back, floor((poolValue − 1) / maxPayout), or 0 when it is empty;
+// `freeSlots` is that less the live positions. Reserved liquidity is
+// (slotCapacity − freeSlots) × maxPayout. See "Concurrency" above.
+export ledger slotCapacity: Uint<64>;
+export ledger freeSlots: Counter;
 
 // ── Positions ──────────────────────────────────────────────────────────────
 
@@ -262,12 +286,40 @@ export circuit setPrice(price: Uint<64>, secret: Bytes<32>): [] {
 
 // ── Liquidity ──────────────────────────────────────────────────────────────
 
+// Records that the pool is now worth `nextValue`, and grows or shrinks the
+// free slots by the change in capacity. `capacity` is computed by the caller,
+// because circuits cannot divide, and pinned here. Shrinking below the live
+// positions is refused: that liquidity backs their maximum profit.
+circuit repool(nextValue: Uint<64>, capacity: Uint<64>): [] {
+  const c = disclose(capacity);
+  if (nextValue == 0) {
+    assert(c == 0, "an empty pool has no slots");
+  } else {
+    assert(c * maxPayout <= nextValue - 1, "slot capacity overstated");
+    assert((c + 1) * maxPayout > nextValue - 1, "slot capacity understated");
+  }
+  const old = slotCapacity;
+  const grows = c >= old;
+  const change = grows ? c - old : old - c;
+  assert(change <= 65535, "the pool changes by too many slots at once");
+  const step = change as Uint<16>;
+  if (grows) {
+    freeSlots.increment(step);
+  } else {
+    assert(!freeSlots.lessThan(step), "that liquidity is reserved for open positions");
+    freeSlots.decrement(step);
+  }
+  slotCapacity = c;
+  poolValue = nextValue;
+}
+
 // Deposits a pUSDC coin into the pool and mints zLP shares to the caller.
 //
 // `shares` is computed by the caller and checked here, because circuits cannot
 // divide: it must be floor(amount * lpSupply / poolValue), or `amount` for the
 // first deposit. The two inequalities below pin it to exactly that.
-export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>): [] {
+// `capacity` is the pool's slot capacity after the deposit; see `repool`.
+export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>, capacity: Uint<64>): [] {
   const c = disclose(coin);
   const s = disclose(shares);
   assert(c.color == usdc, "the pool only takes pUSDC");
@@ -297,7 +349,7 @@ export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>): [] {
 
   const nextValue = poolValue + amount;
   assert(nextValue <= 18446744073709551615, "pool would overflow");
-  poolValue = nextValue as Uint<64>;
+  repool(nextValue as Uint<64>, capacity);
   const nextSupply = lpSupply + s;
   assert(nextSupply <= 18446744073709551615, "share supply would overflow");
   lpSupply = nextSupply as Uint<64>;
@@ -318,15 +370,15 @@ export circuit addLiquidity(coin: ShieldedCoinInfo, shares: Uint<64>): [] {
 // be floor(shares * poolValue / lpSupply), rounded in the pool's favour. The
 // two inequalities below pin it to exactly that.
 //
-// Only liquidity that is not reserved can leave: after the withdrawal the pool
-// must still be worth more than `reserved`, so every open position's maximum
-// profit stays payable. The one exception is the last LP leaving an idle pool
-// (no open positions, every share redeemed), which empties it completely.
+// Only liquidity that is not reserved can leave: the pool's slot capacity
+// afterwards (`capacity`, see `repool`) must still cover every open position,
+// so every open position's maximum profit stays payable. The last LP may
+// empty an idle pool completely.
 //
 // The zLP coin is received and never spent: no circuit in this contract can
 // name it, so it is retired for good, and `lpSupply` drops by its value. A
 // future circuit that spends contract-held coins must keep it that way.
-export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
+export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>, capacity: Uint<64>): [] {
   const c = disclose(lp);
   const a = disclose(amount);
   assert(lpSupply > 0, "the pool has no shares");
@@ -342,10 +394,7 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
   // a <= poolValue follows from shares <= lpSupply and the bound above.
   const nextValue = (poolValue - a) as Uint<64>;
   const drained = nextValue == 0;
-  assert(
-    nextValue > reserved || (drained && reserved == 0),
-    "that liquidity is reserved for open positions"
-  );
+  repool(nextValue, capacity);
 
   receiveShielded(c);
 
@@ -363,7 +412,6 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>): [] {
   } else {
     pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   }
-  poolValue = nextValue;
   lpSupply = (lpSupply - shares) as Uint<64>;
 }
 
@@ -394,7 +442,6 @@ export circuit openPosition(
   ownerSecret: Bytes<32>,
   salt: Bytes<32>
 ): [] {
-  assert(poolValue > 0, "no liquidity to trade against");
   // The token type is the same for every pUSDC coin, so disclosing it
   // reveals only that the collateral is pUSDC — which the contract requires.
   assert(disclose(coin.color) == usdc, "collateral must be pUSDC");
@@ -418,10 +465,11 @@ export circuit openPosition(
   assert(size >= collateral, "size below collateral: leverage under 1x");
   assert(size <= collateral * maxLeverage, "leverage above the maximum");
 
-  // A constant reservation, so it tells nobody anything about this position.
-  const nextReserved = reserved + maxPayout;
-  assert(nextReserved < poolValue, "the pool has no room for another position");
-  reserved = nextReserved as Uint<64>;
+  // One slot of maxPayout, the same for every position, so it tells nobody
+  // anything about this one. A check and a decrement, not a read of the
+  // count: concurrent opens and closes do not invalidate each other.
+  assert(!freeSlots.lessThan(1), "the pool has no room for another position");
+  freeSlots.decrement(1);
 
   receiveShielded(disclose(coin));
 
@@ -473,6 +521,10 @@ export circuit openPosition(
 //
 // `recipient` receives the payout. It is disclosed to build the output, but a
 // shielded output carries only a commitment, so it is not linkable to the key.
+//
+// `capacity` is the pool's slot capacity after a profit or loss (see
+// `repool`); at an unchanged price it is ignored, and the close reads neither
+// the pool coin nor its value.
 export circuit closePosition(
   position: Position,
   ownerSecret: Bytes<32>,
@@ -482,7 +534,8 @@ export circuit closePosition(
   closeFee: Uint<64>,
   borrowFee: Uint<64>,
   closeTime: Uint<64>,
-  recipient: ZswapCoinPublicKey
+  recipient: ZswapCoinPublicKey,
+  capacity: Uint<64>
 ): [] {
   assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
   assert(path.leaf == positionCommitment(position), "path is for a different position");
@@ -557,8 +610,10 @@ export circuit closePosition(
   //
   // So every amount is selected up front, and each stdlib call below gets
   // values that are in range whichever branch is taken: no amount exceeds the
-  // coin it is taken from.
-  const poolCoin = pool;
+  // coin it is taken from. The pool coin is read only in the branches that
+  // spend or grow it — an untaken read yields a zero-value coin, and the
+  // amounts there are zero — so a close that leaves the pool alone does not
+  // conflict with one that changes it.
   const net = position.collateral;
 
   // 1. The loss, at most the whole collateral. Disclosed: it is the pool's
@@ -581,10 +636,6 @@ export circuit closePosition(
   // A profit, less the shortfall. Disclosed: it is the pool's change.
   const profitRaw: Uint<64> = isProfit ? amount : 0;
   const profitAmt = disclose((profitRaw >= shortfall ? profitRaw - shortfall : 0) as Uint<64>);
-  // Holds by the reservation invariant (profit ≤ maxPayout ≤ reserved <
-  // poolValue); checked anyway, since a send of the whole pool would leave no
-  // coin to write back.
-  assert(profitAmt < poolValue, "the pool cannot pay this profit");
 
   // Whether the trader gets anything from the coin. Disclosed because it
   // decides whether an output to them exists; it is false only when the loss
@@ -603,32 +654,39 @@ export circuit closePosition(
     const paid = sendImmediateShielded(rest, payTo, back as Uint<128>);
     if (lossAmt > 0) {
       pool.writeCoin(
-        mergeCoinImmediate(poolCoin, paid.change.value),
+        mergeCoinImmediate(pool, paid.change.value),
         right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
       );
     }
   } else if (lossAmt > 0) {
     pool.writeCoin(
-      mergeCoinImmediate(poolCoin, rest),
+      mergeCoinImmediate(pool, rest),
       right<ZswapCoinPublicKey, ContractAddress>(kernel.self())
     );
   }
   if (profitAmt > 0) {
-    const paid = sendShielded(poolCoin, payTo, profitAmt as Uint<128>);
+    // Holds by the reservation invariant (profit ≤ maxPayout, and the pool
+    // backs this position's slot); checked anyway, since a send of the whole
+    // pool would leave no coin to write back.
+    assert(profitAmt < poolValue, "the pool cannot pay this profit");
+    const paid = sendShielded(pool, payTo, profitAmt as Uint<128>);
     pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   }
-  poolValue = (poolValue + lossAmt - profitAmt) as Uint<64>;
-  reserved = (reserved - maxPayout) as Uint<64>;
+  if (disclose(lossAmt > 0 || profitAmt > 0)) {
+    repool((poolValue + lossAmt - profitAmt) as Uint<64>, capacity);
+  }
+  freeSlots.increment(1);
   closedPositions.increment(1);
 }
 
 // The treasury's per-epoch payment of the LPs' share of fees. Adds `coin` to
 // the pool without minting shares, so every zLP share is worth more.
 //
-// Anyone may call it — it only gives — but it is how fees reach LPs. Only the
+// Anyone may call it — it only gives — but it is how fees reach LPs.
+// `capacity` is the pool's slot capacity after the deposit; see `repool`. Only the
 // deposit is public, never the fees it sums. The split between LPs and the
 // protocol is the treasury's to make; the contract cannot see the fees.
-export circuit depositFees(coin: ShieldedCoinInfo): [] {
+export circuit depositFees(coin: ShieldedCoinInfo, capacity: Uint<64>): [] {
   const c = disclose(coin);
   assert(c.color == usdc, "fees are paid in pUSDC");
   assert(c.value > 0, "a deposit of nothing");
@@ -640,5 +698,5 @@ export circuit depositFees(coin: ShieldedCoinInfo): [] {
   pool.writeCoin(mergeCoinImmediate(pool, c), right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   const nextValue = poolValue + c.value as Uint<64>;
   assert(nextValue <= 18446744073709551615, "pool would overflow");
-  poolValue = nextValue as Uint<64>;
+  repool(nextValue as Uint<64>, capacity);
 }

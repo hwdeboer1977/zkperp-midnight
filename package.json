@@ -13,10 +13,11 @@
     "devnet:down": "docker compose down",
     "devnet:reset": "docker compose down -v && rm -rf .wallet-state .zkperp midnight-level-db deployment.json && docker compose up -d --wait",
     "proof:up": "docker run -d --name proof-server --restart unless-stopped -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v",
-    "compile:probe": "compact compile contracts/probe/leakprobe.compact contracts/managed/leakprobe",
+    "compile:probe": "for n in leakprobe raceprobe; do compact compile contracts/probe/$n.compact contracts/managed/$n || exit 1; done",
     "probe:leak": "npm run build && node dist/probe-leak.js",
     "demo": "npm run build && node dist/demo.js",
-    "race": "npm run build && node dist/race.js"
+    "race": "npm run build && node dist/race.js",
+    "probe:race": "npm run build && node dist/probe-race.js"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.1",

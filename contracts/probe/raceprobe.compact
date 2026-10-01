@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: Apache-2.0
+
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// TEST ONLY — never deployed with zkperp.
+//
+// Which ledger operations conflict when two transactions, proven against the
+// same state, land one after the other? Each circuit does one kind of
+// operation; `npm run probe:race` submits pairs of calls at the same moment
+// and reports which pairs both land. zkperp's state layout depends on the
+// answer: a field every trade reads and writes serialises all trading.
+
+export ledger cellA: Uint<64>;
+export ledger cellB: Uint<64>;
+export ledger counter: Counter;
+export ledger tree: HistoricMerkleTree<10, Bytes<32>>;
+export ledger keys: Set<Bytes<32>>;
+export ledger slots: Map<Bytes<32>, Uint<64>>;
+
+// Read-modify-write of a plain cell, as zkperp does with `reserved`.
+export circuit rmwA(): [] {
+  cellA = (cellA + 1) as Uint<64>;
+}
+
+// The same on a different field: the control. If this conflicts with rmwA,
+// conflicts are per contract, not per field.
+export circuit rmwB(): [] {
+  cellB = (cellB + 1) as Uint<64>;
+}
+
+// A write that does not read the old value.
+export circuit writeA(v: Uint<64>): [] {
+  cellA = disclose(v);
+}
+
+// A read with no write, as an open reads the price.
+export circuit readA(): [] {
+  assert(cellA < 1000000000, "cellA too large");
+}
+
+export circuit increment(): [] {
+  counter.increment(1);
+}
+
+// A bound check that publishes only its yes/no answer, then the increment:
+// the shape a counter-based reservation would take.
+export circuit checkedIncrement(): [] {
+  assert(counter.lessThan(1000000), "counter full");
+  counter.increment(1);
+}
+
+// The bound check alone.
+export circuit checkCounter(): [] {
+  assert(counter.lessThan(1000000), "counter full");
+}
+
+// The exact value read, then the increment.
+export circuit readIncrement(): [] {
+  assert(counter.read() < 1000000, "counter full");
+  counter.increment(1);
+}
+
+export circuit insertLeaf(x: Bytes<32>): [] {
+  tree.insert(disclose(x));
+}
+
+export circuit insertKey(x: Bytes<32>): [] {
+  keys.insert(disclose(x));
+}
+
+export circuit writeSlot(k: Bytes<32>, v: Uint<64>): [] {
+  slots.insert(disclose(k), disclose(v));
+}
+
+// A membership check then an insert, as a close checks and records its
+// nullifier.
+export circuit checkInsertKey(x: Bytes<32>): [] {
+  assert(!keys.member(disclose(x)), "already present");
+  keys.insert(disclose(x));
+}
+
+// A root check against the tree's history, as a close proves its position is
+// in the tree while opens keep inserting.
+export circuit checkRoot(path: MerkleTreePath<10, Bytes<32>>): [] {
+  assert(tree.checkRoot(disclose(merkleTreePathRoot<10, Bytes<32>>(path))), "no such leaf");
+}

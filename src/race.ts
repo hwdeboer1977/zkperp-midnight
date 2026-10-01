@@ -11,12 +11,19 @@
  * time as each other. Each race below submits two transactions from two
  * different wallets at the same moment and reports what landed:
  *
- *   A  a close against a price update      — does a new price invalidate a
- *                                            trade proven against the old one?
- *   B  two closes in profit                — both spend the one pool coin
- *   C  two closes at an unchanged price    — neither touches the pool coin,
- *                                            both read and write `reserved`
- *   D  two opens                           — both read and write `reserved`
+ *   A  a close against a price update      — EXPECTED to invalidate the close.
+ *                                            Pricing is strict: a trade settles
+ *                                            at the latest price or not at all,
+ *                                            so the trader re-proves at the new
+ *                                            one. The relayer updates only on a
+ *                                            new Chainlink round (a real move),
+ *                                            so this is rare, not routine.
+ *   B  two closes in profit                — both spend the one pool coin.
+ *                                            Known: one is rejected, free, and
+ *                                            the frontend retries.
+ *   C  two closes at an unchanged price    — neither touches the pool coin.
+ *                                            Target: both land.
+ *   D  two opens                           — Target: both land.
  *
  * Positions a race leaves open are closed one at a time at the end.
  */
@@ -28,7 +35,8 @@ import { LOCAL, walletSeed } from "./network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "./wallet.js";
 import { getDeployment } from "./contracts.js";
 import { readyTrader, traderSeed } from "./trader.js";
-import { closePosition, openPosition, readLedger, type ContractHandle } from "./perp.js";
+import { closePosition, openPosition, readLedger, reservedOf, type ContractHandle } from "./perp.js";
+import { addLiquidity } from "./pool.js";
 import { openPositionsOn, type PositionRecord } from "./positions.js";
 import { balance, coinKey, handle, waitForBalance } from "./session.js";
 
@@ -111,6 +119,9 @@ async function main() {
   const devWallet = await buildWallet({ kind: "seed", value: devSeed }, LOCAL);
   let traderWallet: BuiltWallet | null = null;
   const findings: string[] = [];
+  /** ok: met the expectation; false: did not; undefined: inconclusive. */
+  const verdict = (race: string, ok: boolean | undefined, what: string) =>
+    findings.push(`${ok === undefined ? chalk.yellow("?") : ok ? chalk.green("✓") : chalk.red("✗")} ${race}: ${what}`);
   try {
     await waitForSync(devWallet, () => {});
     const traderSeedHex = traderSeed(devSeed);
@@ -153,10 +164,7 @@ async function main() {
     step("Setup");
     if ((await readLedger(dev.perp)).poolValue === 0n) {
       info(`dev adds ${fmt(LIQUIDITY)} pUSDC of liquidity…`);
-      await dev.perp.deployed.callTx.addLiquidity(
-        { nonce: new Uint8Array(32).map(() => Math.floor(Math.random() * 256)), color: usdc, value: LIQUIDITY },
-        LIQUIDITY
-      );
+      await addLiquidity(dev.perp, usdc, LIQUIDITY);
     }
     if ((await balance(trader.wallet, usdc)) < 4n * COLLATERAL) {
       info("trader mints pUSDC…");
@@ -165,7 +173,7 @@ async function main() {
     }
     await setPrice(PRICE);
     const l = await readLedger(dev.perp);
-    info(`pool ${fmt(l.poolValue)}, reserved ${fmt(l.reserved)}, price $${fmt(l.markPrice)}`);
+    info(`pool ${fmt(l.poolValue)}, reserved ${fmt(reservedOf(l))}, price $${fmt(l.markPrice)}`);
 
     // ── A: a close against a price update ─────────────────────────────────
     step("A — a close, proven at $3,000, against a price update to $3,300");
@@ -178,20 +186,14 @@ async function main() {
       );
       const after = await readLedger(dev.perp);
       info(`price now $${fmt(after.markPrice)}`);
-      if (c.ok && p.ok && c.height !== undefined && p.height !== undefined) {
-        if (p.height < c.height) {
-          findings.push(
-            c.detail.includes("3000.")
-              ? "A: a close proven at the old price LANDED after the price changed, and settled at the OLD price."
-              : `A: the price changed first and the close still landed (${c.detail}).`
-          );
-        } else {
-          findings.push(`A: the close landed first (block ${c.height} ≤ ${p.height}); the race did not overlap. Rerun.`);
-        }
+      if (c.ok && p.ok && c.height !== undefined && p.height !== undefined && p.height < c.height) {
+        verdict("A", false, "a close proven at the old price landed after the price changed — stale pricing is possible");
+      } else if (c.ok && p.ok) {
+        verdict("A", undefined, "the close landed before the price update; the race did not overlap — rerun");
       } else if (!c.ok && p.ok) {
-        findings.push("A: the price update invalidated the close.");
+        verdict("A", true, "the price update invalidated the close: strict pricing, as designed");
       } else {
-        findings.push(`A: close ${c.ok ? "landed" : "failed"}, setPrice ${p.ok ? "landed" : "failed"}.`);
+        verdict("A", false, `close ${c.ok ? "landed" : "failed"}, setPrice ${p.ok ? "landed" : "failed"}`);
       }
     }
 
@@ -205,28 +207,28 @@ async function main() {
       await setPrice(UP);
       info("price → $3,300: both are in profit, both will draw on the pool");
       const [x, y] = await race(["trader's close", () => close(trader, t)], ["dev's close", () => close(dev, d)]);
-      findings.push(`B: two pool-spending closes — trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}.`);
+      verdict("B", x.ok !== y.ok, x.ok !== y.ok ? "one close landed, the other must retry (single pool coin, known)" : `trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}`);
     }
 
     // ── C: two closes that leave the pool coin alone ──────────────────────
-    step("C — two closes at an unchanged price: no pool spend, both write `reserved`");
+    step("C — two closes at an unchanged price: neither touches the pool");
     {
       await setPrice(PRICE);
       const t = await open(trader);
       const d = await open(dev);
       info("trader and dev each opened a long at $3,000");
       const [x, y] = await race(["trader's close", () => close(trader, t)], ["dev's close", () => close(dev, d)]);
-      findings.push(`C: two flat closes — trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}.`);
+      verdict("C", x.ok && y.ok, x.ok && y.ok ? "both flat closes landed" : `trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}`);
     }
 
     // ── D: two opens ──────────────────────────────────────────────────────
-    step("D — two opens at once, both writing `reserved`");
+    step("D — two opens at once, both taking a slot");
     {
       const [x, y] = await race(
         ["trader's open", async () => ({ txHash: (await openPosition(trader.perp, usdc, COLLATERAL, SIZE, true, LOCAL.networkId)).txHash })],
         ["dev's open", async () => ({ txHash: (await openPosition(dev.perp, usdc, COLLATERAL, SIZE, false, LOCAL.networkId)).txHash })]
       );
-      findings.push(`D: two opens — trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}.`);
+      verdict("D", x.ok && y.ok, x.ok && y.ok ? "both opens landed" : `trader's ${x.ok ? "landed" : "failed"}, dev's ${y.ok ? "landed" : "failed"}`);
     }
 
     // ── Clean up: close whatever the races left open ──────────────────────
@@ -238,11 +240,11 @@ async function main() {
       await closePosition(trader.perp, record, usdc, trader.coinPublicKey, treasuryEncKey);
     }
     const end = await readLedger(dev.perp);
-    info(`pool ${fmt(end.poolValue)}, reserved ${fmt(end.reserved)}`);
-    if (end.reserved !== 0n) findings.push("Clean-up: liquidity is still reserved; some position was not closed.");
+    info(`pool ${fmt(end.poolValue)}, reserved ${fmt(reservedOf(end))}`);
+    if (reservedOf(end) !== 0n) verdict("clean-up", false, "liquidity is still reserved; some position was not closed");
 
     console.log(`\n${chalk.bold("Findings")}`);
-    for (const f of findings) console.log(`   · ${f}`);
+    for (const f of findings) console.log(`   ${f}`);
   } finally {
     await traderWallet?.facade.stop();
     await devWallet.facade.stop();

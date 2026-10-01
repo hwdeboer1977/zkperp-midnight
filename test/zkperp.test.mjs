@@ -87,8 +87,25 @@ const deploy = () =>
     CLOCK_SLACK
   ).currentContractState;
 
+/** Slots of MAX_PAYOUT a pool of `value` backs, as the contract pins it. */
+const capOf = (value) => (value === 0n ? 0n : (value - 1n) / MAX_PAYOUT);
+/** Liquidity reserved for open positions. */
+const reservedOf = (l) => (l.slotCapacity - l.freeSlots) * MAX_PAYOUT;
+
+// Circuits that change the pool's value take its slot capacity afterwards as
+// a last argument. Unless a test passes one, it is computed here.
+const POOL_CHANGE = {
+  addLiquidity: { arity: 3, delta: (c) => c.value },
+  depositFees: { arity: 2, delta: (c) => c.value },
+  removeLiquidity: { arity: 3, delta: (_c, amount) => -amount },
+};
+
 /** Runs a circuit against `state` at block time `time`; reports rather than throws. */
 function callAt(time, caller, state, circuit, ...args) {
+  const change = POOL_CHANGE[circuit];
+  if (change && args.length === change.arity - 1) {
+    args.push(capOf(ledger(state).poolValue + change.delta(...args)));
+  }
   const wrapper = deploy();
   wrapper.data = state;
   try {
@@ -152,7 +169,7 @@ const genesis = deploy().data;
 // ── Trading needs a pool ────────────────────────────────────────────────────
 {
   const early = openCall(TRADER, genesis, coin(100_000_000n), 1_000_000_000n, true, bytes32(1), bytes32(2));
-  expect("no long can open against an empty pool", !early.ok && /no liquidity/.test(early.error), why(early));
+  expect("no long can open against an empty pool", !early.ok && /no room/.test(early.error), why(early));
 }
 
 // ── Liquidity ───────────────────────────────────────────────────────────────
@@ -169,6 +186,11 @@ let pooled;
   const l = ledger(first.state);
   expect("the pool holds it", l.poolValue === 500_000_000_000n && l.pool.value === 500_000_000_000n);
   expect("shares were minted", l.lpSupply === 500_000_000_000n);
+  expect("a 500k pool backs four 100k slots, all free", l.slotCapacity === 4n && l.freeSlots === 4n, `${l.slotCapacity}/${l.freeSlots}`);
+  const overCap = call(LP, genesis, "addLiquidity", coin(500_000_000_000n), 500_000_000_000n, 5n);
+  expect("an overstated slot capacity is refused", !overCap.ok && /capacity overstated/.test(overCap.error), why(overCap));
+  const underCap = call(LP, genesis, "addLiquidity", coin(500_000_000_000n), 500_000_000_000n, 3n);
+  expect("an understated slot capacity is refused", !underCap.ok && /capacity understated/.test(underCap.error), why(underCap));
   const lpCoins = first.zswap.outputs.filter((o) => o.recipient.is_left);
   expect(
     "the LP receives zLP of the share amount",
@@ -256,7 +278,8 @@ const commitment = pureCircuits.positionCommitment(position);
 {
   expect("one position is counted", after.openPositions === 1n);
   expect("the pool is untouched by an open", after.poolValue === ledger(pooled).poolValue);
-  expect("an open reserves exactly maxPayout", after.reserved === MAX_PAYOUT, String(after.reserved));
+  expect("an open reserves exactly maxPayout", reservedOf(after) === MAX_PAYOUT, String(reservedOf(after)));
+  expect("an open takes one free slot", after.freeSlots === ledger(pooled).freeSlots - 1n);
   expect(
     "the trader's opening is in the positions tree",
     after.positions.findPathForLeaf(commitment) !== undefined
@@ -350,7 +373,23 @@ const at = (price) => {
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
-const closeArgs = (o) => [o.position, o.secret, o.path, o.coin, o.pnl, o.closeFee, o.borrowFee, o.closeTime, o.to];
+const closeArgs = (o) => [o.position, o.secret, o.path, o.coin, o.pnl, o.closeFee, o.borrowFee, o.closeTime, o.to, o.capacity];
+
+/**
+ * The pool's slot capacity after a close, worked out as the contract settles:
+ * a loss (at most the collateral) in, a profit less any fee shortfall out.
+ */
+function closeCapacity(state, o) {
+  const l = ledger(state);
+  const p = o.position;
+  const profit = p.isLong ? l.markPrice >= p.entryPrice : l.markPrice <= p.entryPrice;
+  const toPool = profit ? 0n : o.pnl < p.collateral ? o.pnl : p.collateral;
+  const afterLoss = p.collateral - toPool;
+  const fees = o.closeFee + o.borrowFee;
+  const shortfall = fees > afterLoss ? fees - afterLoss : 0n;
+  const fromPool = profit && o.pnl > shortfall ? o.pnl - shortfall : 0n;
+  return capOf(l.poolValue + toPool - fromPool);
+}
 const close = (state, overrides = {}) => {
   const o = {
     position,
@@ -365,6 +404,7 @@ const close = (state, overrides = {}) => {
     to: RECIPIENT,
     ...overrides,
   };
+  o.capacity ??= closeCapacity(state, o);
   return callAt(o.time, TRADER, state, "closePosition", ...closeArgs(o));
 };
 const paidTo = (r, who) =>
@@ -388,6 +428,9 @@ if (flat.ok) {
     "the nullifier is recorded",
     l.closed.member(pureCircuits.positionNullifier(OWNER_SECRET, SALT))
   );
+  expect("a close gives its slot back", l.freeSlots === ledger(pooled).freeSlots);
+  const anyCap = close(opened.state, { capacity: 12_345n });
+  expect("at an unchanged price the slot capacity is ignored: the pool is not touched", anyCap.ok, why(anyCap));
   const twice = close(flat.state);
   expect("a position cannot close twice", !twice.ok && /already closed/.test(twice.error), why(twice));
 
@@ -443,7 +486,7 @@ if (flat.ok) {
 
 // ── Solvency ────────────────────────────────────────────────────────────────
 {
-  expect("a close releases the reservation", flat.ok && ledger(flat.state).reserved === 0n);
+  expect("a close releases the reservation", flat.ok && reservedOf(ledger(flat.state)) === 0n);
 
   // 500k pool, 100k per position: four fit (400k < 500k), a fifth does not.
   let state = pooled;
@@ -458,7 +501,7 @@ if (flat.ok) {
   }
   expect("four 100k reservations fit a 500k pool", accepted === 4, `${accepted} accepted`);
   expect("the fifth is refused while reserved would reach the pool", /no room/.test(refusal), refusal);
-  expect("reserved is positions × maxPayout", ledger(state).reserved === 4n * MAX_PAYOUT);
+  expect("reserved is positions × maxPayout", reservedOf(ledger(state)) === 4n * MAX_PAYOUT);
 
   // Price ×10: the raw profit (9 × size ≈ 111k) exceeds the 100k cap.
   const moon = at(30_000_000_000n);
@@ -474,7 +517,7 @@ if (flat.ok) {
     expect("the recipient gets collateral less fees plus exactly the cap", paidTo(capped, RECIPIENT) === KEEP + MAX_PAYOUT);
     expect("the treasury gets the fees", paidTo(capped, TREASURY) === FEES);
     expect("the pool pays exactly the cap", ledger(capped.state).poolValue === after.poolValue - MAX_PAYOUT);
-    expect("the reservation is released", ledger(capped.state).reserved === 0n);
+    expect("the reservation is released", reservedOf(ledger(capped.state)) === 0n);
   }
 }
 
@@ -486,6 +529,8 @@ if (flat.ok) {
   expect("an overstated profit is refused", !over.ok && /overstated/.test(over.error), why(over));
   const under = close(up, { pnl: profit - 1n });
   expect("an understated profit is refused", !under.ok && /understated/.test(under.error), why(under));
+  const wrongCap = close(up, { pnl: profit, capacity: capOf(after.poolValue - profit) + 1n });
+  expect("a close that moves the pool must give its new slot capacity", !wrongCap.ok && /capacity overstated/.test(wrongCap.error), why(wrongCap));
   const win = close(up, { pnl: profit });
   expect("a winning long closes", win.ok, why(win));
   if (win.ok) {
@@ -545,7 +590,7 @@ expect("a 10x short opens", shortOpened.ok, why(shortOpened));
   const tooMuch = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL * 21n, false, OWNER_SECRET, SALT);
   expect("a 21x short is refused", !tooMuch.ok && /leverage above/.test(tooMuch.error), why(tooMuch));
   const l = ledger(shortOpened.state);
-  expect("a short reserves the same maxPayout as a long", l.reserved === MAX_PAYOUT);
+  expect("a short reserves the same maxPayout as a long", reservedOf(l) === MAX_PAYOUT);
   expect("the short's opening is in the tree", l.positions.findPathForLeaf(shortCommitment) !== undefined);
   expect(
     "a short's commitment differs from the same long's",
@@ -594,6 +639,7 @@ const closeShort = (state, overrides = {}) => {
   o.path =
     ledger(state).positions.findPathForLeaf(pureCircuits.positionCommitment(o.position)) ??
     ledger(state).positions.findPathForLeaf(shortCommitment);
+  o.capacity ??= closeCapacity(state, o);
   return callAt(o.time, TRADER, state, "closePosition", ...closeArgs(o));
 };
 const shortPool = ledger(shortOpened.state).poolValue;
@@ -618,7 +664,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   if (win.ok) {
     expect("the recipient gets collateral less fees plus profit", paidTo(win, RECIPIENT) === KEEP + profit);
     expect("the pool pays exactly the profit", ledger(win.state).poolValue === shortPool - profit);
-    expect("the short's reservation is released", ledger(win.state).reserved === 0n);
+    expect("the short's reservation is released", reservedOf(ledger(win.state)) === 0n);
   }
 }
 
@@ -666,8 +712,8 @@ const shortPool = ledger(shortOpened.state).poolValue;
   const opened20 = openCall(TRADER, pooled, bigCoin, bigSize, false, OWNER_SECRET, big.salt);
   expect("a 20x short opens", opened20.ok, why(opened20));
   const crash = call(DEPLOYER, opened20.state, "setPrice", 1_200_000_000n, ADMIN_SECRET).state;
-  const closeBig = (pnl) =>
-    callAt(T1, TRADER, crash, "closePosition", ...closeArgs({
+  const closeBig = (pnl) => {
+    const o = {
       position: big,
       secret: OWNER_SECRET,
       path: ledger(crash).positions.findPathForLeaf(pureCircuits.positionCommitment(big)),
@@ -677,7 +723,10 @@ const shortPool = ledger(shortOpened.state).poolValue;
       borrowFee: borrowFeeOf(bigSize, HELD),
       closeTime: T1,
       to: RECIPIENT,
-    }));
+    };
+    o.capacity = closeCapacity(crash, o);
+    return callAt(T1, TRADER, crash, "closePosition", ...closeArgs(o));
+  };
   const raw = closeBig(floorDiv(bigSize * 1_800_000_000n, PRICE));
   expect("a short's profit above the cap is refused", !raw.ok && /payout cap/.test(raw.error), why(raw));
   const capped = closeBig(MAX_PAYOUT);
@@ -813,7 +862,7 @@ const redeemable = (state, shares) => {
   expect("a withdrawal that leaves more than the reservation is accepted", underEdge.ok, why(underEdge));
   if (underEdge.ok) {
     const l = ledger(underEdge.state);
-    expect("the reservation still fits the pool", l.poolValue > l.reserved, `${l.poolValue} vs ${l.reserved}`);
+    expect("the reservation still fits the pool", l.poolValue > reservedOf(l), `${l.poolValue} vs ${reservedOf(l)}`);
     const trader = close(underEdge.state);
     expect("the open position still closes afterwards", trader.ok, why(trader));
   }

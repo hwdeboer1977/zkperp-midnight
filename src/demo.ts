@@ -40,7 +40,7 @@
 import chalk from "chalk";
 import { deployContract } from "@midnight-ntwrk/midnight-js-contracts";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { createHash, randomBytes } from "crypto";
+import { createHash } from "crypto";
 import { LOCAL, walletSeed } from "./network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "./wallet.js";
 import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
@@ -53,11 +53,12 @@ import {
   openPosition,
   positionPnl,
   readLedger,
+  reservedOf,
   settlement,
   type ContractHandle,
 } from "./perp.js";
 import { openPositionsOn, positionsFile, reconcile } from "./positions.js";
-import { depositFees, redeemable, removeLiquidity } from "./pool.js";
+import { addLiquidity, depositFees, redeemable, removeLiquidity } from "./pool.js";
 import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
 import { balance, coinKey, handle, providersFor, waitForBalance } from "./session.js";
 
@@ -163,7 +164,7 @@ async function main() {
     if ((await readLedger(devPerp)).poolValue === 0n) {
       await waitForBalance(devWallet, usdc, (b) => b >= LIQUIDITY);
       info(`dev adds ${fmt(LIQUIDITY)} pUSDC of liquidity…`);
-      await devPerp.deployed.callTx.addLiquidity({ nonce: randomBytes(32), color: usdc, value: LIQUIDITY }, LIQUIDITY);
+      await addLiquidity(devPerp, usdc, LIQUIDITY);
     }
     await setPrice(devPerp, PRICE, adminSecret);
 
@@ -208,7 +209,7 @@ async function main() {
       info(`closing a position left open by an earlier run (${leftover.commitment.slice(0, 12)}…)`);
       await closePosition(trader.perp, leftover, usdc, trader.coinPublicKey, treasuryEncKey);
     }
-    if ((await readLedger(devPerp)).reserved !== 0n) {
+    if (reservedOf(await readLedger(devPerp)) !== 0n) {
       throw new Error("liquidity is still reserved for positions this machine has no record of");
     }
 
@@ -225,13 +226,13 @@ async function main() {
       step(`Custody — open and close a ${dir} at an unchanged price`);
       const before = await balance(trader.wallet, usdc);
       const poolBefore = (await readLedger(devPerp)).poolValue;
-      const reservedBefore = (await readLedger(devPerp)).reserved;
+      const reservedBefore = reservedOf(await readLedger(devPerp));
 
       const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened ${opened.txHash}`);
       check(
         "the open reserved exactly maxPayout — the same for every position",
-        (await readLedger(devPerp)).reserved === reservedBefore + MAX_PAYOUT
+        reservedOf(await readLedger(devPerp)) === reservedBefore + MAX_PAYOUT
       );
       check("the pool is untouched by an open, fee included", (await readLedger(devPerp)).poolValue === poolBefore);
       const whileOpen = await waitForBalance(trader.wallet, usdc, (b) => b < before);
@@ -259,7 +260,7 @@ async function main() {
       const devAfter = await waitForBalance(dev.wallet, usdc, (b) => b > devBefore);
       check(`the treasury receives exactly the fees (${fmt(fees)})`, devAfter - devBefore === fees);
       check("the pool did not move: no fee reaches it", (await readLedger(devPerp)).poolValue === poolBefore);
-      check("the close released the reservation", (await readLedger(devPerp)).reserved === reservedBefore);
+      check("the close released the reservation", reservedOf(await readLedger(devPerp)) === reservedBefore);
       feesCollected += fees;
       await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier, [
         ["closing fee", closed.closeFee],
@@ -338,7 +339,7 @@ async function main() {
       if (label.includes("wipe-out")) {
         check("a wipe-out forgives the closing and borrow fees: the treasury gets the opening fee only", s.toTreasury === openFee);
       }
-      check("no reservation is left behind", (await readLedger(devPerp)).reserved === 0n);
+      check("no reservation is left behind", reservedOf(await readLedger(devPerp)) === 0n);
       feesCollected += s.toTreasury;
       await privacy("close", closed.txHash, trader, opened.record, perpAddress, usdc, closed.nullifier, [
         ["closing fee", closed.closeFee],
@@ -423,7 +424,7 @@ async function main() {
     // ── Summary ───────────────────────────────────────────────────────────
     const l = await readLedger(devPerp);
     console.log();
-    info(`positions opened ${l.openPositions}, closed ${l.closedPositions}; pool ${fmt(l.poolValue)} pUSDC, reserved ${fmt(l.reserved)}`);
+    info(`positions opened ${l.openPositions}, closed ${l.closedPositions}; pool ${fmt(l.poolValue)} pUSDC, reserved ${fmt(reservedOf(l))}`);
     info(`trader's openings: ${positionsFile()}`);
     const failed = results.filter((r) => !r.ok);
     console.log();

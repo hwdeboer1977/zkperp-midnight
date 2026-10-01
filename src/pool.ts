@@ -5,7 +5,7 @@
  */
 
 import { randomBytes } from "crypto";
-import { readLedger, type ContractHandle } from "./perp.js";
+import { capacityOf, readLedger, type ContractHandle } from "./perp.js";
 
 /** pUSDC that `shares` redeem for, as the circuit demands: rounded down, for the pool. */
 export function redeemable(ledger: { poolValue: bigint; lpSupply: bigint }, shares: bigint): bigint {
@@ -26,7 +26,8 @@ export async function removeLiquidity(
   const amount = redeemable(ledger, shares);
   const tx = await perp.deployed.callTx.removeLiquidity(
     { nonce: new Uint8Array(randomBytes(32)), color: ledger.lpToken, value: shares },
-    amount
+    amount,
+    capacityOf(ledger.poolValue - amount, ledger.maxPayout)
   );
   return { txHash: tx.public.txHash, amount };
 }
@@ -36,10 +37,25 @@ export async function removeLiquidity(
  * minting shares, raising every zLP share's value.
  */
 export async function depositFees(perp: ContractHandle, usdc: Uint8Array, amount: bigint): Promise<string> {
-  const tx = await perp.deployed.callTx.depositFees({
-    nonce: new Uint8Array(randomBytes(32)),
-    color: usdc,
-    value: amount,
-  });
+  const ledger = await readLedger(perp);
+  const tx = await perp.deployed.callTx.depositFees(
+    { nonce: new Uint8Array(randomBytes(32)), color: usdc, value: amount },
+    capacityOf(ledger.poolValue + amount, ledger.maxPayout)
+  );
+  return tx.public.txHash;
+}
+
+/**
+ * Deposits `amount` pUSDC for zLP shares: one share per unit for the first
+ * deposit, pro rata after that, rounded down for the pool.
+ */
+export async function addLiquidity(perp: ContractHandle, usdc: Uint8Array, amount: bigint): Promise<string> {
+  const ledger = await readLedger(perp);
+  const shares = ledger.lpSupply === 0n ? amount : (amount * ledger.lpSupply) / ledger.poolValue;
+  const tx = await perp.deployed.callTx.addLiquidity(
+    { nonce: new Uint8Array(randomBytes(32)), color: usdc, value: amount },
+    shares,
+    capacityOf(ledger.poolValue + amount, ledger.maxPayout)
+  );
   return tx.public.txHash;
 }

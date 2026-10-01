@@ -7,7 +7,7 @@ import { CompiledContract } from "@midnight-ntwrk/compact-js";
 import { pipe } from "effect";
 import { managedPath } from "./providers.js";
 
-export type ContractName = "pusdc" | "zkperp" | "leakprobe";
+export type ContractName = "pusdc" | "zkperp" | "leakprobe" | "raceprobe";
 
 /** The generated module for a contract: `Contract`, `ledger`, `pureCircuits`. */
 export async function contractModule(name: ContractName): Promise<any> {
