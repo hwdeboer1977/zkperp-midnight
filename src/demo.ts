@@ -47,19 +47,22 @@ import { getDeployment, loadCompiledContract, saveDeployment, type ContractName 
 import { readyTrader, traderSeed } from "./trader.js";
 import {
   borrowFeeOf,
+  circuitNow,
   closeFeeOf,
   closePosition,
   openFeeOf,
   openPosition,
   positionPnl,
+  priceNeedsUpdate,
   readLedger,
   reservedOf,
   settlement,
+  submitPrice,
   type ContractHandle,
 } from "./perp.js";
 import { openPositionsOn, positionsFile, reconcile } from "./positions.js";
 import { addLiquidity, depositFees, redeemable, removeLiquidity } from "./pool.js";
-import { findBytes, findNumber, rawTransaction } from "./leak-search.js";
+import { findBytes, findNumber, findNumberLoose, rawTransaction } from "./leak-search.js";
 import { balance, coinKey, handle, providersFor, waitForBalance } from "./session.js";
 
 const PUSDC = 1_000_000n;
@@ -75,6 +78,8 @@ const OPEN_FEE_BPS = 10n;
 const CLOSE_FEE_BPS = 10n;
 const BORROW_RATE = 1_000_000n;
 const CLOCK_SLACK = 600n;
+// Just above Chainlink's hourly heartbeat.
+const MAX_PRICE_AGE = 3_900n;
 // The LPs' share of fees, paid into the pool at the end of the epoch.
 const LP_FEE_SHARE_PCT = 70n;
 const MIN_COLLATERAL = 10n * PUSDC;
@@ -146,6 +151,7 @@ async function main() {
       usdc,
       module.pureCircuits.adminKey(adminSecret),
       PRICE,
+      circuitNow(),
       MAX_LEVERAGE,
       MIN_COLLATERAL,
       MAX_PAYOUT,
@@ -154,6 +160,7 @@ async function main() {
       BORROW_RATE,
       { bytes: coinKey(devWallet) },
       CLOCK_SLACK,
+      MAX_PRICE_AGE,
     ]);
     const devPerp = await handle(devWallet, devSeed, "zkperp", perpAddress);
     info(`zkperp ${perpAddress}`);
@@ -466,11 +473,17 @@ async function privacy(
       `${kind}: ${label} is not in the transaction`,
       Array.isArray(found) ? found.length === 0 : !found
     );
-  absent("size", findNumber(raw, BigInt(o.size)));
-  absent("collateral", findNumber(raw, BigInt(o.collateral)));
-  absent("coin value", findNumber(raw, BigInt(o.collateral) + BigInt(o.openFee)));
-  absent("opening fee", findNumber(raw, BigInt(o.openFee)));
-  for (const [label, n] of amounts) absent(label, findNumber(raw, n));
+  const absentNumber = (label: string, n: bigint) => {
+    absent(label, findNumber(raw, n));
+    // Plain bytes of a short number turn up by chance; worth a look, not a verdict.
+    const loose = findNumberLoose(raw, n);
+    if (loose.length) info(chalk.yellow(`  ${label}: possible chance match as ${loose.join(", ")} — review`));
+  };
+  absentNumber("size", BigInt(o.size));
+  absentNumber("collateral", BigInt(o.collateral));
+  absentNumber("coin value", BigInt(o.collateral) + BigInt(o.openFee));
+  absentNumber("opening fee", BigInt(o.openFee));
+  for (const [label, n] of amounts) absentNumber(label, n);
   absent("owner secret", findBytes(raw, o.ownerSecret));
   absent("salt", findBytes(raw, o.salt));
   absent("collateral coin nonce", findBytes(raw, o.collateralNonce));
@@ -500,9 +513,9 @@ async function deployOrFind(
 }
 
 async function setPrice(perp: ContractHandle, price: bigint, adminSecret: Uint8Array) {
-  if ((await readLedger(perp)).markPrice === price) return;
+  if (!priceNeedsUpdate(await readLedger(perp), price)) return;
   info(`oracle: price → $${fmt(price)}`);
-  await perp.deployed.callTx.setPrice(price, adminSecret);
+  await submitPrice(perp, price, adminSecret);
 }
 
 main().catch((error) => {

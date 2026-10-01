@@ -4,7 +4,7 @@ Private perpetuals on [Midnight](https://midnight.network): go leveraged long or
 
 > ⚠️ **pUSDC is a mock token. Anyone can mint any amount of it.** It exists so the devnet can hand out collateral without a faucet, and it has none of the supply control a real stablecoin needs. zkperp itself only accepts the one token it was deployed with; swapping pUSDC for a real shielded stablecoin changes nothing in zkperp's contract.
 >
-> The price oracle is also a mock: the admin sets the mark price.
+> The price oracle is also a mock: the admin sets the mark price. Each price carries the time the oracle observed it (for Chainlink, the round's `updatedAt`), and every open and close refuses a price older than `maxPriceAge`, which should sit just above the feed's heartbeat. A price update cannot carry an older time than the current one, so an old round can't be replayed.
 
 ## How it works
 
@@ -70,12 +70,14 @@ Known limits:
 - **Wipe-outs publish the collateral**, since all of it moves into the pool.
 - **A capped profit shows that the cap bound**, which means `size × Δprice / entry ≥ maxPayout`.
 - **Fees reveal size to the treasury.** See the warning above.
+- **If the oracle stops, trading stops**, closes included, until a fresh price arrives. A trade at a stale price would let traders pick their price.
+- **The oracle lags the market.** Chainlink publishes a new round on a 0.5% move or hourly, so the market can move up to ~0.5% before the contract's price follows, and a trader watching exchanges can trade on that. The opening and closing fees absorb most of this edge; a spread around the oracle price or a faster feed would close it.
 - **Funding rates** need the long/short skew, which is private. The design for that is open (bucketed or batch-published skew are the candidates).
 
 The privacy claims are tested, not just asserted:
 
 - `npm test` runs every circuit locally and searches the resulting public state and transcript for each private value, with positive controls.
-- `npm run probe:leak` deploys a test-only contract that publishes three amounts on purpose, and checks that the search finds them. On-chain they appear as little-endian bytes. This shows which encodings the search covers, so a "not found" elsewhere can be trusted for those encodings.
+- `npm run probe:leak` deploys a test-only contract that publishes three amounts on purpose, and checks that the search finds them. On-chain a disclosed amount appears as a length byte (0x40 + its byte count) followed by its little-endian bytes; the search treats that form as a leak, and plain byte matches, which a short number can hit by chance in proof bytes, as warnings to review. This shows which encodings the search covers, so a "not found" elsewhere can be trusted for those encodings.
 - `npm run demo` searches the raw bytes of every trade transaction on the devnet.
 
 **Concurrent trades.** A Midnight transaction is proven against the state it read, and fails if a value it read *exactly* has changed by the time it lands. `npm run probe:race` measures which ledger operations conflict: exact reads of a changed cell do; `Counter` increments, decrements and `lessThan` checks, Merkle and set inserts, and historic root checks do not. zkperp is laid out on that basis, and `npm run race` checks it on zkperp itself:

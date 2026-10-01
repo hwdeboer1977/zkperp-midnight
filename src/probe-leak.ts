@@ -19,7 +19,7 @@ import { LOCAL, walletSeed } from "./network.js";
 import { buildWallet, makeWalletProviders, waitForSync } from "./wallet.js";
 import { makeProviders } from "./providers.js";
 import { loadCompiledContract } from "./contracts.js";
-import { findNumber, rawTransaction } from "./leak-search.js";
+import { encodings, findNumber, rawTransaction } from "./leak-search.js";
 
 // Same magnitudes as the demo's collateral and size, and a Uint<128>-sized
 // one, so the control exercises the widths the real search relies on.
@@ -62,6 +62,15 @@ async function main() {
         `   ${forms.length ? chalk.green("✓ found") : chalk.red("✗ MISSED")}  ${label} (${n})` +
           (forms.length ? chalk.gray(`  as ${forms.join(", ")}`) : "")
       );
+      // The bytes around every occurrence: how the chain frames an amount.
+      for (const e of encodings(n)) {
+        for (let i = raw.indexOf(e.hex); i >= 0; i = raw.indexOf(e.hex, i + 1)) {
+          if (i % 2) continue;
+          const before = raw.slice(Math.max(0, i - 24), i);
+          const after = raw.slice(i + e.hex.length, i + e.hex.length + 24);
+          console.log(chalk.gray(`        ${e.form} at byte ${i / 2}: ${before} [${e.hex}] ${after}`));
+        }
+      }
     }
     console.log();
     if (missed) {

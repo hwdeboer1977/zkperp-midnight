@@ -61,6 +61,9 @@ const TREASURY = key(0x7e);
 const T0 = 1_800_000_000n;
 const HELD = 3_600n;
 const T1 = T0 + HELD;
+// The oracle's price is from just before T0, and stays good for 65 minutes.
+const PRICE_TIME = T0 - 10n;
+const MAX_PRICE_AGE = 3_900n;
 
 const ceilDiv = (a, b) => (a + b - 1n) / b;
 const floorDiv = (a, b) => a / b;
@@ -77,6 +80,7 @@ const deploy = () =>
     USDC,
     pureCircuits.adminKey(ADMIN_SECRET),
     PRICE,
+    PRICE_TIME,
     MAX_LEVERAGE,
     MIN_COLLATERAL,
     MAX_PAYOUT,
@@ -84,7 +88,8 @@ const deploy = () =>
     CLOSE_FEE_BPS,
     BORROW_RATE,
     TREASURY,
-    CLOCK_SLACK
+    CLOCK_SLACK,
+    MAX_PRICE_AGE
   ).currentContractState;
 
 /** Slots of MAX_PAYOUT a pool of `value` backs, as the contract pins it. */
@@ -156,14 +161,18 @@ const genesis = deploy().data;
 
 // ── Oracle ──────────────────────────────────────────────────────────────────
 {
-  const wrong = call(TRADER, genesis, "setPrice", 1n, bytes32(0x01));
+  const wrong = call(TRADER, genesis, "setPrice", 1n, T0, bytes32(0x01));
   expect("a stranger cannot set the price", !wrong.ok && /not the admin/.test(wrong.error), why(wrong));
-  const right = call(TRADER, genesis, "setPrice", 3_100_000_000n, ADMIN_SECRET);
+  const right = call(TRADER, genesis, "setPrice", 3_100_000_000n, T0, ADMIN_SECRET);
   expect(
-    "the admin secret sets the price, whoever submits it",
-    right.ok && ledger(right.state).markPrice === 3_100_000_000n,
+    "the admin secret sets the price and its time, whoever submits it",
+    right.ok && ledger(right.state).markPrice === 3_100_000_000n && ledger(right.state).priceTime === T0,
     why(right)
   );
+  const future = call(TRADER, genesis, "setPrice", 3_100_000_000n, T0 + 1n, ADMIN_SECRET);
+  expect("a price time in the future is refused", !future.ok && /in the future/.test(future.error), why(future));
+  const replay = call(TRADER, genesis, "setPrice", 2_900_000_000n, PRICE_TIME - 1n, ADMIN_SECRET);
+  expect("an older round cannot replace the price", !replay.ok && /older than the current/.test(replay.error), why(replay));
 }
 
 // ── Trading needs a pool ────────────────────────────────────────────────────
@@ -369,7 +378,7 @@ const FEES = OPEN_FEE + CLOSE_FEE + BORROW_FEE;
 const KEEP = COLLATERAL - CLOSE_FEE - BORROW_FEE;
 const pathFor = (state) => ledger(state).positions.findPathForLeaf(commitment);
 const at = (price) => {
-  const r = call(DEPLOYER, opened.state, "setPrice", price, ADMIN_SECRET);
+  const r = call(DEPLOYER, opened.state, "setPrice", price, T0, ADMIN_SECRET);
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
@@ -482,6 +491,24 @@ if (flat.ok) {
   expect("a close time before the open is refused", !beforeOpen.ok && /before the open/.test(beforeOpen.error), why(beforeOpen));
   const instant = close(opened.state, { time: T0, closeTime: T0, borrowFee: 0n });
   expect("a position closed in the second it opened owes no borrow fee", instant.ok && paidTo(instant, TREASURY) === OPEN_FEE + CLOSE_FEE, why(instant));
+}
+
+// ── A stale price ───────────────────────────────────────────────────────────
+
+console.log("\n  stale price\n");
+{
+  const STALE = PRICE_TIME + MAX_PRICE_AGE;
+  const lastGood = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { time: STALE - 1n, openTime: STALE - 1n });
+  expect("an open with a price just inside its age limit is accepted", lastGood.ok, why(lastGood));
+  const staleOpen = openCall(TRADER, pooled, coin(COLLATERAL), SIZE, true, OWNER_SECRET, SALT, { time: STALE, openTime: STALE });
+  expect("an open with a stale price is refused", !staleOpen.ok && /price is stale/.test(staleOpen.error), why(staleOpen));
+  const staleClose = close(opened.state, { time: STALE, closeTime: STALE, borrowFee: borrowFeeOf(SIZE, STALE - T0) });
+  expect("a close with a stale price is refused", !staleClose.ok && /price is stale/.test(staleClose.error), why(staleClose));
+  const refreshed = callAt(STALE, DEPLOYER, opened.state, "setPrice", PRICE, STALE, ADMIN_SECRET);
+  const afterReport = close(refreshed.state, { time: STALE, closeTime: STALE, borrowFee: borrowFeeOf(SIZE, STALE - T0) });
+  expect("once the oracle reports again, the close goes through", afterReport.ok, why(afterReport));
+  const pool = callAt(STALE, LP, pooled, "addLiquidity", coin(1_000_000n), 1_000_000n);
+  expect("liquidity does not depend on the price, stale or not", pool.ok, why(pool));
 }
 
 // ── Solvency ────────────────────────────────────────────────────────────────
@@ -619,7 +646,7 @@ expect("a 10x short opens", shortOpened.ok, why(shortOpened));
 }
 
 const shortAt = (price) => {
-  const r = call(DEPLOYER, shortOpened.state, "setPrice", price, ADMIN_SECRET);
+  const r = call(DEPLOYER, shortOpened.state, "setPrice", price, T0, ADMIN_SECRET);
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
@@ -711,7 +738,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   };
   const opened20 = openCall(TRADER, pooled, bigCoin, bigSize, false, OWNER_SECRET, big.salt);
   expect("a 20x short opens", opened20.ok, why(opened20));
-  const crash = call(DEPLOYER, opened20.state, "setPrice", 1_200_000_000n, ADMIN_SECRET).state;
+  const crash = call(DEPLOYER, opened20.state, "setPrice", 1_200_000_000n, T0, ADMIN_SECRET).state;
   const closeBig = (pnl) => {
     const o = {
       position: big,
@@ -749,8 +776,10 @@ console.log("\n  fees beyond the collateral\n");
   const borrow = borrowFeeOf(SIZE, LONG_HOLD);
   expect("(the closing and borrow fees exceed the collateral)", CLOSE_FEE + borrow > COLLATERAL);
   const late = (state, pnl) => close(state, { time: T2, closeTime: T2, borrowFee: borrow, pnl });
+  // Days later, the oracle has reported since.
+  const reported = (price) => callAt(T2, DEPLOYER, opened.state, "setPrice", price, T2, ADMIN_SECRET).state;
 
-  const idle = late(opened.state, 0n);
+  const idle = late(reported(PRICE), 0n);
   expect("a position whose fees exceed its collateral still closes", idle.ok, why(idle));
   if (idle.ok) {
     expect("the trader gets nothing", paidTo(idle, RECIPIENT) === 0n);
@@ -760,7 +789,7 @@ console.log("\n  fees beyond the collateral\n");
 
   // Price up 25%: the profit (~3,086) covers the shortfall (~1,247), which
   // stays in the pool; the trader gets the rest of the profit.
-  const up = at(3_750_000_000n);
+  const up = reported(3_750_000_000n);
   const profit = floorDiv(SIZE * 750_000_000n, PRICE);
   const shortfall = CLOSE_FEE + borrow - COLLATERAL;
   const win = late(up, profit);

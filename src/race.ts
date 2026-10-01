@@ -35,7 +35,15 @@ import { LOCAL, walletSeed } from "./network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "./wallet.js";
 import { getDeployment } from "./contracts.js";
 import { readyTrader, traderSeed } from "./trader.js";
-import { closePosition, openPosition, readLedger, reservedOf, type ContractHandle } from "./perp.js";
+import {
+  closePosition,
+  openPosition,
+  priceNeedsUpdate,
+  readLedger,
+  reservedOf,
+  submitPrice,
+  type ContractHandle,
+} from "./perp.js";
 import { addLiquidity } from "./pool.js";
 import { openPositionsOn, type PositionRecord } from "./positions.js";
 import { balance, coinKey, handle, waitForBalance } from "./session.js";
@@ -146,8 +154,8 @@ async function main() {
     const treasuryEncKey = String(devWallet.shieldedSecretKeys.encryptionPublicKey);
 
     const setPrice = async (price: bigint) => {
-      if ((await readLedger(dev.perp)).markPrice === price) return;
-      await dev.perp.deployed.callTx.setPrice(price, adminSecret);
+      if (!priceNeedsUpdate(await readLedger(dev.perp), price)) return;
+      await submitPrice(dev.perp, price, adminSecret);
     };
     const open = async (p: Party, isLong = true) => {
       const opened = await openPosition(p.perp, usdc, COLLATERAL, SIZE, isLong, LOCAL.networkId);
@@ -182,7 +190,7 @@ async function main() {
       info("trader opened a long at $3,000");
       const [c, p] = await race(
         ["trader's close", () => close(trader, record)],
-        ["dev's setPrice($3,300)", async () => ({ txHash: (await dev.perp.deployed.callTx.setPrice(UP, adminSecret)).public.txHash })]
+        ["dev's setPrice($3,300)", async () => ({ txHash: await submitPrice(dev.perp, UP, adminSecret) })]
       );
       const after = await readLedger(dev.perp);
       info(`price now $${fmt(after.markPrice)}`);

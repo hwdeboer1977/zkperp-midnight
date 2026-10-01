@@ -80,8 +80,9 @@ import CompactStandardLibrary;
 //   · a close at an unchanged price reads neither the pool coin nor
 //     `poolValue`.
 //
-// The mark price is read by every trade on purpose: pricing is strict, so a
-// trade proven at one price fails if the price changes before it lands.
+// The mark price and its time are read by every trade on purpose: pricing is
+// strict, so a trade proven at one price fails if the price changes before it
+// lands, and a trade refuses a price older than `maxPriceAge`.
 //
 // Why a constant cap and not k × collateral: a position that hits a cap is
 // paid exactly the cap, publicly, so a collateral-relative cap publishes the
@@ -155,10 +156,21 @@ export sealed ledger treasury: ZswapCoinPublicKey;
 // borrow fee they can dodge to `clockSlack` seconds' worth.
 export sealed ledger clockSlack: Uint<32>;
 
+// The oldest price a trade accepts, in seconds since the oracle's own
+// timestamp. Chainlink's ETH/USD feed updates on a 0.5% move or hourly, so a
+// price up to an hour old is still current; this should sit just above that
+// heartbeat. If the oracle stops, trading — closes included — waits for it.
+export sealed ledger maxPriceAge: Uint<32>;
+
 // ── Oracle ─────────────────────────────────────────────────────────────────
 
 // Price of the traded asset in USD, 6 decimals: 3000_000000 is $3,000.
 export ledger markPrice: Uint<64>;
+
+// When the oracle observed `markPrice`, in seconds since the epoch — for
+// Chainlink, the round's `updatedAt`. Every trade checks it against the block
+// time; see `freshPrice`.
+export ledger priceTime: Uint<64>;
 
 // ── Pool ───────────────────────────────────────────────────────────────────
 
@@ -223,6 +235,7 @@ constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
   initialPrice: Uint<64>,
+  initialPriceTime: Uint<64>,
   leverageCap: Uint<8>,
   collateralFloor: Uint<64>,
   payoutCap: Uint<64>,
@@ -230,12 +243,14 @@ constructor(
   closeFee: Uint<16>,
   rate: Uint<32>,
   feeRecipient: ZswapCoinPublicKey,
-  slack: Uint<32>
+  slack: Uint<32>,
+  priceAge: Uint<32>
 ) {
   usdc = disclose(usdcToken);
   admin = disclose(adminCommitment);
   assert(disclose(initialPrice) > 0, "price must be positive");
   markPrice = disclose(initialPrice);
+  priceTime = disclose(initialPriceTime);
   assert(disclose(leverageCap) >= 1, "leverage cap must be at least 1x");
   maxLeverage = disclose(leverageCap);
   minCollateral = disclose(collateralFloor);
@@ -249,6 +264,8 @@ constructor(
   treasury = disclose(feeRecipient);
   assert(disclose(slack) > 0, "the clock slack must be positive");
   clockSlack = disclose(slack);
+  assert(disclose(priceAge) > 0, "the price age limit must be positive");
+  maxPriceAge = disclose(priceAge);
   lpToken = default<Bytes<32>>;
 }
 
@@ -276,12 +293,27 @@ export pure circuit positionNullifier(ownerSecret: Bytes<32>, salt: Bytes<32>): 
 
 // ── Mock oracle ────────────────────────────────────────────────────────────
 
-// Sets the mark price. Authorised by a secret, not by `ownPublicKey()`: the
-// caller supplies that key themselves, so checking it proves nothing.
-export circuit setPrice(price: Uint<64>, secret: Bytes<32>): [] {
+// Sets the mark price, observed by the oracle at `updatedAt` (seconds since
+// the epoch). Authorised by a secret, not by `ownPublicKey()`: the caller
+// supplies that key themselves, so checking it proves nothing.
+//
+// The time may not be in the future, nor older than the current price's, so a
+// relayer cannot replay an older round to move the price back.
+export circuit setPrice(price: Uint<64>, updatedAt: Uint<64>, secret: Bytes<32>): [] {
   assert(admin == disclose(adminKey(secret)), "not the admin");
   assert(disclose(price) > 0, "price must be positive");
+  const t = disclose(updatedAt);
+  assert(blockTimeGte(t), "the price time is in the future");
+  assert(t >= priceTime, "the price time is older than the current price's");
   markPrice = disclose(price);
+  priceTime = t;
+}
+
+// Every open and close prices against `markPrice` and calls this first. It
+// reads `priceTime`, which changes only when the price does, so it adds no
+// conflict a trade does not already have with a price update.
+circuit freshPrice(): [] {
+  assert(blockTimeLt((priceTime + maxPriceAge) as Uint<64>), "the price is stale");
 }
 
 // ── Liquidity ──────────────────────────────────────────────────────────────
@@ -452,6 +484,7 @@ export circuit openPosition(
   const t = disclose(openTime);
   assert(blockTimeGte(t), "open time is in the future");
   assert(blockTimeLt((t + clockSlack) as Uint<64>), "open time is too far in the past");
+  freshPrice();
 
   // Fee and leverage bounds, checked in the proof against private values. A
   // failed assert aborts proving, so a reader learns only that they held.
@@ -562,6 +595,7 @@ export circuit closePosition(
   const now = disclose(closeTime);
   assert(blockTimeGte(now), "close time is in the future");
   assert(blockTimeLt((now + clockSlack) as Uint<64>), "close time is too far in the past");
+  freshPrice();
   assert(now >= position.openTime, "close time is before the open");
   const held = now - position.openTime;
 

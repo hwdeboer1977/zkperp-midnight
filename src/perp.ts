@@ -53,6 +53,30 @@ export function reservedOf(ledger: { slotCapacity: bigint; freeSlots: bigint; ma
   return (ledger.slotCapacity - ledger.freeSlots) * ledger.maxPayout;
 }
 
+/**
+ * The oracle's update: `price` observed at `updatedAt` (seconds since the
+ * epoch; for Chainlink, the round's `updatedAt`). Defaults to now, as the
+ * mock oracle in the demo has no feed of its own.
+ */
+export async function submitPrice(
+  perp: ContractHandle,
+  price: bigint,
+  adminSecret: Uint8Array,
+  updatedAt: bigint = circuitNow()
+): Promise<string> {
+  const tx = await perp.deployed.callTx.setPrice(price, updatedAt, adminSecret);
+  return tx.public.txHash;
+}
+
+/**
+ * Whether the mock oracle should submit: a different price, or the same one
+ * grown old. A real relayer submits only on a new Chainlink round instead.
+ */
+export function priceNeedsUpdate(ledger: { markPrice: bigint; priceTime: bigint }, price: bigint): boolean {
+  const REFRESH_SECONDS = 600n;
+  return ledger.markPrice !== price || circuitNow() - ledger.priceTime > REFRESH_SECONDS;
+}
+
 /** Fees as the circuit demands them, each rounded up. */
 export function openFeeOf(size: bigint, openFeeBps: bigint): bigint {
   return ceilDiv(size * openFeeBps, 10_000n);

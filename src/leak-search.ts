@@ -6,16 +6,27 @@
  * A search that finds nothing only proves the value is absent IN THE FORMS
  * SEARCHED. So every number is searched in each form it might take:
  *
- *   · minimal big- and little-endian bytes. Every zero-padded fixed width —
- *     u64, u128, a 32-byte field element — contains these as a substring, so
- *     this covers them all;
+ *   · length-tagged little-endian: one byte 0x40 + n, then the value's n
+ *     minimal bytes, least significant first. This is how a contract's public
+ *     transcript carries a number — measured by `probe-leak.ts`, and on
+ *     zkperp's own closes, where every copy of the public pool value is
+ *     tagged this way;
  *   · SCALE compact encoding, which the node's transaction format uses for
  *     integers and which shifts the bits (value << 2 | mode), so the plain
  *     bytes never appear;
- *   · decimal ASCII, as hex, in case anything is rendered as text.
+ *   · decimal ASCII, as hex, in case anything is rendered as text;
+ *   · plain big- and little-endian bytes, untagged, for anything framed some
+ *     other way.
+ *
+ * The plain forms are short — a fee is three bytes — and a 40 KB transaction
+ * is mostly random proof bytes, so they turn up by chance: a fee once
+ * matched, big-endian, inside a hash. A plain match is therefore reported as a
+ * possible chance match for review (`findNumberLoose`), not as a leak; the
+ * others are long enough that a chance match is negligible, and a match is a
+ * leak (`findNumber`). Every match must start on a byte boundary.
  *
  * Coverage is checked, not assumed: `probe-leak.ts` deliberately discloses
- * values from a contract and requires this search to find them.
+ * values from a contract and requires `findNumber` to find them.
  */
 
 export function hexOf(n: bigint): string {
@@ -39,29 +50,55 @@ export function scaleCompact(n: bigint): string {
 export interface Encoding {
   form: string;
   hex: string;
+  /** Long or specific enough that a match is not chance. */
+  certain: boolean;
+}
+
+/** One byte 0x40 + length, then the minimal little-endian bytes. */
+export function taggedLittleEndian(n: bigint): string {
+  const le = reverseBytes(hexOf(n));
+  return (0x40 + le.length / 2).toString(16).padStart(2, "0") + le;
 }
 
 export function encodings(n: bigint): Encoding[] {
   const be = hexOf(n);
+  const scale = scaleCompact(n);
   return [
-    { form: "big-endian", hex: be },
-    { form: "little-endian", hex: reverseBytes(be) },
-    { form: "SCALE compact", hex: scaleCompact(n) },
-    { form: "decimal text", hex: Buffer.from(n.toString(), "ascii").toString("hex") },
+    { form: "length-tagged little-endian", hex: taggedLittleEndian(n), certain: true },
+    { form: "SCALE compact", hex: scale, certain: scale.length >= 8 },
+    { form: "decimal text", hex: Buffer.from(n.toString(), "ascii").toString("hex"), certain: n >= 1000n },
+    { form: "plain big-endian", hex: be, certain: false },
+    { form: "plain little-endian", hex: reverseBytes(be), certain: false },
   ];
 }
 
-/** Which encodings of `n` occur in `haystackHex`. Empty means none found. */
+/** Whether `needle` occurs in `haystack` starting on a byte boundary. */
+function includesAligned(haystack: string, needle: string): boolean {
+  for (let i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + 1)) {
+    if (i % 2 === 0) return true;
+  }
+  return false;
+}
+
+/** The forms of `n` that occur and cannot be chance: a leak. Empty means none. */
 export function findNumber(haystackHex: string, n: bigint): string[] {
   const h = haystackHex.toLowerCase();
   return encodings(n)
-    .filter((e) => h.includes(e.hex))
+    .filter((e) => e.certain && includesAligned(h, e.hex))
+    .map((e) => e.form);
+}
+
+/** The forms of `n` that occur but may be chance: for review, not a verdict. */
+export function findNumberLoose(haystackHex: string, n: bigint): string[] {
+  const h = haystackHex.toLowerCase();
+  return encodings(n)
+    .filter((e) => !e.certain && includesAligned(h, e.hex))
     .map((e) => e.form);
 }
 
 export function findBytes(haystackHex: string, bytes: Uint8Array | string): boolean {
   const needle = typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("hex");
-  return haystackHex.toLowerCase().includes(needle.toLowerCase());
+  return includesAligned(haystackHex.toLowerCase(), needle.toLowerCase());
 }
 
 /** The raw bytes of a transaction, hex, from the indexer. */
