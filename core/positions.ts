@@ -2,6 +2,9 @@
 
 import fs from "fs";
 import path from "path";
+import type { PositionRecord } from "./types.js";
+
+export type { PositionRecord };
 
 /**
  * The trader's record of their positions: the only copy of each opening.
@@ -20,35 +23,6 @@ import path from "path";
  */
 const FILE = path.join(process.cwd(), ".zkperp", "positions.json");
 
-export interface PositionRecord {
-  /**
-   * pending — written, open not yet confirmed; may or may not exist on chain.
-   * open    — the commitment is in the positions tree.
-   * failed  — the open was never accepted; nothing on chain to recover.
-   * closed  — settled; kept as a record, holds nothing spendable.
-   */
-  status: "pending" | "open" | "failed" | "closed";
-  contractAddress: string;
-  networkId: string;
-  /** hex */
-  commitment: string;
-  opening: {
-    ownerSecret: string;
-    isLong: boolean;
-    size: string;
-    /** Net of the opening fee; the coin holds collateral + openFee. */
-    collateral: string;
-    openFee: string;
-    entryPrice: string;
-    /** Seconds since the epoch. */
-    openTime: string;
-    collateralNonce: string;
-    salt: string;
-  };
-  createdAt: string;
-  txHash?: string;
-  closeTxHash?: string;
-}
 
 function readAll(): PositionRecord[] {
   return fs.existsSync(FILE) ? JSON.parse(fs.readFileSync(FILE, "utf8")) : [];

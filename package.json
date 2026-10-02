@@ -14,10 +14,16 @@
     "devnet:reset": "docker compose down -v && rm -rf .wallet-state .zkperp midnight-level-db deployment.json && docker compose up -d --wait",
     "proof:up": "docker run -d --name proof-server --restart unless-stopped -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v",
     "compile:probe": "for n in leakprobe raceprobe; do compact compile contracts/probe/$n.compact contracts/managed/$n || exit 1; done",
-    "probe:leak": "npm run build && node dist/probe-leak.js",
-    "demo": "npm run build && node dist/demo.js",
-    "race": "npm run build && node dist/race.js",
-    "probe:race": "npm run build && node dist/probe-race.js"
+    "probe:leak": "npm run build && node dist/scripts/probe-leak.js",
+    "demo": "npm run build && node dist/scripts/demo.js",
+    "race": "npm run build && node dist/scripts/race.js",
+    "probe:race": "npm run build && node dist/scripts/probe-race.js",
+    "setup:local": "npm run build && node dist/scripts/setup-local.js",
+    "relayer": "npm run build && node dist/services/oracle/relayer.js",
+    "treasury": "npm run build && node dist/services/treasury/treasury.js",
+    "frontend:config": "npm run build && node dist/scripts/frontend-config.js",
+    "frontend": "npm run frontend:config && npm --prefix frontend run dev",
+    "fund": "npm run build && node dist/scripts/fund-wallet.js"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.1",
@@ -33,7 +39,9 @@
     "@midnight-ntwrk/wallet-sdk": "1.2.0",
     "@midnight-ntwrk/wallet-sdk-address-format": "3.1.2",
     "chalk": "^5.3.0",
+    "dotenv": "^16.6.1",
     "effect": "^3.22.1",
+    "ethers": "^6.17.0",
     "rxjs": "^7.8.2",
     "ws": "^8.18.3"
   },

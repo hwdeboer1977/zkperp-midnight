@@ -6,7 +6,7 @@ import CompactStandardLibrary;
 
 // TEST ONLY — never deployed with zkperp.
 //
-// A positive control for the privacy search in src/leak-search.ts. It
+// A positive control for the privacy search in core/leak-search.ts. It
 // disclose()s amounts on purpose, in each way a zkperp amount could end up
 // public: written to a Uint<64> field, to a Uint<128> field (coin values are
 // Uint<128>), and as a set key. The search must find all three in this

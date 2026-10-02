@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/** Types shared by the services, the scripts and the frontend. No runtime code. */
+
+/** A trader's record of one position: the only copy of its opening. See core/positions.ts. */
+export interface PositionRecord {
+  /**
+   * pending — written, open not yet confirmed; may or may not exist on chain.
+   * open    — the commitment is in the positions tree.
+   * failed  — the open was never accepted; nothing on chain to recover.
+   * closed  — settled; kept as a record, holds nothing spendable.
+   */
+  status: "pending" | "open" | "failed" | "closed";
+  contractAddress: string;
+  networkId: string;
+  /** hex */
+  commitment: string;
+  opening: {
+    ownerSecret: string;
+    isLong: boolean;
+    size: string;
+    /** Net of the opening fee; the coin holds collateral + openFee. */
+    collateral: string;
+    openFee: string;
+    entryPrice: string;
+    /** Seconds since the epoch. */
+    openTime: string;
+    collateralNonce: string;
+    salt: string;
+  };
+  createdAt: string;
+  txHash?: string;
+  closeTxHash?: string;
+}

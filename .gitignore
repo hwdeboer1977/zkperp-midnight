@@ -7,3 +7,9 @@ midnight-level-db/
 .zkperp/
 deployment.json
 .env
+# Frontend: generated from contracts/managed and .zkperp by npm run frontend:config.
+frontend/node_modules/
+frontend/dist/
+frontend/src/generated/
+frontend/public/zk/
+frontend/public/config.json

@@ -6,11 +6,11 @@
  */
 
 import * as Rx from "rxjs";
-import { findDeployedContract } from "@midnight-ntwrk/midnight-js-contracts";
+import { deployContract, findDeployedContract } from "@midnight-ntwrk/midnight-js-contracts";
 import { LOCAL } from "./network.js";
 import { makeWalletProviders, type BuiltWallet } from "./wallet.js";
 import { makeProviders } from "./providers.js";
-import { loadCompiledContract, type ContractName } from "./contracts.js";
+import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
 import type { ContractHandle } from "./perp.js";
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
@@ -59,4 +59,31 @@ export function waitForBalance(wallet: BuiltWallet, usdc: Uint8Array, ok: (b: bi
       Rx.timeout(180_000)
     )
   );
+}
+
+/**
+ * The address of `name` on the local devnet: the recorded deployment if it
+ * still exists and `accept` approves its state, a fresh one otherwise.
+ */
+export async function deployOrFind(
+  log: (line: string) => void,
+  wallet: BuiltWallet,
+  seed: string,
+  name: ContractName,
+  args: (module: any) => Promise<unknown[]>,
+  accept: (ledger: any) => boolean = () => true
+): Promise<string> {
+  const known = getDeployment(LOCAL.networkId, name);
+  const providers = providersFor(wallet, seed, name);
+  const { module, compiledContract } = await loadCompiledContract(name);
+  const state = known ? await providers.publicDataProvider.queryContractState(known) : undefined;
+  if (known && state && accept(module.ledger(state.data))) return known;
+  log(`deploying ${name}…`);
+  const deployed: any = await deployContract(providers as any, {
+    compiledContract: compiledContract as any,
+    args: await args(module),
+  } as any);
+  const address: string = deployed.deployTxData.public.contractAddress;
+  saveDeployment(LOCAL.networkId, name, address);
+  return address;
 }

@@ -91,6 +91,21 @@ The privacy claims are tested, not just asserted:
 
 **Local tests are not enough for Compact.** The zero-knowledge proof evaluates every branch of an `if`; only the taken branch's effects are kept. The JavaScript runtime that local tests use runs only the taken branch. A value that goes negative in an untaken branch still breaks the proof. The first loss close on the devnet failed this way, while every local test passed (see the note in `closePosition`). So `npm run demo` runs every settlement path through the real proof server, for a long and for a short: flat, profit, loss, profit larger than the collateral, wipe-out, and capped profit.
 
+## Layout
+
+```
+contracts/           Compact sources: zkperp, pusdc, and test-only probes in probe/
+core/                shared TypeScript: wallets, providers, contract calls, fee and PnL
+                     maths, position records, the Chainlink reader, the privacy search
+services/oracle/     the price relayer: Chainlink ETH/USD → setPrice, on each new round
+services/treasury/   the fee-epoch job: pays the LPs' share of fees into the pool
+scripts/             dev tooling: the devnet demo, the race tests, the probes, local setup
+test/                circuit tests, run locally without a chain
+frontend/            the browser app, its own package: Vite + React, 1AM or Lace
+```
+
+The liquidator will get its own service in `services/liquidator/`.
+
 ## Running it
 
 Requires Docker, Node 22 and the Compact compiler (`compact` 0.31.1).
@@ -116,6 +131,28 @@ npm run probe:race      # which ledger operations conflict (npm run compile:prob
 - runs the privacy search on every trade transaction.
 
 `npm run devnet:reset` wipes the chain and all local state.
+
+### The local stack
+
+The services and the frontend run against the same devnet, with the real Chainlink feed. Put an Ethereum mainnet RPC URL in `.env` as `EVM_RPC_URL`; reading the feed needs no key or gas.
+
+```sh
+npm run setup:local     # fresh zkperp priced by Chainlink, a funded pool, trader and treasury wallets
+npm run relayer         # terminal 1: submits each new Chainlink round   (health: :3010/health)
+npm run treasury        # terminal 2: runs fee epochs, ≥5 closes and ≥1 hour apart   (:3011/health, /epochs)
+```
+
+Then the frontend, in a third terminal:
+
+```sh
+(cd frontend && npm install)   # once
+npm run frontend               # copies contracts, keys and config into frontend/, serves http://localhost:5173
+npm run fund -- mn_addr_undeployed1…   # sends NIGHT to your browser wallet, for DUST
+```
+
+Set the wallet to the **Undeployed** network. 1AM proves in the browser tab, so a position's size, direction and collateral never leave the browser; Lace needs the local proof server. Mint pUSDC on the Faucet page, trade, and **download the encrypted backup** on the Portfolio page: a position's opening exists only in that browser, and without it the position cannot be closed.
+
+`setup:local` writes `.zkperp/local-stack.json` with the addresses, endpoints and the treasury's keys. Don't run `npm run demo` or `npm run race` while the relayer runs: they set mock prices of their own.
 
 ## Not built yet
 
