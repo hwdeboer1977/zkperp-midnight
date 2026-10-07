@@ -1,0 +1,29 @@
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// Cheap ways to tie two 16-byte halves to a 32-byte value without slicing.
+
+export ledger sink: Set<Field>;
+
+// Equal hashes: the halves hashed as a pair against the whole hashed as one.
+export circuit eqViaHash(a: Bytes<32>, lo: Bytes<16>, hi: Bytes<16>): [] {
+  assert(persistentHash<Bytes<32>>(a) == persistentHash<Vector<2, Bytes<16>>>([lo, hi]), "halves differ");
+  sink.insert(disclose((lo as Field) + (hi as Field)));
+}
+
+export pure circuit hashWhole(a: Bytes<32>): Bytes<32> {
+  return persistentHash<Bytes<32>>(a);
+}
+export pure circuit hashHalves(lo: Bytes<16>, hi: Bytes<16>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<16>>>([lo, hi]);
+}
+
+// Through bytes: the whole as a byte vector, compared with the halves as byte vectors.
+export circuit eqViaVector(a: Bytes<32>, lo: Bytes<16>, hi: Bytes<16>): [] {
+  const v = a as Vector<32, Uint<8>>;
+  const l = lo as Vector<16, Uint<8>>;
+  const h = hi as Vector<16, Uint<8>>;
+  assert(v[0] == l[0] && v[15] == l[15] && v[16] == h[0] && v[31] == h[15], "halves differ");
+  sink.insert(disclose((lo as Field) + (hi as Field)));
+}

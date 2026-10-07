@@ -44,7 +44,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { createHash } from "crypto";
 import { LOCAL, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
-import { readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   borrowFeeOf,
   circuitNow,
@@ -80,6 +80,9 @@ const BORROW_RATE = 1_000_000n;
 const CLOCK_SLACK = 600n;
 // Just above Chainlink's hourly heartbeat.
 const MAX_PRICE_AGE = 3_900n;
+// Liquidatable below 2.5% of size in equity; 0.5% of size to the treasury.
+const MAINTENANCE_BPS = 250n;
+const LIQUIDATION_FEE_BPS = 50n;
 // The LPs' share of fees, paid into the pool at the end of the epoch.
 const LP_FEE_SHARE_PCT = 70n;
 const MIN_COLLATERAL = 10n * PUSDC;
@@ -169,6 +172,9 @@ async function main() {
       { bytes: coinKey(treasury) },
       CLOCK_SLACK,
       MAX_PRICE_AGE,
+      MAINTENANCE_BPS,
+      LIQUIDATION_FEE_BPS,
+      module.pureCircuits.liquidatorPublicKey(liquidatorSecret(devSeed)),
     ], ownTreasury);
     const devPerp = await handle(devWallet, devSeed, "zkperp", perpAddress);
     info(`zkperp ${perpAddress}`);
@@ -223,7 +229,7 @@ async function main() {
     // would throw off every check below. Close them first.
     for (const leftover of openPositionsOn(perpAddress)) {
       info(`closing a position left open by an earlier run (${leftover.commitment.slice(0, 12)}…)`);
-      await closePosition(trader.perp, leftover, usdc, trader.coinPublicKey, treasuryEncKey);
+      await closePosition(trader.perp, leftover, usdc, treasuryEncKey);
     }
     if (reservedOf(await readLedger(devPerp)) !== 0n) {
       throw new Error("liquidity is still reserved for positions this machine has no record of");
@@ -260,7 +266,7 @@ async function main() {
       await privacy("open", opened.txHash, trader, opened.record, perpAddress, usdc);
 
       const treasuryBefore = await balance(treasury, usdc);
-      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
+      const closed = await closePosition(trader.perp, opened.record, usdc, treasuryEncKey);
       info(`closed ${closed.txHash} after ${closed.held}s: borrow fee ${fmt(closed.borrowFee)}`);
       const fees = openFee + closed.closeFee + closed.borrowFee;
       check("the closing fee is size × 0.10%, rounded up", closed.closeFee === closeFee);
@@ -315,7 +321,7 @@ async function main() {
       await setPrice(devPerp, exit, adminSecret);
       const poolBefore = (await readLedger(devPerp)).poolValue;
       const treasuryBefore = await balance(treasury, usdc);
-      const closed = await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
+      const closed = await closePosition(trader.perp, opened.record, usdc, treasuryEncKey);
       const expected = positionPnl(isLong, SIZE, PRICE, exit, MAX_PAYOUT);
       info(`closed at $${fmt(exit)}: ${closed.txHash}`);
       info(
@@ -419,7 +425,7 @@ async function main() {
         refusal = String(error instanceof Error ? error.message : error);
       }
       check("emptying the pool is refused while a position is open", /reserved for open positions/.test(refusal));
-      await closePosition(trader.perp, opened.record, usdc, trader.coinPublicKey, treasuryEncKey);
+      await closePosition(trader.perp, opened.record, usdc, treasuryEncKey);
       info("closed it at an unchanged price");
 
       // Nothing open: the last LP may take everything.

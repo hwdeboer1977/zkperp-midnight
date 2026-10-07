@@ -119,7 +119,26 @@ import CompactStandardLibrary;
 // The opening fee stays inside the collateral coin until close — moving it at
 // open would publish it — and leaves with the other two.
 //
-// Not yet here: liquidation and funding.
+// ── Liquidation ────────────────────────────────────────────────────────────
+//
+// A position whose equity (collateral less loss, closing and borrow fees)
+// falls below `maintenanceBps` of its size can be closed without its owner
+// secret, by `liquidatePosition`. The rest of its equity, less a liquidation
+// fee, still goes to the trader's `payTo`; the fee goes to the treasury, which
+// runs the keeper.
+//
+// To liquidate, the keeper needs every field of the position except the owner
+// secret, and none of them is public. So every open writes a second note,
+// encrypted IN THE CIRCUIT to the `liquidator` key (see `sealLiquidatorNote`):
+// the trader cannot hand the keeper a false copy, because the circuit builds
+// the note from the very fields it commits to. The nullifier depends on the
+// salt only, so the keeper can retire the position without the owner secret.
+//
+// ⚠️ This trusts the liquidator key's holder, like the treasury: it sees every
+// position's size, direction, entry and collateral, and can tell when each one
+// closes. It cannot close a healthy position nor take any payout.
+//
+// Not yet here: funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
 
@@ -162,6 +181,15 @@ export sealed ledger clockSlack: Uint<32>;
 // heartbeat. If the oracle stops, trading — closes included — waits for it.
 export sealed ledger maxPriceAge: Uint<32>;
 
+// Liquidation; see "Liquidation" above. A position is liquidatable once its
+// equity is below `maintenanceBps` of its size; the liquidation fee is
+// `liquidationFeeBps` of size, taken out of what equity is left.
+export sealed ledger maintenanceBps: Uint<16>;
+export sealed ledger liquidationFeeBps: Uint<16>;
+
+// The keeper's public key. Every open encrypts its position to it.
+export sealed ledger liquidator: JubjubPoint;
+
 // ── Oracle ─────────────────────────────────────────────────────────────────
 
 // Price of the traded asset in USD, 6 decimals: 3000_000000 is $3,000.
@@ -201,7 +229,8 @@ export ledger freeSlots: Counter;
 // Everything a position commits to. Never stored; only its hash is.
 export struct Position {
   // `ownerKey(secret)`: proves ownership at close without naming a wallet.
-  owner: Bytes<32>;
+  // A field element, so the liquidator's note carries it without slicing.
+  owner: Field;
   // Long profits when the price rises, short when it falls.
   isLong: Boolean;
   // Notional, in pUSDC minor units. Size / collateral is the leverage.
@@ -213,9 +242,15 @@ export struct Position {
   // Seconds since the epoch, as checked against the block time at open.
   openTime: Uint<64>;
   // Identifies the collateral coin this contract holds for this position.
+  // Below the field size, as the liquidator's note casts it to a field.
   collateralNonce: Bytes<32>;
-  // Random, 32 bytes. Without it the commitment is guessable.
+  // Random, 32 bytes below the field size. Without it the commitment is
+  // guessable.
   salt: Bytes<32>;
+  // The wallet that opened the position, and the only one a close can pay.
+  // Whoever learns the owner secret can still close the position, but the
+  // money goes here. Inside the commitment, so it is never published.
+  payTo: ZswapCoinPublicKey;
 }
 
 // Commitments to every position ever opened. A Merkle tree rather than a set
@@ -239,6 +274,19 @@ export ledger closedPositions: Counter;
 // of different values commute, so concurrent opens do not conflict.
 export ledger notes: Set<Bytes<128>>;
 
+// One note per position for the keeper: the position's fields, minus nothing
+// the keeper needs and plus nothing it must not have, encrypted to
+// `liquidator` by the open circuit itself. See `sealLiquidatorNote`.
+export struct LiquidatorNote {
+  // e·G for the open's ephemeral scalar e. The keeper's shared secret is
+  // e·L = l·(e·G), for its key L = l·G.
+  ephemeral: JubjubPoint;
+  // `liquidatorPlaintext(...)`, each element plus a mask from the shared
+  // secret. Uniform field elements to anyone else.
+  fields: Vector<10, Field>;
+}
+export ledger liquidatorNotes: Set<LiquidatorNote>;
+
 constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
@@ -252,7 +300,10 @@ constructor(
   rate: Uint<32>,
   feeRecipient: ZswapCoinPublicKey,
   slack: Uint<32>,
-  priceAge: Uint<32>
+  priceAge: Uint<32>,
+  maintenance: Uint<16>,
+  liquidationFee: Uint<16>,
+  liquidatorKey: JubjubPoint
 ) {
   usdc = disclose(usdcToken);
   admin = disclose(adminCommitment);
@@ -274,6 +325,11 @@ constructor(
   clockSlack = disclose(slack);
   assert(disclose(priceAge) > 0, "the price age limit must be positive");
   maxPriceAge = disclose(priceAge);
+  assert(disclose(maintenance) >= 1 && disclose(maintenance) < 10000, "the maintenance margin must be 1 to 9 999 bps");
+  maintenanceBps = disclose(maintenance);
+  assert(disclose(liquidationFee) <= 10000, "the liquidation fee is at most 10 000 bps");
+  liquidationFeeBps = disclose(liquidationFee);
+  liquidator = disclose(liquidatorKey);
   lpToken = default<Bytes<32>>;
 }
 
@@ -283,8 +339,11 @@ export pure circuit adminKey(secret: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:admin"), secret]);
 }
 
-export pure circuit ownerKey(secret: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:owner"), secret]);
+// A field element rather than the 32-byte hash: the liquidator's note then
+// carries it as is. Reducing a 256-bit hash into the field keeps it far out of
+// reach of a collision.
+export pure circuit ownerKey(secret: Bytes<32>): Field {
+  return degradeToTransient(persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:owner"), secret]));
 }
 
 export pure circuit positionCommitment(p: Position): Bytes<32> {
@@ -292,11 +351,96 @@ export pure circuit positionCommitment(p: Position): Bytes<32> {
 }
 
 // Published when a position closes, so it cannot close twice. Derived from the
-// owner secret and the salt — neither of which anyone else knows — so it cannot
-// be matched to the commitment it retires. That unlinkability is why a close
-// proves membership in `positions` instead of naming a leaf.
-export pure circuit positionNullifier(ownerSecret: Bytes<32>, salt: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "zkperp:nullifier"), ownerSecret, salt]);
+// salt, which only the trader and the liquidator know, so the public cannot
+// match it to the commitment it retires. That unlinkability is why a close
+// proves membership in `positions` instead of naming a leaf. Not from the
+// owner secret: a liquidation must be able to retire the position without it.
+export pure circuit positionNullifier(salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:nullifier:v2"), salt]);
+}
+
+// ── The liquidator's note ──────────────────────────────────────────────────
+//
+// ECDH on Jubjub plus a Poseidon mask per field element: for the open's
+// ephemeral scalar e and the keeper's key L, the shared secret is
+// k = transientHash(e·L), and element i is plaintext[i] + transientHash(k, i).
+// Each mask is uniform in the field, so a ciphertext element is uniform to
+// anyone without k, whatever field element it hides.
+//
+// transientHash is not promised to stay the same across compiler versions:
+// the keeper decrypts each note when it appears and keeps the plaintext.
+
+// The keeper's public key for secret scalar `secret`.
+export pure circuit liquidatorPublicKey(secret: Field): JubjubPoint {
+  return ecMulGenerator(secret);
+}
+
+export pure circuit liquidatorShared(point: JubjubPoint, scalar: Field): Field {
+  return transientHash<JubjubPoint>(ecMul(point, scalar));
+}
+
+export pure circuit liquidatorMask(shared: Field, i: Field): Field {
+  return transientHash<Vector<2, Field>>([shared, i]);
+}
+
+// Everything the keeper needs, as ten field elements:
+//
+//   0 owner          a field element already
+//   1 collateralNonce, 2 salt   cast whole: both are drawn below the field size
+//   3, 4 payTo       its two 16-byte halves, little-endian
+//   5 size | collateral, 6 openFee | entryPrice, 7 openTime | isLong   64 bits each
+//   8, 9 payToEnc    the trader's encryption key, in halves
+//
+// No `slice`: in a proof it costs as much as everything else in the open
+// together (measured: 4 MB of proving key per slice, against 0.07 MB to cast a
+// 16-byte argument). So 32-byte values that must be split arrive as halves.
+// `payToEnc` is not in the commitment; a wrong one only hides the trader's own
+// coin from their wallet. `payTo` is, and `openPosition` ties its halves to it.
+export pure circuit liquidatorPlaintext(
+  p: Position,
+  payToLo: Bytes<16>,
+  payToHi: Bytes<16>,
+  encLo: Bytes<16>,
+  encHi: Bytes<16>
+): Vector<10, Field> {
+  const shift = 18446744073709551616;
+  return [
+    p.owner,
+    p.collateralNonce as Field,
+    p.salt as Field,
+    payToLo as Field,
+    payToHi as Field,
+    (p.size as Field) + (p.collateral as Field) * shift,
+    (p.openFee as Field) + (p.entryPrice as Field) * shift,
+    (p.openTime as Field) + ((p.isLong ? 1 : 0) as Field) * shift,
+    encLo as Field,
+    encHi as Field
+  ];
+}
+
+export pure circuit sealLiquidatorNote(m: Vector<10, Field>, key: JubjubPoint, ephemeral: Field): LiquidatorNote {
+  const k = liquidatorShared(key, ephemeral);
+  return LiquidatorNote {
+    ephemeral: ecMulGenerator(ephemeral),
+    fields: [
+      m[0] + liquidatorMask(k, 0), m[1] + liquidatorMask(k, 1), m[2] + liquidatorMask(k, 2),
+      m[3] + liquidatorMask(k, 3), m[4] + liquidatorMask(k, 4), m[5] + liquidatorMask(k, 5),
+      m[6] + liquidatorMask(k, 6), m[7] + liquidatorMask(k, 7), m[8] + liquidatorMask(k, 8),
+      m[9] + liquidatorMask(k, 9)
+    ]
+  };
+}
+
+// The keeper's side: the plaintext elements of `note`, for its secret scalar.
+export pure circuit openLiquidatorNote(note: LiquidatorNote, secret: Field): Vector<10, Field> {
+  const k = liquidatorShared(note.ephemeral, secret);
+  const c = note.fields;
+  return [
+    c[0] - liquidatorMask(k, 0), c[1] - liquidatorMask(k, 1), c[2] - liquidatorMask(k, 2),
+    c[3] - liquidatorMask(k, 3), c[4] - liquidatorMask(k, 4), c[5] - liquidatorMask(k, 5),
+    c[6] - liquidatorMask(k, 6), c[7] - liquidatorMask(k, 7), c[8] - liquidatorMask(k, 8),
+    c[9] - liquidatorMask(k, 9)
+  ];
 }
 
 // ── Mock oracle ────────────────────────────────────────────────────────────
@@ -473,6 +617,16 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>, capacity:
 // `note` is the opening encrypted for the trader (see `notes`). The contract
 // cannot check it: a note that does not describe this position only hurts the
 // trader who wrote it, who then needs a local record to close.
+//
+// `ephemeral` is a fresh random scalar for the liquidator's note (see
+// `sealLiquidatorNote`); `payToLo`/`payToHi` are the opening wallet's coin key
+// in halves, and `encLo`/`encHi` its encryption key, which the note carries so
+// a liquidation can return equity visibly. All stay private. `salt` and the
+// coin's nonce must be below the field size, as the note casts them.
+//
+// The payout key is the opening wallet's own (`ownPublicKey()`), bound into the
+// commitment as `payTo`. Like every argument it is supplied by the caller, so
+// it proves nothing about who opened; it only fixes where a close pays.
 export circuit openPosition(
   coin: ShieldedCoinInfo,
   size: Uint<64>,
@@ -481,7 +635,12 @@ export circuit openPosition(
   openTime: Uint<64>,
   ownerSecret: Bytes<32>,
   salt: Bytes<32>,
-  note: Bytes<128>
+  note: Bytes<128>,
+  ephemeral: Field,
+  payToLo: Bytes<16>,
+  payToHi: Bytes<16>,
+  encLo: Bytes<16>,
+  encHi: Bytes<16>
 ): [] {
   // The token type is the same for every pUSDC coin, so disclosing it
   // reveals only that the collateral is pUSDC — which the contract requires.
@@ -524,10 +683,25 @@ export circuit openPosition(
     entryPrice: markPrice,
     openTime: t,
     collateralNonce: coin.nonce,
-    salt: salt
+    salt: salt,
+    payTo: ownPublicKey()
   };
   positions.insert(disclose(positionCommitment(position)));
   notes.insert(disclose(note));
+  // Zero would make the keeper's shared secret public.
+  assert(ephemeral != 0, "the ephemeral scalar must not be zero");
+  // The halves the note carries must be the key the commitment binds. Equal
+  // hashes, because a hash of the two halves and of the whole serialize the
+  // same 32 bytes; cheaper by far than slicing the key in the proof.
+  assert(
+    persistentHash<Vector<2, Bytes<16>>>([payToLo, payToHi]) == persistentHash<Bytes<32>>(position.payTo.bytes),
+    "the payout key halves do not match"
+  );
+  liquidatorNotes.insert(disclose(sealLiquidatorNote(
+    liquidatorPlaintext(position, payToLo, payToHi, encLo, encHi),
+    liquidator,
+    ephemeral
+  )));
   openPositions.increment(1);
 }
 
@@ -562,8 +736,11 @@ export circuit openPosition(
 // not: it is inside the commitment, and publishing it would link the close to
 // its open.
 //
-// `recipient` receives the payout. It is disclosed to build the output, but a
-// shielded output carries only a commitment, so it is not linkable to the key.
+// The payout goes to `position.payTo`, the wallet that opened the position;
+// there is no recipient argument. So the owner secret alone cannot redirect
+// money: a thief who has it can force a close, nothing more. The key is
+// disclosed to build the output, but a shielded output carries only a
+// commitment, so it is not linkable to the key.
 //
 // `capacity` is the pool's slot capacity after a profit or loss (see
 // `repool`); at an unchanged price it is ignored, and the close reads neither
@@ -577,20 +754,62 @@ export circuit closePosition(
   closeFee: Uint<64>,
   borrowFee: Uint<64>,
   closeTime: Uint<64>,
-  recipient: ZswapCoinPublicKey,
   capacity: Uint<64>
 ): [] {
   assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
+  retire(position, path);
+  settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, capacity, false);
+}
+
+// Closes a position whose equity is below maintenance margin, without its
+// owner secret: the keeper knows every other field from the position's
+// liquidator note. Settles as `closePosition` does, plus a liquidation fee of
+// ceil(size × liquidationFeeBps / 10 000) out of what equity is left, to the
+// treasury. Whatever equity remains after that still goes to `payTo`.
+//
+// Only a position at a loss, or flat, can be liquidated; one in profit is
+// above maintenance by construction of the leverage cap.
+export circuit liquidatePosition(
+  position: Position,
+  path: MerkleTreePath<20, Bytes<32>>,
+  collateral: QualifiedShieldedCoinInfo,
+  pnl: Uint<64>,
+  closeFee: Uint<64>,
+  borrowFee: Uint<64>,
+  liquidationFee: Uint<64>,
+  closeTime: Uint<64>,
+  capacity: Uint<64>
+): [] {
+  retire(position, path);
+  settle(position, collateral, pnl, closeFee, borrowFee, liquidationFee, closeTime, capacity, true);
+}
+
+// Proves `position` is in `positions` without naming its leaf, and spends its
+// nullifier so it cannot settle twice.
+circuit retire(position: Position, path: MerkleTreePath<20, Bytes<32>>): [] {
   assert(path.leaf == positionCommitment(position), "path is for a different position");
   assert(
     positions.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(path))),
     "no such position"
   );
-
-  const nullifier = disclose(positionNullifier(ownerSecret, position.salt));
+  const nullifier = disclose(positionNullifier(position.salt));
   assert(!closed.member(nullifier), "position already closed");
   closed.insert(nullifier);
+}
 
+// The settlement shared by a close and a liquidation; see `closePosition`. For
+// a close `liquidation` is false and `liquidationFee` zero.
+circuit settle(
+  position: Position,
+  collateral: QualifiedShieldedCoinInfo,
+  pnl: Uint<64>,
+  closeFee: Uint<64>,
+  borrowFee: Uint<64>,
+  liquidationFee: Uint<64>,
+  closeTime: Uint<64>,
+  capacity: Uint<64>,
+  liquidation: Boolean
+): [] {
   // The coin must be the one this position committed to, or a trader could
   // close their position against someone else's collateral.
   assert(collateral.nonce == position.collateralNonce, "not this position's collateral coin");
@@ -617,7 +836,7 @@ export circuit closePosition(
 
   const exit = markPrice;
   const entry = position.entryPrice;
-  const payTo = left<ZswapCoinPublicKey, ContractAddress>(disclose(recipient));
+  const payTo = left<ZswapCoinPublicKey, ContractAddress>(disclose(position.payTo));
   const coin = disclose(collateral);
   const amount = disclose(pnl);
 
@@ -640,6 +859,19 @@ export circuit closePosition(
     assert(pnl * entry >= delta, "loss understated");
     assert(pnl * entry < delta + entry, "loss overstated");
   }
+
+  // A liquidation takes a loss, or a flat position eaten by fees, never a
+  // profit, and pins its fee like the others. A close charges none.
+  assert(!liquidation || !isProfit || pnl == 0, "a position in profit cannot be liquidated");
+  assert(liquidation || liquidationFee == 0, "only a liquidation charges a liquidation fee");
+  assert(
+    !liquidation || liquidationFee * 10000 >= position.size * liquidationFeeBps,
+    "liquidation fee understated"
+  );
+  assert(
+    !liquidation || liquidationFee * 10000 < position.size * liquidationFeeBps + 10000,
+    "liquidation fee overstated"
+  );
 
   // ⚠️ Why the amounts are chosen here, before any branch, and why `pool` is
   // read once up front.
@@ -670,12 +902,20 @@ export circuit closePosition(
   const fees = closeFee + borrowFee;
   const feeTaken = (fees >= afterLoss ? afterLoss : fees) as Uint<64>;
   const shortfall = fees - feeTaken;
+  // What the trader still has in the coin: the equity margin is measured on.
+  const equity = (afterLoss - feeTaken) as Uint<64>;
+  assert(
+    !liquidation || equity * 10000 < position.size * maintenanceBps,
+    "the position is above maintenance margin"
+  );
+  // 2b. A liquidation's fee, out of the equity; zero for a close.
+  const liqTaken = (liquidationFee >= equity ? equity : liquidationFee) as Uint<64>;
   // Disclosed to build the treasury's output; a shielded output's value is
   // inside its commitment, so this publishes nothing.
-  const toTreasury = disclose((position.openFee + feeTaken) as Uint<64>);
+  const toTreasury = disclose((position.openFee + feeTaken + liqTaken) as Uint<64>);
 
   // 3. The trader's share of the coin.
-  const back = disclose((afterLoss - feeTaken) as Uint<64>);
+  const back = disclose((equity - liqTaken) as Uint<64>);
 
   // A profit, less the shortfall. Disclosed: it is the pool's change.
   const profitRaw: Uint<64> = isProfit ? amount : 0;

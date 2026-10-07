@@ -1,0 +1,62 @@
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// What makes the liquidator note expensive? One circuit per ingredient; the
+// size of each proving key shows its cost. `npm run compile:probe`-style:
+//   compact compile contracts/probe/costprobe.compact contracts/managed/costprobe
+
+export ledger sink: Set<Field>;
+export ledger bsink: Set<Bytes<32>>;
+export ledger key: JubjubPoint;
+
+constructor(k: JubjubPoint) {
+  key = disclose(k);
+}
+
+// Nothing but a ledger insert: the floor.
+export circuit floor(x: Field): [] {
+  sink.insert(disclose(x));
+}
+
+// One variable-base multiplication, by a ledger point.
+export circuit varMul(e: Field): [] {
+  sink.insert(disclose(transientHash<JubjubPoint>(ecMul(key, e))));
+}
+
+// One fixed-base multiplication.
+export circuit fixedMul(e: Field): [] {
+  sink.insert(disclose(transientHash<JubjubPoint>(ecMulGenerator(e))));
+}
+
+// Fourteen Poseidon hashes, chained.
+export circuit hashes(x: Field): [] {
+  const a = transientHash<Vector<2, Field>>([x, 1]);
+  const b = transientHash<Vector<2, Field>>([a, 2]);
+  const c = transientHash<Vector<2, Field>>([b, 3]);
+  const d = transientHash<Vector<2, Field>>([c, 4]);
+  const e = transientHash<Vector<2, Field>>([d, 5]);
+  const f = transientHash<Vector<2, Field>>([e, 6]);
+  const g = transientHash<Vector<2, Field>>([f, 7]);
+  const h = transientHash<Vector<2, Field>>([g, 8]);
+  const i = transientHash<Vector<2, Field>>([h, 9]);
+  const j = transientHash<Vector<2, Field>>([i, 10]);
+  const k = transientHash<Vector<2, Field>>([j, 11]);
+  const l = transientHash<Vector<2, Field>>([k, 12]);
+  const m = transientHash<Vector<2, Field>>([l, 13]);
+  sink.insert(disclose(transientHash<Vector<2, Field>>([m, 14])));
+}
+
+// Five 32-byte values split into 128-bit field halves.
+export circuit halves(a: Bytes<32>, b: Bytes<32>, c: Bytes<32>, d: Bytes<32>, e: Bytes<32>): [] {
+  sink.insert(disclose(
+    (slice<16>(a, 0) as Field) + (slice<16>(a, 16) as Field) + (slice<16>(b, 0) as Field) + (slice<16>(b, 16) as Field) +
+    (slice<16>(c, 0) as Field) + (slice<16>(c, 16) as Field) + (slice<16>(d, 0) as Field) + (slice<16>(d, 16) as Field) +
+    (slice<16>(e, 0) as Field) + (slice<16>(e, 16) as Field)
+  ));
+}
+
+// One persistent (SHA-256) hash of four 32-byte values, as positionCommitment-like work.
+export circuit sha(a: Bytes<32>, b: Bytes<32>, c: Bytes<32>, d: Bytes<32>): [] {
+  bsink.insert(disclose(persistentHash<Vector<4, Bytes<32>>>([a, b, c, d])));
+}

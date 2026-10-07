@@ -4,8 +4,12 @@
  * Sends NIGHT from the devnet's pre-funded dev wallet to a browser wallet, so
  * it can generate DUST and pay fees on the local devnet.
  *
- *   npm run fund -- mn_addr_undeployed1…            # 5 NIGHT
- *   npm run fund -- mn_addr_undeployed1… 20000000   # an amount in NIGHT's smallest unit
+ *   npm run fund -- mn_addr_undeployed1…              # 5,000 NIGHT
+ *   npm run fund -- mn_addr_undeployed1… 20000000000  # an amount in NIGHT's smallest unit (6 decimals)
+ *
+ * DUST accrues in proportion to the NIGHT held, and registering NIGHT for DUST
+ * costs about 0.3 DUST: with only a few NIGHT the wallet waits many minutes
+ * before it can even register.
  *
  * Copy the unshielded address from the wallet (1AM or Lace, set to the
  * Undeployed network). After it arrives, register the NIGHT for DUST
@@ -23,12 +27,12 @@ async function main() {
   if (!address?.startsWith(`mn_addr_${LOCAL.networkId}1`)) {
     throw new Error(`usage: npm run fund -- mn_addr_${LOCAL.networkId}1… [amount]  (the wallet's unshielded address)`);
   }
-  const amount = BigInt(amountText ?? 5_000_000);
+  const amount = BigInt(amountText ?? 5_000_000_000);
   setNetworkId(LOCAL.networkId);
   const dev = await buildWallet({ kind: "seed", value: walletSeed() }, LOCAL);
   try {
     await waitForSync(dev, () => {});
-    console.log(chalk.gray(`sending ${amount} NIGHT to ${address}…`));
+    console.log(chalk.gray(`sending ${amount / 1_000_000n}.${(amount % 1_000_000n).toString().padStart(6, "0")} NIGHT to ${address}…`));
     const txId = await sendNight(dev, address, amount, LOCAL);
     console.log(chalk.green(`sent: ${txId}`));
     console.log(chalk.gray("next: register the NIGHT for DUST generation in the wallet, then mint pUSDC on the Faucet page"));

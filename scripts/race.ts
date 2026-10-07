@@ -164,7 +164,7 @@ async function main() {
       return opened.record;
     };
     const close = async (p: Party, record: PositionRecord) => {
-      const closed = await closePosition(p.perp, record, usdc, p.coinPublicKey, treasuryEncKey);
+      const closed = await closePosition(p.perp, record, usdc, treasuryEncKey);
       return {
         txHash: closed.txHash,
         detail: `settled at $${fmt(closed.exit)}: ${closed.profit ? "profit" : "loss"} ${fmt(closed.pnl)}`,
@@ -247,7 +247,7 @@ async function main() {
     for (const record of openPositionsOn(perpAddress)) {
       // Any record's owner secret closes it; the trader wallet pays the fees.
       info(`closing ${record.commitment.slice(0, 12)}…`);
-      await closePosition(trader.perp, record, usdc, trader.coinPublicKey, treasuryEncKey);
+      await closePosition(trader.perp, record, usdc, treasuryEncKey);
     }
     const end = await readLedger(dev.perp);
     info(`pool ${fmt(end.poolValue)}, reserved ${fmt(reservedOf(end))}`);

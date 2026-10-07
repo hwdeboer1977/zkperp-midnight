@@ -1,0 +1,39 @@
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// Which byte-to-field conversion is cheap? One circuit each; compare key sizes.
+
+export ledger sink: Set<Field>;
+export ledger sink16: Set<Bytes<16>>;
+
+// The whole 32 bytes as one field (range-checked below the field size).
+export circuit castFull(a: Bytes<32>): [] {
+  sink.insert(disclose(a as Field));
+}
+
+// A 16-byte argument cast to a field, no slicing.
+export circuit cast16(a: Bytes<16>): [] {
+  sink.insert(disclose(a as Field));
+}
+
+// Slicing alone.
+export circuit sliceOnly(a: Bytes<32>): [] {
+  sink16.insert(disclose(slice<16>(a, 0)));
+}
+
+// One value split in two: slice plus cast.
+export circuit halvesOne(a: Bytes<32>): [] {
+  sink.insert(disclose((slice<16>(a, 0) as Field) + (slice<16>(a, 16) as Field)));
+}
+
+// Through a byte vector: each byte times a constant power of 256, summed.
+export circuit viaVector(a: Bytes<32>): [] {
+  const v = a as Vector<32, Uint<8>>;
+  sink.insert(disclose(fold((acc, b) => acc * 256 + (b as Field), 0 as Field, v)));
+}
+
+// The degrade built-in: a 32-byte hash output into a field.
+export circuit degrade(a: Bytes<32>): [] {
+  sink.insert(disclose(degradeToTransient(a)));
+}

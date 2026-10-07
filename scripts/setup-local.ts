@@ -28,7 +28,7 @@ import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
-import { readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import { readLedger, type ContractHandle } from "../core/perp.js";
 import { addLiquidity } from "../core/pool.js";
 import { balance, coinKey, deployOrFind, handle, waitForBalance } from "../core/session.js";
@@ -51,6 +51,9 @@ const PARAMS = {
   clockSlack: 600n,
   // Just above Chainlink's hourly heartbeat.
   maxPriceAge: 3_900n,
+  // Liquidatable below 2.5% of size in equity; 0.5% of size to the treasury.
+  maintenanceBps: 250n,
+  liquidationFeeBps: 50n,
 };
 
 const FILE = path.join(process.cwd(), ".zkperp", "local-stack.json");
@@ -76,9 +79,12 @@ async function main() {
     others.push(trader);
     const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
     others.push(treasury);
+    const keeper = await readyWallet(dev, keeperSeed(devSeed), LOCAL, info, "keeper");
+    others.push(keeper);
     info(`dev      ${dev.unshieldedAddress}`);
     info(`trader   ${trader.unshieldedAddress}`);
     info(`treasury ${treasury.unshieldedAddress}`);
+    info(`keeper   ${keeper.unshieldedAddress}`);
 
     step("pUSDC");
     const pusdcAddress = await deployOrFind(info, dev, devSeed, "pusdc", async () => []);
@@ -116,6 +122,9 @@ async function main() {
         { bytes: coinKey(treasury) },
         PARAMS.clockSlack,
         PARAMS.maxPriceAge,
+        PARAMS.maintenanceBps,
+        PARAMS.liquidationFeeBps,
+        module.pureCircuits.liquidatorPublicKey(liquidatorSecret(devSeed)),
       ],
       () => false
     );
