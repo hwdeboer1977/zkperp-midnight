@@ -15,7 +15,7 @@
 import chalk from "chalk";
 import { deployContract } from "@midnight-ntwrk/midnight-js-contracts";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, makeWalletProviders, waitForSync } from "../core/wallet.js";
 import { makeProviders } from "../core/providers.js";
 import { loadCompiledContract } from "../core/contracts.js";
@@ -28,6 +28,7 @@ const B = 12_345_678_917n;
 const C = 987_654_321_123n;
 
 async function main() {
+  requireLocal("npm run probe:leak");
   setNetworkId(LOCAL.networkId);
   const seed = walletSeed();
   const wallet = await buildWallet({ kind: "seed", value: seed }, LOCAL);

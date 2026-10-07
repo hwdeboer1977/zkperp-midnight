@@ -26,10 +26,9 @@
 
 import "dotenv/config";
 import fs from "fs";
-import path from "path";
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../../core/network.js";
+import { activeNetwork, stackFile, walletSeed } from "../../core/network.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
 import { getDeployment } from "../../core/contracts.js";
 import {
@@ -45,17 +44,18 @@ import { keeperSeed, liquidatorSecret, readyWallet } from "../../core/trader.js"
 import { handle } from "../../core/session.js";
 
 const CHECK_MS = Number(process.env.KEEPER_CHECK_MS ?? 15_000);
-const STACK_FILE = path.join(process.cwd(), ".zkperp", "local-stack.json");
 
 const log = (s: string) => console.log(`${new Date().toISOString()} ${s}`);
 const fmt = (m: bigint) => `${m / 1_000_000n}.${(m % 1_000_000n).toString().padStart(6, "0")}`;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
-  setNetworkId(LOCAL.networkId);
-  const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
-  if (!perpAddress) throw new Error("no current zkperp deployment: run npm run setup:local first");
-  if (!fs.existsSync(STACK_FILE)) throw new Error(`${STACK_FILE} is missing: run npm run setup:local first`);
+  const network = activeNetwork();
+  setNetworkId(network.networkId);
+  const perpAddress = getDeployment(network.networkId, "zkperp");
+  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
+  const STACK_FILE = stackFile(network);
+  if (!fs.existsSync(STACK_FILE)) throw new Error(`${STACK_FILE} is missing: run the setup first`);
   const stack = JSON.parse(fs.readFileSync(STACK_FILE, "utf8"));
   const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
 
@@ -64,17 +64,17 @@ async function main() {
   log("syncing the keeper wallet…");
   const seed = keeperSeed(devSeed);
   const fundFromDev = async () => {
-    const dev = await buildWallet({ kind: "seed", value: devSeed }, LOCAL);
+    const dev = await buildWallet({ kind: "seed", value: devSeed }, network);
     await waitForSync(dev, () => {});
     return dev;
   };
-  const wallet = await readyWallet(fundFromDev, seed, LOCAL, log, "keeper");
+  const wallet = await readyWallet(fundFromDev, seed, network, log, "keeper");
   const perp: ContractHandle = await handle(wallet, seed, "zkperp", perpAddress);
 
   const ledger0 = await readLedger(perp);
   const ourKey = perp.module.pureCircuits.liquidatorPublicKey(secret);
   if (ledger0.liquidator.x !== ourKey.x || ledger0.liquidator.y !== ourKey.y) {
-    throw new Error("this zkperp encrypts to a different liquidator key; redeploy with npm run setup:local");
+    throw new Error("this zkperp encrypts to a different liquidator key; redeploy with the setup");
   }
   const usdc: Uint8Array = ledger0.usdc;
   log(chalk.green(`keeper ready on ${perpAddress}, checking every ${CHECK_MS / 1000}s`));

@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Sets up the local stack: a fresh zkperp on the devnet, priced by Chainlink,
- * with a funded pool, ready for the relayer, the treasury job and the
- * frontend.
+ * Sets up a stack: a fresh zkperp, priced by Chainlink, with a funded pool,
+ * ready for the relayer, the treasury job, the keeper and the frontend. On
+ * the network ZKPERP_NETWORK selects (core/network.ts).
  *
- *   npm run setup:local      # needs EVM_RPC_URL in .env
- *   npm run relayer          # in one terminal
+ *   npm run setup:local      # the devnet; needs EVM_RPC_URL in .env
+ *   npm run setup:preview    # the preview testnet; also needs WALLET_SEED_PREVIEW,
+ *                            # funded with tNIGHT from the faucet
+ *   npm run relayer          # in one terminal (relayer:preview for preview)
  *   npm run treasury         # in another
+ *   npm run keeper           # in a third
+ *
+ * On the devnet the dev wallet is pre-funded. On preview it is the operator
+ * wallet, from your own secret seed (WALLET_SEED_PREVIEW), separate from any
+ * trader's wallet:
+ * the first run stops with its address if it holds no tNIGHT, and registers
+ * its NIGHT for DUST once it does. The treasury and keeper wallets (and, on
+ * the devnet only, a command-line trader)
+ * derive from it and are funded from it.
  *
  * Unlike the demo, which drives a mock price of its own, this deploys zkperp
  * with Chainlink's latest round as its first price, so the relayer can take
@@ -15,9 +26,9 @@
  * this deployment but sets mock prices; run this again to go back to
  * Chainlink.
  *
- * Writes .zkperp/local-stack.json: the addresses, the network endpoints and
- * the treasury's keys — everything the frontend needs to find the contract
- * and pay fees.
+ * Writes .zkperp/<network>-stack.json: the addresses, the network endpoints
+ * and the treasury's keys — everything the frontend needs to find the
+ * contract and pay fees.
  */
 
 import "dotenv/config";
@@ -26,8 +37,8 @@ import path from "path";
 import chalk from "chalk";
 import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../core/network.js";
-import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
+import { activeNetwork, isLocal, stackFile, walletSeed } from "../core/network.js";
+import { buildWallet, getUnshieldedAddress, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import { readLedger, type ContractHandle } from "../core/perp.js";
 import { addLiquidity } from "../core/pool.js";
@@ -56,7 +67,6 @@ const PARAMS = {
   liquidationFeeBps: 50n,
 };
 
-const FILE = path.join(process.cwd(), ".zkperp", "local-stack.json");
 const step = (s: string) => console.log(`\n${chalk.blue.bold("▶")} ${chalk.bold(s)}`);
 const info = (s: string) => console.log(chalk.gray(`   ${s}`));
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
@@ -65,24 +75,48 @@ const fmt = (m: bigint) => `${m / PUSDC}.${(m % PUSDC).toString().padStart(6, "0
 async function main() {
   const rpcUrl = process.env.EVM_RPC_URL;
   if (!rpcUrl) throw new Error("EVM_RPC_URL is not set: add an Ethereum mainnet RPC URL to .env");
-  setNetworkId(LOCAL.networkId);
-  const devSeed = walletSeed();
+  const network = activeNetwork();
+  const FILE = stackFile(network);
+  setNetworkId(network.networkId);
+  const devSeed = walletSeed(network);
   const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  console.log(chalk.bold(`zkperp setup on ${network.name}`));
 
   step("Wallets");
-  const dev = await buildWallet({ kind: "seed", value: devSeed }, LOCAL);
+  let dev: BuiltWallet;
+  if (isLocal(network)) {
+    dev = await buildWallet({ kind: "seed", value: devSeed }, network);
+    await waitForSync(dev, () => {});
+  } else {
+    // Nothing pre-funds a public network's dev wallet: the faucet does.
+    const address = getUnshieldedAddress({ kind: "seed", value: devSeed }, network.networkId);
+    info(`operator wallet ${address}: syncing (the first time on ${network.name} takes a while)…`);
+    dev = await readyWallet(
+      async () => {
+        throw new Error(
+          `the operator wallet holds no tNIGHT. Request some for ${address} at ` +
+            "https://midnight-tmnight-preview.nethermind.dev/ and run this again."
+        );
+      },
+      devSeed,
+      network,
+      info,
+      "operator wallet"
+    );
+  }
   const others: BuiltWallet[] = [];
   try {
-    await waitForSync(dev, () => {});
+    // A command-line trader, for the devnet scripts (demo, race, liquidation).
+    // On a public network traders use their own wallets in the browser.
     const traderSeedHex = traderSeed(devSeed);
-    const trader = await readyTrader(dev, traderSeedHex, LOCAL, info);
-    others.push(trader);
-    const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
+    const trader = isLocal(network) ? await readyTrader(dev, traderSeedHex, network, info) : null;
+    if (trader) others.push(trader);
+    const treasury = await readyWallet(dev, treasurySeed(devSeed), network, info, "treasury");
     others.push(treasury);
-    const keeper = await readyWallet(dev, keeperSeed(devSeed), LOCAL, info, "keeper");
+    const keeper = await readyWallet(dev, keeperSeed(devSeed), network, info, "keeper");
     others.push(keeper);
     info(`dev      ${dev.unshieldedAddress}`);
-    info(`trader   ${trader.unshieldedAddress}`);
+    if (trader) info(`trader   ${trader.unshieldedAddress}`);
     info(`treasury ${treasury.unshieldedAddress}`);
     info(`keeper   ${keeper.unshieldedAddress}`);
 
@@ -138,8 +172,8 @@ async function main() {
     const l = await readLedger(perp);
     info(`pool ${fmt(l.poolValue)} pUSDC: ${l.freeSlots} slots of ${fmt(l.maxPayout)}`);
 
-    step("Trader");
-    if ((await balance(trader, usdc)) < TRADER_MINT) {
+    if (trader && (await balance(trader, usdc)) < TRADER_MINT) {
+      step("Trader");
       info(`trader mints ${fmt(TRADER_MINT)} pUSDC…`);
       const traderPusdc = await handle(trader, traderSeedHex, "pusdc", pusdcAddress);
       await traderPusdc.deployed.callTx.mint(TRADER_MINT);
@@ -147,11 +181,11 @@ async function main() {
 
     const stack = {
       network: {
-        networkId: LOCAL.networkId,
-        nodeWS: LOCAL.nodeWS,
-        indexer: LOCAL.indexer,
-        indexerWS: LOCAL.indexerWS,
-        proofServer: LOCAL.proofServer,
+        networkId: network.networkId,
+        nodeWS: network.nodeWS,
+        indexer: network.indexer,
+        indexerWS: network.indexerWS,
+        proofServer: network.proofServer,
       },
       contracts: { pusdc: pusdcAddress, zkperp: perpAddress },
       usdcToken: hex(usdc),
@@ -165,8 +199,9 @@ async function main() {
     };
     fs.mkdirSync(path.dirname(FILE), { recursive: true, mode: 0o700 });
     fs.writeFileSync(FILE, JSON.stringify(stack, null, 2) + "\n");
-    console.log(`\n${chalk.green.bold("Local stack ready.")} ${chalk.gray(FILE)}`);
-    console.log(chalk.gray("   next: npm run relayer, and npm run treasury, each in its own terminal"));
+    console.log(`\n${chalk.green.bold(`${network.name} stack ready.`)} ${chalk.gray(FILE)}`);
+    const suffix = isLocal(network) ? "" : `:${network.key}`;
+    console.log(chalk.gray(`   next: npm run relayer${suffix}, treasury${suffix} and keeper${suffix}, each in its own terminal`));
   } finally {
     for (const w of others) await w.facade.stop();
     await dev.facade.stop();

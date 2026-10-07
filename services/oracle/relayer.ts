@@ -26,7 +26,7 @@ import http from "http";
 import chalk from "chalk";
 import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../../core/network.js";
+import { activeNetwork, stackFile, walletSeed } from "../../core/network.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
 import { getDeployment } from "../../core/contracts.js";
 import { readLedger, submitPrice } from "../../core/perp.js";
@@ -54,14 +54,15 @@ interface Health {
 async function main() {
   const rpcUrl = process.env.EVM_RPC_URL;
   if (!rpcUrl) throw new Error("EVM_RPC_URL is not set: add an Ethereum mainnet RPC URL to .env");
-  setNetworkId(LOCAL.networkId);
-  const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
-  if (!perpAddress) throw new Error("no current zkperp deployment: run npm run demo first");
+  const network = activeNetwork();
+  setNetworkId(network.networkId);
+  const perpAddress = getDeployment(network.networkId, "zkperp");
+  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
 
   const seed = walletSeed();
   const adminSecret = createHash("sha256").update(`zkperp-admin:${seed}`).digest();
   log("syncing the oracle wallet…");
-  const wallet = await buildWallet({ kind: "seed", value: seed }, LOCAL);
+  const wallet = await buildWallet({ kind: "seed", value: seed }, network);
   await waitForSync(wallet, () => {});
   const perp = await handle(wallet, seed, "zkperp", perpAddress);
 

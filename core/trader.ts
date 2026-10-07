@@ -22,7 +22,14 @@ import type { NetworkConfig } from "./network.js";
 import { buildWallet, currentState, waitForSync, type BuiltWallet } from "./wallet.js";
 
 const NIGHT = nativeToken().raw;
-const NIGHT_FOR_TRADER = 5_000_000n;
+/**
+ * NIGHT given to each derived wallet (trader, treasury, keeper), in the
+ * smallest unit: NIGHT_PER_WALLET, or 100 NIGHT. DUST accrues in proportion to
+ * the NIGHT held, and registering costs about 0.3 DUST, so a handful of NIGHT
+ * leaves a wallet waiting many minutes for its first transaction.
+ */
+const NIGHT_FOR_TRADER = BigInt(process.env.NIGHT_PER_WALLET ?? 100_000_000);
+const nightText = (n: bigint) => `${n / 1_000_000n}.${(n % 1_000_000n).toString().padStart(6, "0")}`;
 
 function seedFor(role: "trader" | "treasury" | "keeper", devSeed: string): string {
   const variable = `${role.toUpperCase()}_SEED`;
@@ -106,8 +113,15 @@ export async function readyWallet(
   name: string
 ): Promise<BuiltWallet> {
   const wallet = await buildWallet({ kind: "seed", value: seed }, network);
+  // On a public network a sync can take minutes: say so, at most every 30 s.
+  let lastProgress = 0;
+  const progress = (line: string) => {
+    if (Date.now() - lastProgress < 30_000) return;
+    lastProgress = Date.now();
+    log(`   ${name} syncing: ${line}`);
+  };
   try {
-    await waitForSync(wallet, () => {});
+    await waitForSync(wallet, progress);
     let state = await currentState(wallet);
     if (state.dust.balance(new Date()) > 0n) return wallet;
 
@@ -115,7 +129,7 @@ export async function readyWallet(
       const built = typeof funder === "function" ? await funder() : undefined;
       const dev = built ?? (funder as BuiltWallet);
       try {
-        log(`sending ${NIGHT_FOR_TRADER} NIGHT from the dev wallet to the ${name}…`);
+        log(`sending ${nightText(NIGHT_FOR_TRADER)} NIGHT from the operator wallet to the ${name}…`);
         const txId = await sendNight(dev, wallet.unshieldedAddress, NIGHT_FOR_TRADER, network);
         log(`   sent: ${txId}`);
       } finally {
@@ -125,14 +139,14 @@ export async function readyWallet(
 
     // The NIGHT appears in the wallet's wallet a few blocks later.
     let utxos: readonly any[] = [];
-    const deadline = Date.now() + 5 * 60 * 1000;
+    const deadline = Date.now() + 15 * 60 * 1000;
     for (;;) {
-      await waitForSync(wallet, () => {});
+      await waitForSync(wallet, progress);
       state = await currentState(wallet);
       const all = (state.unshielded as any).availableCoins as readonly any[];
       utxos = all.filter((u) => u.utxo?.type === NIGHT && !u.meta?.registeredForDustGeneration);
       if (utxos.length > 0 || all.some((u) => u.utxo?.type === NIGHT)) break;
-      if (Date.now() > deadline) throw new Error(`the ${name}'s NIGHT did not arrive within five minutes`);
+      if (Date.now() > deadline) throw new Error(`the ${name}'s NIGHT did not arrive within 15 minutes; run this again`);
       await sleep(3000);
     }
 
@@ -152,12 +166,17 @@ export async function readyWallet(
     }
 
     log(`waiting for the ${name}'s DUST to accrue…`);
-    const dustDeadline = Date.now() + 5 * 60 * 1000;
+    const dustDeadline = Date.now() + 15 * 60 * 1000;
+    let lastReport = Date.now();
     for (;;) {
-      await waitForSync(wallet, () => {});
+      await waitForSync(wallet, progress);
       state = await currentState(wallet);
       if (state.dust.balance(new Date()) > 0n) break;
-      if (Date.now() > dustDeadline) throw new Error(`the ${name} has no DUST after five minutes`);
+      if (Date.now() - lastReport > 30_000) {
+        lastReport = Date.now();
+        log(`   ${name}: still no DUST (${Math.round((dustDeadline - Date.now()) / 60_000)} min left)`);
+      }
+      if (Date.now() > dustDeadline) throw new Error(`the ${name} has no DUST after 15 minutes; run this again`);
       await sleep(3000);
     }
     return wallet;

@@ -20,7 +20,7 @@ import fs from "fs";
 import path from "path";
 import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
 import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
@@ -54,11 +54,12 @@ function check(name: string, ok: boolean, detail = "") {
 }
 
 async function main() {
+  requireLocal("npm run liquidation");
   setNetworkId(LOCAL.networkId);
   const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
-  const stackFile = path.join(process.cwd(), ".zkperp", "local-stack.json");
-  if (!perpAddress || !fs.existsSync(stackFile)) throw new Error("no local stack: run npm run setup:local first");
-  const stack = JSON.parse(fs.readFileSync(stackFile, "utf8"));
+  const file = stackFile(LOCAL);
+  if (!perpAddress || !fs.existsSync(file)) throw new Error("no local stack: run npm run setup:local first");
+  const stack = JSON.parse(fs.readFileSync(file, "utf8"));
   const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
 
   const devSeed = walletSeed();

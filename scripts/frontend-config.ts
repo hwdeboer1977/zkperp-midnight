@@ -3,7 +3,8 @@
 /**
  * Gives the frontend what it needs from the backend side of the repository.
  *
- *   npm run frontend:config     # after npm run setup:local (and npm run compile)
+ *   npm run frontend:config           # after npm run setup:local (and npm run compile)
+ *   npm run frontend:config:preview   # after npm run setup:preview
  *
  *   frontend/src/generated/<contract>/   the compiled contract modules
  *   frontend/public/zk/<contract>/       proving and verifier keys, ZKIR
@@ -19,14 +20,16 @@
  * prove against the next deployment's verifier keys.
  */
 
+import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
 import { fingerprint, type ContractName } from "../core/contracts.js";
+import { activeNetwork, stackFile } from "../core/network.js";
 
 const ROOT = process.cwd();
 const FRONTEND = path.join(ROOT, "frontend");
-const STACK = path.join(ROOT, ".zkperp", "local-stack.json");
+const STACK = stackFile(activeNetwork());
 const CONTRACTS: ContractName[] = ["zkperp", "pusdc"];
 
 function copyTree(from: string, to: string, keep: (file: string) => boolean = () => true): number {
@@ -45,7 +48,7 @@ function copyTree(from: string, to: string, keep: (file: string) => boolean = ()
 }
 
 function main() {
-  if (!fs.existsSync(STACK)) throw new Error("no local stack: run npm run setup:local first");
+  if (!fs.existsSync(STACK)) throw new Error(`${STACK} is missing: run the setup for this network first`);
   const stack = JSON.parse(fs.readFileSync(STACK, "utf8"));
 
   for (const name of CONTRACTS) {

@@ -31,7 +31,7 @@
 import chalk from "chalk";
 import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
 import { readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
@@ -116,6 +116,7 @@ async function race(
 }
 
 async function main() {
+  requireLocal("npm run race");
   setNetworkId(LOCAL.networkId);
   const devSeed = walletSeed();
   const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();

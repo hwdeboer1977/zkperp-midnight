@@ -141,9 +141,10 @@ npm run probe:race      # which ledger operations conflict (npm run compile:prob
 The services and the frontend run against the same devnet, with the real Chainlink feed. Put an Ethereum mainnet RPC URL in `.env` as `EVM_RPC_URL`; reading the feed needs no key or gas.
 
 ```sh
-npm run setup:local     # fresh zkperp priced by Chainlink, a funded pool, trader and treasury wallets
+npm run setup:local     # fresh zkperp priced by Chainlink, a funded pool, trader, treasury and keeper wallets
 npm run relayer         # terminal 1: submits each new Chainlink round   (health: :3010/health)
 npm run treasury        # terminal 2: runs fee epochs, ≥5 closes and ≥1 hour apart   (:3011/health, /epochs)
+npm run keeper          # terminal 3: liquidates positions below maintenance margin
 ```
 
 Then the frontend, in a third terminal:
@@ -160,6 +161,17 @@ After `npm run frontend:config` (or a recompile), restart the dev server: a runn
 
 `setup:local` writes `.zkperp/local-stack.json` with the addresses, endpoints and the treasury's keys. Don't run `npm run demo` or `npm run race` while the relayer runs: they set mock prices of their own.
 
+### The preview testnet
+
+The same stack runs on Midnight's public `preview` network; the scripts and services pick it with `ZKPERP_NETWORK=preview`, which the `:preview` npm scripts set. The proof server stays on this machine (`npm run proof:up`): it sees every trade's private inputs.
+
+1. Put a fresh, secret 64-hex `WALLET_SEED_PREVIEW` in `.env` (per network, so it does not replace the devnet's seed). This is the **operator** wallet: it deploys, submits prices, adds the first liquidity and funds the treasury and keeper. Traders, you included, use their own 1AM accounts in the browser; keep the two apart, since the operator wallet's transactions are public. On the devnet the dev seed is public; here it controls the oracle, the liquidator key and every derived wallet, and the scripts refuse to run without it.
+2. Run `npm run setup:preview`. The first run stops with the dev wallet's address: get tNIGHT for it at <https://midnight-tmnight-preview.nethermind.dev/>, then run it again. It registers the NIGHT for DUST, funds the trader, treasury and keeper wallets with `NIGHT_PER_WALLET` (default 100 NIGHT each), deploys pUSDC and zkperp, adds liquidity, and writes `.zkperp/preview-stack.json`.
+3. Run `npm run relayer:preview`, `npm run treasury:preview` and `npm run keeper:preview`, each in its own terminal.
+4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the prover is remote and sees your positions.
+
+The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`) refuse to run against `preview`.
+
 ## Not built yet
 
-Liquidation and funding rates. Funding needs the long/short skew, which is private; it is listed as a known limit above.
+Funding rates. Funding needs the long/short skew, which is private; it is listed as a known limit above.

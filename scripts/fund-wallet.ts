@@ -18,11 +18,12 @@
 
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync } from "../core/wallet.js";
 import { sendNight } from "../core/trader.js";
 
 async function main() {
+  requireLocal("npm run fund");
   const [address, amountText] = process.argv.slice(2);
   if (!address?.startsWith(`mn_addr_${LOCAL.networkId}1`)) {
     throw new Error(`usage: npm run fund -- mn_addr_${LOCAL.networkId}1… [amount]  (the wallet's unshielded address)`);

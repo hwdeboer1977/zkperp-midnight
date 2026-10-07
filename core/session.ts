@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Wallet and contract plumbing shared by the devnet scripts (demo, race):
+ * Wallet and contract plumbing shared by the scripts and services, on the
+ * network ZKPERP_NETWORK selects (core/network.ts):
  * providers and contract handles per wallet, and shielded balances.
  */
 
 import * as Rx from "rxjs";
 import { deployContract, findDeployedContract } from "@midnight-ntwrk/midnight-js-contracts";
-import { LOCAL } from "./network.js";
+import { activeNetwork } from "./network.js";
 import { makeWalletProviders, type BuiltWallet } from "./wallet.js";
 import { makeProviders } from "./providers.js";
 import { getDeployment, loadCompiledContract, saveDeployment, type ContractName } from "./contracts.js";
@@ -19,7 +20,7 @@ export function providersFor(wallet: BuiltWallet, seed: string, name: ContractNa
   const { walletProvider, midnightProvider } = makeWalletProviders(wallet);
   return makeProviders({
     contractName: name,
-    network: LOCAL,
+    network: activeNetwork(),
     seedHex: seed,
     accountId: wallet.unshieldedAddress,
     walletProvider,
@@ -73,7 +74,7 @@ export async function deployOrFind(
   args: (module: any) => Promise<unknown[]>,
   accept: (ledger: any) => boolean = () => true
 ): Promise<string> {
-  const known = getDeployment(LOCAL.networkId, name);
+  const known = getDeployment(activeNetwork().networkId, name);
   const providers = providersFor(wallet, seed, name);
   const { module, compiledContract } = await loadCompiledContract(name);
   const state = known ? await providers.publicDataProvider.queryContractState(known) : undefined;
@@ -84,6 +85,6 @@ export async function deployOrFind(
     args: await args(module),
   } as any);
   const address: string = deployed.deployTxData.public.contractAddress;
-  saveDeployment(LOCAL.networkId, name, address);
+  saveDeployment(activeNetwork().networkId, name, address);
   return address;
 }

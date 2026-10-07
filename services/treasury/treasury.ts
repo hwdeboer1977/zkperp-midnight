@@ -34,7 +34,7 @@ import path from "path";
 import http from "http";
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { LOCAL, walletSeed } from "../../core/network.js";
+import { activeNetwork, stackFile, walletSeed } from "../../core/network.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
 import { getDeployment } from "../../core/contracts.js";
 import { readLedger, type ContractHandle } from "../../core/perp.js";
@@ -95,9 +95,10 @@ function lastEpochOn(contractAddress: string): { closed: bigint; balanceAfter: b
 }
 
 async function main() {
-  setNetworkId(LOCAL.networkId);
-  const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
-  if (!perpAddress) throw new Error("no current zkperp deployment: run npm run demo or npm run setup:local first");
+  const network = activeNetwork();
+  setNetworkId(network.networkId);
+  const perpAddress = getDeployment(network.networkId, "zkperp");
+  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
 
   const devSeed = walletSeed();
   log("syncing the treasury wallet…");
@@ -105,16 +106,16 @@ async function main() {
   // The dev wallet is built only if the treasury still needs funding: the
   // relayer may be using it.
   const fundFromDev = async () => {
-    const dev = await buildWallet({ kind: "seed", value: devSeed }, LOCAL);
+    const dev = await buildWallet({ kind: "seed", value: devSeed }, network);
     await waitForSync(dev, () => {});
     return dev;
   };
-  const wallet = await readyWallet(fundFromDev, seed, LOCAL, log, "treasury");
+  const wallet = await readyWallet(fundFromDev, seed, network, log, "treasury");
 
   const perp: ContractHandle = await handle(wallet, seed, "zkperp", perpAddress);
   const ledger0 = await readLedger(perp);
   if (hex(ledger0.treasury.bytes) !== hex(coinKey(wallet))) {
-    throw new Error("this zkperp pays its fees to a different treasury key; redeploy with npm run demo or npm run setup:local");
+    throw new Error("this zkperp pays its fees to a different treasury key; redeploy with the setup");
   }
   const usdc: Uint8Array = ledger0.usdc;
   if (!readEpochs().some((e) => e.contractAddress === perpAddress)) {

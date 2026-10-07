@@ -19,7 +19,7 @@ import chalk from "chalk";
 import { deployContract } from "@midnight-ntwrk/midnight-js-contracts";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { randomBytes } from "crypto";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { loadCompiledContract } from "../core/contracts.js";
 import { readyTrader, traderSeed } from "../core/trader.js";
@@ -77,6 +77,7 @@ async function attempt(c: ContractHandle, f: Call): Promise<Result> {
 }
 
 async function main() {
+  requireLocal("npm run probe:race");
   setNetworkId(LOCAL.networkId);
   const devSeed = walletSeed();
   const devWallet = await buildWallet({ kind: "seed", value: devSeed }, LOCAL);

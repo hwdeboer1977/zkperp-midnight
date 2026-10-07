@@ -42,7 +42,7 @@
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { createHash } from "crypto";
-import { LOCAL, walletSeed } from "../core/network.js";
+import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
@@ -119,6 +119,7 @@ interface Party {
 }
 
 async function main() {
+  requireLocal("npm run demo");
   const network = LOCAL;
   setNetworkId(network.networkId);
   const devSeed = walletSeed();
