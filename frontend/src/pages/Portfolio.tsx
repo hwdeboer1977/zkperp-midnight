@@ -5,8 +5,11 @@ import { fmt6 } from "../lib/bytes";
 import { contractModule } from "../lib/contracts";
 import { useConfig, useLedger, useNow } from "../lib/hooks";
 import { allPositions, backupFile, restoreBackup, type PositionRecord } from "../lib/positions";
+import { usePositionKey } from "../lib/positionKey";
+import { recoverPositions, settleClosed } from "../lib/recover";
 import { PriceMovedError, closePosition, quoteClose } from "../lib/trading";
 import { useWallet } from "../lib/wallet";
+import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
 
 type Quote = Awaited<ReturnType<typeof quoteClose>>;
@@ -109,8 +112,9 @@ function Backup() {
     <section className="card">
       <h2>Backup</h2>
       <p className="muted">
-        A position's opening — its secrets — exists only in this browser. Clear the site data and its collateral is stuck.
-        The backup is encrypted with your passphrase.
+        Positions opened with your passkey are recovered from the chain. Positions opened without one (by the CLI, or before
+        passkeys) exist only in this browser: clear the site data and their collateral is stuck. The backup holds every
+        record here, encrypted with your passphrase.
       </p>
       <div className="row">
         <input type="password" placeholder="passphrase" value={pass} onChange={(e) => setPass(e.target.value)} />
@@ -133,8 +137,30 @@ export default function PortfolioPage() {
   const config = useConfig();
   const { ledger } = useLedger();
   const [records, setRecords] = useState<PositionRecord[]>([]);
+  const key = usePositionKey();
+  const [syncError, setSyncError] = useState<string | null>(null);
   const reload = useCallback(() => void allPositions().then(setRecords), []);
   useEffect(reload, [reload]);
+
+  // On every ledger poll: find this key's positions from their notes, and mark
+  // closed what was closed elsewhere. Notes already tried are skipped.
+  useEffect(() => {
+    if (!ledger || !config) return;
+    let live = true;
+    void (async () => {
+      const module = await contractModule("zkperp");
+      const address = config.contracts.zkperp;
+      let changed = await settleClosed(module, ledger, address);
+      if (key) changed += await recoverPositions(module, ledger, key, address, config.network.networkId);
+      if (live && changed > 0) reload();
+    })().then(
+      () => live && setSyncError(null),
+      (e) => live && setSyncError(String(e?.message ?? e))
+    );
+    return () => {
+      live = false;
+    };
+  }, [ledger, config, key, reload]);
 
   const mine = config ? records.filter((r) => r.contractAddress === config.contracts.zkperp) : [];
   const open = mine.filter((r) => r.status === "open");
@@ -145,6 +171,8 @@ export default function PortfolioPage() {
     <>
       <h1>Portfolio</h1>
       {!w.api && <NeedsWallet what="close positions" />}
+      <PositionKeyPanel />
+      {syncError && <div className="banner bad">Could not read your positions from the chain: {syncError}</div>}
       {pending.length > 0 && (
         <div className="banner warn">
           {pending.length} position(s) are pending: their open may or may not have landed. They are kept, with everything
@@ -154,7 +182,9 @@ export default function PortfolioPage() {
       <section className="card">
         <h2>Open positions</h2>
         {open.length === 0 ? (
-          <p className="muted">No open positions in this browser.</p>
+          <p className="muted">
+            {key ? "No open positions." : "No open positions in this browser. Unlock your passkey to find positions opened elsewhere."}
+          </p>
         ) : (
           <table>
             <thead>

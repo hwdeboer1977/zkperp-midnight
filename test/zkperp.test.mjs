@@ -56,6 +56,8 @@ const CLOSE_FEE_BPS = 10n;
 const BORROW_RATE = 1_000_000n; // 10^-6 of size per second
 const CLOCK_SLACK = 600n;
 const TREASURY = key(0x7e);
+// Stands in for an encrypted opening (core/notes.ts); the contract never reads it.
+const NOTE = Uint8Array.from({ length: 128 }, (_, i) => (i * 53 + 7) & 0xff);
 
 // Block times: positions open at T0 and close an hour later at T1.
 const T0 = 1_800_000_000n;
@@ -141,7 +143,7 @@ const coin = (value, color = USDC) => ({ nonce: bytes32(++nonceByte), color, val
 function openCall(caller, state, c, size, isLong, secret, salt, overrides = {}) {
   const o = { fee: openFeeOf(size), openTime: T0, time: T0, ...overrides };
   const posted = { ...c, value: c.value + o.fee };
-  return callAt(o.time, caller, state, "openPosition", posted, size, isLong, o.fee, o.openTime, secret, salt);
+  return callAt(o.time, caller, state, "openPosition", posted, size, isLong, o.fee, o.openTime, secret, salt, o.note ?? NOTE);
 }
 /** The collateral coin as the contract holds it: net collateral plus opening fee. */
 const held = (c, size) => ({ ...c, value: c.value + openFeeOf(size), mt_index: 0n });
@@ -238,7 +240,7 @@ const SALT = Uint8Array.from({ length: 32 }, (_, i) => (i * 37 + 11) & 0xff);
   const atCap = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL * 20n, true, OWNER_SECRET, SALT);
   expect("20x of the collateral net of the fee is accepted", atCap.ok, why(atCap));
   // The fee comes out of the coin first, so 20x of the whole coin is too much.
-  const grossTooBig = callAt(T0, TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 20n, true, openFeeOf(COLLATERAL * 20n), T0, OWNER_SECRET, SALT);
+  const grossTooBig = callAt(T0, TRADER, pooled, "openPosition", coin(COLLATERAL), COLLATERAL * 20n, true, openFeeOf(COLLATERAL * 20n), T0, OWNER_SECRET, SALT, NOTE);
   expect("leverage is checked on the collateral net of the fee", !grossTooBig.ok && /leverage above/.test(grossTooBig.error), why(grossTooBig));
   const under = openCall(TRADER, pooled, coin(COLLATERAL), COLLATERAL - 1n, true, OWNER_SECRET, SALT);
   expect("under 1x is refused", !under.ok && /under 1x/.test(under.error), why(under));
@@ -286,6 +288,7 @@ const position = {
 const commitment = pureCircuits.positionCommitment(position);
 {
   expect("one position is counted", after.openPositions === 1n);
+  expect("the open's note is stored", after.notes.size() === 1n && after.notes.member(NOTE));
   expect("the pool is untouched by an open", after.poolValue === ledger(pooled).poolValue);
   expect("an open reserves exactly maxPayout", reservedOf(after) === MAX_PAYOUT, String(reservedOf(after)));
   expect("an open takes one free slot", after.freeSlots === ledger(pooled).freeSlots - 1n);

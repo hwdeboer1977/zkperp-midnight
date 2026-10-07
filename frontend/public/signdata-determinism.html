@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>signData determinism probe</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 60rem; margin: 0 auto; padding: 2rem 1.25rem 4rem;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 .35rem; }
+  .sub { opacity: .7; margin: 0 0 1.5rem; }
+  fieldset { border: 1px solid rgba(128,128,128,.35); border-radius: 8px; padding: 1rem; margin: 0 0 1rem; }
+  legend { padding: 0 .4rem; font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75; }
+  label { display: block; margin: .5rem 0 .15rem; font-size: .85rem; opacity: .8; }
+  select, input { font: inherit; padding: .4rem .5rem; border-radius: 6px;
+    border: 1px solid rgba(128,128,128,.45); background: transparent; color: inherit; min-width: 18rem; }
+  button { font: inherit; font-weight: 600; padding: .55rem 1.1rem; border-radius: 6px; cursor: pointer;
+    border: 1px solid rgba(128,128,128,.45); background: rgba(128,128,128,.12); color: inherit; margin-top: .9rem; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { font-weight: 400; padding: .35rem .7rem; font-size: .85rem; }
+  pre { background: rgba(128,128,128,.1); padding: .9rem; border-radius: 6px;
+    overflow-x: auto; font-size: 12.5px; line-height: 1.5; white-space: pre; }
+  .verdict { padding: 1rem 1.1rem; border-radius: 8px; margin: 1rem 0; border-left: 4px solid; }
+  .verdict h2 { margin: 0 0 .4rem; font-size: 1.05rem; }
+  .verdict p  { margin: .35rem 0 0; }
+  .yes  { border-color: #16a34a; background: rgba(22,163,74,.10); }
+  .no   { border-color: #dc2626; background: rgba(220,38,38,.10); }
+  .warn { border-color: #d97706; background: rgba(217,119,6,.10); }
+  .note { font-size: .85rem; opacity: .75; }
+  code { font-size: .9em; background: rgba(128,128,128,.15); padding: .1em .35em; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Does <code>signData</code> return the same bytes twice?</h1>
+<p class="sub">
+  If yes, a position key can be derived from the wallet alone, and positions close from any device.
+</p>
+
+<!--
+  Copied from ~/midnight-polisZK/frontend/public/signdata-determinism.html.
+
+  The question for zkperp: can a position be found and closed on any device
+  with only the 1AM wallet connected? That needs a secret the wallet can
+  reproduce. The connector exposes no seed and no decrypt, so the one candidate
+  is a signature over a fixed message, usable only if it is deterministic.
+
+  polisZK measured 1AM on 2026-08-26 (apiVersion 4.0.0, preview): NOT
+  deterministic. This re-runs that test against the current 1AM build.
+
+  Served by the Vite dev server so it shares the origin 1AM is already
+  connected to:
+
+      cd frontend && npm run dev
+      open http://localhost:5173/signdata-determinism.html
+
+  ANSWERED 2026-10-02: still NOT deterministic (1AM, apiVersion 4.0.0,
+  undeployed). This page's alternation no longer gets past 1AM's duplicate
+  check: the repeat of MESSAGE was refused for over a minute. What worked was
+  signing one message as text, hex and base64. The requests differ, the signed
+  bytes do not, and all three signatures verify (compact-runtime
+  verifySignature) over the same bytes yet differ from each other. That also
+  revealed the prefix: `midnight_signed_message:<byte length>:<message>`.
+-->
+
+<fieldset>
+  <legend>Setup</legend>
+
+  <label for="wallet">Wallet</label>
+  <select id="wallet"><option>Looking for wallets…</option></select>
+
+  <label for="network">Network id</label>
+  <input id="network" value="undeployed" spellcheck="false" />
+  <p class="note" style="margin-top:.3rem">
+    Whatever your wallet is on; filled in from <code>config.json</code> when present. Signing
+    does not touch the chain, so this only has to be a network the wallet will
+    connect to.
+  </p>
+
+  <label for="runs">Signatures of the same message</label>
+  <input id="runs" type="number" min="2" max="8" value="3" style="min-width:6rem" />
+  <p class="note" style="margin-top:.3rem">
+    A <em>different</em> control message is signed between each one. 1AM refuses a
+    repeat of a payload it has just seen — "Duplicate request, a similar request
+    is already pending" — so the alternation is what makes the repeat reachable
+    at all. Expect roughly twice this many prompts.
+  </p>
+
+  <button id="run">Run the probe</button>
+  <button id="forget" class="ghost" type="button">Forget the stored run</button>
+</fieldset>
+
+<div id="verdict"></div>
+
+<fieldset>
+  <legend>Log</legend>
+  <pre id="log">Not run yet.</pre>
+</fieldset>
+
+<p class="note">
+  <strong>Run it twice.</strong> Once, then reload the page — ideally restart the
+  browser, or lock and unlock the wallet — and run it again. The first run stores
+  its signature in <code>localStorage</code>, and the second compares against it.
+  A wallet that caches a nonce per session looks perfectly deterministic inside
+  one page load and is useless as a key root across two.
+</p>
+
+<script type="module">
+/*
+ * A fixed message, domain-tagged. If this ever becomes a real key root the tag
+ * is what stops a signature harvested for one purpose from being a valid root
+ * for another, so the probe measures the same shape the real thing would use.
+ */
+const MESSAGE = "zkperp/position-key-root/v1";
+
+/*
+ * A control, and a separator.
+ *
+ * Two jobs. First, if signatures over MESSAGE and over CONTROL come back
+ * identical, the wallet is returning something that does not depend on its
+ * input and the determinism result means nothing.
+ *
+ * Second, it makes consecutive requests differ. 1AM rejects a repeat of a
+ * payload it has just handled with "Duplicate request — a similar request is
+ * already pending", which is precisely the request this probe exists to make.
+ * Alternating MESSAGE / CONTROL / MESSAGE sidesteps that without weakening the
+ * test: what is being compared is still two signatures over the same bytes.
+ */
+const CONTROL = "zkperp/position-key-root/v1/control";
+
+const STORE_KEY = "zkperp.signdata-probe.v1";
+
+/* The wallet's own words for the refusal above, matched loosely because the
+ * wording is not part of any contract and may differ between wallets. */
+const DUPLICATE = /duplicate|already pending|similar request/i;
+
+const $ = (id) => document.getElementById(id);
+const walletSelect = $("wallet");
+const runButton = $("run");
+const logEl = $("log");
+const verdictEl = $("verdict");
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let lines = [];
+function log(line) {
+  lines.push(line);
+  logEl.textContent = lines.join("\n");
+}
+
+function verdict(kind, title, paragraphs) {
+  verdictEl.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "verdict " + kind;
+  const h = document.createElement("h2");
+  h.textContent = title;
+  box.append(h);
+  for (const text of paragraphs) {
+    const p = document.createElement("p");
+    p.textContent = text;
+    box.append(p);
+  }
+  verdictEl.append(box);
+}
+
+/* Wallets inject one or more InitialAPI objects under window.midnight, keyed by
+ * an arbitrary id, so enumerating is the only correct way to find them. Same
+ * approach as frontend/src/wallet/WalletContext.tsx. */
+function installedWallets() {
+  return Object.entries(window.midnight ?? {})
+    .filter(([, api]) => api && typeof api.connect === "function")
+    .map(([key, api]) => ({ key, api }));
+}
+
+let wallets = [];
+function refreshWallets() {
+  wallets = installedWallets();
+  walletSelect.innerHTML = "";
+  if (wallets.length === 0) {
+    walletSelect.append(new Option("No wallet found", ""));
+    return;
+  }
+  wallets.forEach(({ key, api }, i) => {
+    const name = api.name ?? api.rdns ?? key;
+    walletSelect.append(new Option(`${name} — ${api.rdns ?? key} (api ${api.apiVersion ?? "?"})`, String(i)));
+  });
+}
+
+/* An extension may inject after the page loads, so a single read would report
+ * "no wallet" for one that is merely slow. */
+fetch("/config.json").then((r) => (r.ok ? r.json() : null))
+  .then((c) => { if (c?.network?.networkId) $("network").value = c.network.networkId; })
+  .catch(() => {});
+
+refreshWallets();
+let attempts = 0;
+const poll = setInterval(() => {
+  attempts += 1;
+  if (wallets.length > 0 || attempts > 10) { clearInterval(poll); return; }
+  refreshWallets();
+}, 500);
+
+$("forget").addEventListener("click", () => {
+  localStorage.removeItem(STORE_KEY);
+  log("Stored run cleared. The next run has nothing to compare across sessions.");
+});
+
+runButton.addEventListener("click", () => { void run(); });
+
+/**
+ * One signature, retrying past the wallet's duplicate-request refusal.
+ *
+ * Only that refusal is retried. Anything else — a rejected prompt, a lost
+ * connection — is a real answer and is allowed to fail the run, because
+ * retrying it would turn a clear failure into a confusing one.
+ */
+async function signWithRetry(api, message, options, label) {
+  let delay = 1500;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await api.signData(message, options);
+    } catch (cause) {
+      const text = String(cause?.message ?? cause);
+      if (!DUPLICATE.test(text) || attempt >= 5) throw cause;
+      log(`  ${label} refused as a duplicate — waiting ${delay}ms, retry ${attempt}/4`);
+      await sleep(delay);
+      delay = Math.round(delay * 1.6);
+    }
+  }
+}
+
+async function run() {
+  lines = [];
+  verdictEl.innerHTML = "";
+  runButton.disabled = true;
+  runButton.textContent = "Running…";
+
+  try {
+    const choice = wallets[Number(walletSelect.value)];
+    if (!choice) throw new Error("No wallet selected. Is the extension installed and this origin allowed?");
+
+    const networkId = $("network").value.trim();
+    const runs = Math.max(2, Math.min(8, Number($("runs").value) || 3));
+
+    log(`wallet     ${choice.api.name ?? choice.key}  (${choice.api.rdns ?? "no rdns"})`);
+    log(`apiVersion ${choice.api.apiVersion ?? "unknown"}`);
+    log(`network    ${networkId}`);
+    log(`message    ${JSON.stringify(MESSAGE)}`);
+    log(`control    ${JSON.stringify(CONTROL)}`);
+    log("");
+
+    log("connecting…");
+    const api = await choice.api.connect(networkId);
+
+    /* The API asks DApps to hint which methods they intend to use, so the
+     * wallet can gather permissions in one prompt instead of several. */
+    if (typeof api.hintUsage === "function") {
+      try {
+        await api.hintUsage(["signData"]);
+        log("hintUsage(['signData']) accepted");
+      } catch (cause) {
+        log(`hintUsage refused: ${cause?.message ?? cause}  (continuing)`);
+      }
+    }
+
+    const { unshieldedAddress } = await api.getUnshieldedAddress();
+    log(`address    ${unshieldedAddress}`);
+    log("");
+    log(`taking ${runs} signatures of the message, alternating with the control`);
+    log("approve each prompt if asked");
+    log("");
+
+    /* keyType is 'unshielded' because that is the only value the type admits in
+     * connector 4.0.1. A root derived here descends from the unshielded key, not
+     * the shielded seed, so the CLI trader (core/) could not reproduce it. */
+    const options = { encoding: "text", keyType: "unshielded" };
+
+    const signatures = [];
+    const controls = [];
+
+    for (let i = 0; i < runs; i += 1) {
+      if (i > 0) {
+        /* The separator. Signed for its own sake as a control sample, and
+         * signed HERE so that no two consecutive requests carry the same
+         * payload. */
+        const started = performance.now();
+        const control = await signWithRetry(api, CONTROL, options, "ctl");
+        const ms = Math.round(performance.now() - started);
+        controls.push(control);
+        log(`  ctl ${controls.length}  ${String(ms).padStart(5)}ms  sig ${short(control.signature)}`);
+        await sleep(400);
+      }
+
+      const started = performance.now();
+      const signature = await signWithRetry(api, MESSAGE, options, `#${i + 1}`);
+      const ms = Math.round(performance.now() - started);
+      signatures.push(signature);
+      log(`  msg ${i + 1}  ${String(ms).padStart(5)}ms  sig ${short(signature.signature)}`);
+      await sleep(400);
+    }
+
+    log("");
+
+    const first = signatures[0];
+    const allSame = signatures.every((s) => s.signature === first.signature);
+    const controlDiffers = controls.every((c) => c.signature !== first.signature);
+    const keysSame = signatures.every((s) => s.verifyingKey === first.verifyingKey);
+    /* Secondary evidence: if the control repeats identically too, whatever the
+     * message did was not a one-off. */
+    const controlsAgree = controls.length < 2
+      ? null
+      : controls.every((c) => c.signature === controls[0].signature);
+
+    log(`message signatures identical   ${allSame ? "YES" : "NO"}   (${signatures.length} taken)`);
+    log(`control differs from message   ${controlDiffers ? "YES" : "NO"}`);
+    log(`verifyingKey stable            ${keysSame ? "YES" : "NO"}`);
+    log(`control repeats identically    ${controlsAgree === null ? "n/a — only one taken" : controlsAgree ? "YES" : "NO"}`);
+
+    /* Across sessions. A per-session cached nonce is indistinguishable from real
+     * determinism inside one page load, and it is the failure mode that would
+     * survive review and break in production. */
+    const storedRaw = localStorage.getItem(STORE_KEY);
+    const stored = storedRaw ? JSON.parse(storedRaw) : null;
+    const comparable = stored && stored.message === MESSAGE && stored.address === unshieldedAddress;
+    const matchesStored = comparable && stored.signature === first.signature;
+
+    if (!stored) {
+      log("stored run                     none — reload and run again to test across sessions");
+    } else if (!comparable) {
+      log("stored run                     from a different address or message — not comparable");
+    } else {
+      log(`matches the stored run         ${matchesStored ? "YES" : "NO"}  (stored ${stored.at})`);
+    }
+
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      message: MESSAGE,
+      address: unshieldedAddress,
+      signature: first.signature,
+      verifyingKey: first.verifyingKey,
+      at: new Date().toISOString(),
+    }));
+
+    log("");
+    log("full signatures of the message:");
+    signatures.forEach((s, i) => log(`  ${i + 1}  ${s.signature}`));
+    log("verifyingKey:");
+    log(`  ${first.verifyingKey}`);
+
+    report({ allSame, controlDiffers, keysSame, controlsAgree, comparable, matchesStored, stored });
+  } catch (cause) {
+    log("");
+    log(`FAILED: ${cause?.message ?? cause}`);
+    verdict("warn", "The probe did not complete", [
+      "Nothing is proven either way — this is the probe failing, not an answer about determinism.",
+      String(cause?.message ?? cause),
+    ]);
+  } finally {
+    runButton.disabled = false;
+    runButton.textContent = "Run the probe";
+  }
+}
+
+function short(hex) {
+  if (typeof hex !== "string") return String(hex);
+  return hex.length <= 24 ? hex : `${hex.slice(0, 12)}…${hex.slice(-8)}`;
+}
+
+function report({ allSame, controlDiffers, keysSame, controlsAgree, comparable, matchesStored, stored }) {
+  if (!controlDiffers) {
+    verdict("warn", "Result is meaningless — the signature ignores its input", [
+      "Signing two different messages produced identical bytes, so this wallet is not signing what it was given.",
+      "Nothing can be concluded about determinism until that is explained.",
+    ]);
+    return;
+  }
+
+  if (!keysSame) {
+    verdict("warn", "The verifying key changed between signatures", [
+      "The wallet used more than one key during the run, so the comparison is not measuring what it looks like.",
+      "Check whether the account switched mid-run.",
+    ]);
+    return;
+  }
+
+  if (!allSame) {
+    verdict("no", "Non-deterministic — no wallet-only position key", [
+      "The same message signed twice gave different bytes, so a signature cannot be a reproducible key root.",
+      "polisZK's finding holds for this wallet build. Positions need another key source (passkey PRF or passphrase).",
+      "Record which wallet and apiVersion this was, from the log above — the finding is about an implementation, not about Midnight.",
+    ]);
+    return;
+  }
+
+  if (comparable && matchesStored) {
+    verdict("yes", "Deterministic, and stable across sessions", [
+      `The same bytes came back within this run and match the run stored at ${stored.at}.`,
+      controlsAgree === false
+        ? "Note: the control did NOT repeat identically, which is odd given the message did. Worth understanding before building on this."
+        : "The control repeated identically too, so this is not a one-off.",
+      "This is the result that allows wallet-only recovery: positionKey = HKDF(signature, domain) is reproducible from the wallet alone and needs nothing remembered.",
+      "Before building on it: confirm the stored run really was a separate browser session, and repeat on any other wallet you intend to support. This is a property of one implementation, and nothing in the connector API promises it.",
+    ]);
+    return;
+  }
+
+  if (comparable && !matchesStored) {
+    verdict("no", "Deterministic within a session only — still unusable", [
+      "Every signature in this run matched, but none matched the run stored from earlier. The wallet is caching something per session rather than deriving it.",
+      "That is the worst shape to build on: it would pass any single-session test and then fail for a trader months later, after the notes are already on chain.",
+      "Positions need another key source.",
+    ]);
+    return;
+  }
+
+  verdict("warn", "Deterministic within this session — now reload and run again", [
+    "Every signature in this run came back identical, and the control differs, so the wallet is signing its input the same way each time.",
+    "This is only half the answer. Reload the page — better, restart the browser or lock and unlock the wallet — and run it a second time. This run has been stored for that comparison.",
+    "A per-session cached nonce looks exactly like this and is useless as a key root.",
+  ]);
+}
+</script>
+</body>
+</html>

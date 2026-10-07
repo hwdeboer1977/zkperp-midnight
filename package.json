@@ -8,7 +8,7 @@
     "compile": "for f in contracts/*.compact; do n=$(basename \"$f\" .compact); echo \"compiling $n\"; compact compile \"$f\" \"contracts/managed/$n\" || exit 1; done",
     "compile:skip-zk": "for f in contracts/*.compact; do n=$(basename \"$f\" .compact); echo \"compiling $n (no proving keys)\"; compact compile --skip-zk \"$f\" \"contracts/managed/$n\" || exit 1; done",
     "build": "tsc",
-    "test": "node test/pusdc.test.mjs && node test/zkperp.test.mjs",
+    "test": "tsc && node test/pusdc.test.mjs && node test/zkperp.test.mjs && node test/notes.test.mjs",
     "devnet:up": "docker compose up -d --wait",
     "devnet:down": "docker compose down",
     "devnet:reset": "docker compose down -v && rm -rf .wallet-state .zkperp midnight-level-db deployment.json && docker compose up -d --wait",

@@ -5,8 +5,10 @@
  *
  * The same orchestration as core/perp.ts, with the arithmetic shared from
  * core/math.ts — the copy the tests and the devnet demo verify. What differs
- * is where records live (IndexedDB, see positions.ts) and that randomness
- * comes from WebCrypto.
+ * is where records live (IndexedDB, see positions.ts), that randomness comes
+ * from WebCrypto, and that an open's secrets derive from the position key and
+ * its opening goes on chain as a note (core/notes.ts), so the position can be
+ * found and closed from any device.
  *
  * Concurrency (measured on the devnet, see README "Concurrent trades"):
  *
@@ -27,6 +29,7 @@ import {
   positionPnl,
   settlement,
 } from "@core/math";
+import { sealNote, secretsOf, type PositionKey } from "@core/notes";
 import { bytes, hex, random32 } from "./bytes";
 import { loadConfig } from "./config";
 import { putPosition, updatePosition, type PositionRecord } from "./positions";
@@ -88,10 +91,12 @@ export function positionOf(perp: ContractHandle, record: PositionRecord) {
 /**
  * Opens a position posting a coin of `coinValue`; the opening fee comes out of
  * it. `expectedPrice` is the price the trader saw: if it has moved, nothing is
- * submitted.
+ * submitted. The owner secret, salt and coin nonce derive from `key` and a
+ * fresh seed, and the opening is sealed under `key` into the open's note.
  */
 export async function openPosition(
   perp: ContractHandle,
+  key: PositionKey,
   coinValue: bigint,
   size: bigint,
   isLong: boolean,
@@ -102,7 +107,18 @@ export async function openPosition(
   if (ledger.markPrice !== expectedPrice) throw new PriceMovedError(expectedPrice, ledger.markPrice);
   const openFee = openFeeOf(size, BigInt(ledger.openFeeBps));
   const openTime = circuitNow();
-  const ownerSecret = random32();
+  const seed = random32();
+  const { ownerSecret, salt, collateralNonce } = await secretsOf(key, seed);
+  const collateral = coinValue - openFee;
+  const note = await sealNote(key, bytes(perp.address), {
+    seed,
+    isLong,
+    size,
+    collateral,
+    openFee,
+    entryPrice: ledger.markPrice,
+    openTime,
+  });
   const record: PositionRecord = {
     status: "pending",
     contractAddress: perp.address,
@@ -113,12 +129,12 @@ export async function openPosition(
       ownerSecret: hex(ownerSecret),
       isLong,
       size: size.toString(),
-      collateral: (coinValue - openFee).toString(),
+      collateral: collateral.toString(),
       openFee: openFee.toString(),
       entryPrice: ledger.markPrice.toString(),
       openTime: openTime.toString(),
-      collateralNonce: hex(random32()),
-      salt: hex(random32()),
+      collateralNonce: hex(collateralNonce),
+      salt: hex(salt),
     },
   };
   const position = positionOf(perp, record);
@@ -136,7 +152,8 @@ export async function openPosition(
         openFee,
         openTime,
         ownerSecret,
-        position.salt
+        position.salt,
+        note
       )
     );
     const txHash: string = (tx as any).public.txHash;

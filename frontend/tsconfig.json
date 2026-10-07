@@ -27,6 +27,7 @@
   "include": [
     "src",
     "../core/math.ts",
-    "../core/types.ts"
+    "../core/types.ts",
+    "../core/notes.ts"
   ]
 }

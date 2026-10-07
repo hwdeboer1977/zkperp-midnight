@@ -18,6 +18,7 @@ import {
 } from "@midnight-ntwrk/compact-runtime";
 import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js-contracts";
 import { confirmOpen, markClosed, markFailed, recordPending, type PositionRecord } from "./positions.js";
+import { NOTE_BYTES } from "./notes.js";
 import {
   borrowFeeOf,
   capacityOf,
@@ -131,7 +132,10 @@ export async function openPosition(
       openFee,
       openTime,
       ownerSecret,
-      position.salt
+      position.salt,
+      // The CLI keeps its openings in .zkperp/positions.json and writes no
+      // real note. Random bytes look on chain exactly like one.
+      new Uint8Array(randomBytes(NOTE_BYTES))
     );
     const txHash: string = tx.public.txHash;
     confirmOpen(record.commitment, txHash);

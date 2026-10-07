@@ -4,15 +4,18 @@
  * The trader's position records, in this browser's IndexedDB.
  *
  * A position exists on chain only as a commitment. Closing it takes every
- * field of the opening — owner secret, salt, the collateral coin's nonce —
- * and none of them is recoverable from the chain. Lose these records and the
- * collateral is stuck for good. So, as in core/positions.ts:
+ * field of the opening — owner secret, salt, the collateral coin's nonce.
+ * Positions opened here also leave an encrypted note on chain, from which any
+ * device with the trader's passkey rebuilds these records (recover.ts), so for
+ * them this store is a cache. A position without a note — opened by the CLI,
+ * or before notes existed — has only its record here. So, as in
+ * core/positions.ts:
  *
  *   · a record is written BEFORE the open is submitted, and marked open or
  *     failed after: a crash leaves a `pending` record, never a position
  *     nobody can describe;
- *   · after every open the trader is asked to download an encrypted backup,
- *     restorable on any browser.
+ *   · the records can be downloaded as an encrypted backup, restorable on any
+ *     browser.
  */
 
 import type { PositionRecord } from "@core/types";
@@ -83,8 +86,16 @@ export async function backupFile(passphrase: string): Promise<Blob> {
   return new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
 }
 
-/** Rank, so a restore never moves a record backwards (closed beats open). */
+/** Rank, so a merge never moves a record backwards (closed beats open). */
 const rank: Record<PositionRecord["status"], number> = { failed: 0, pending: 1, open: 2, closed: 3 };
+
+/** Stores `record` unless an equal or further-along one is there. True if stored. */
+export async function mergePosition(record: PositionRecord, existing?: PositionRecord): Promise<boolean> {
+  const have = existing ?? (await tx<PositionRecord | undefined>("readonly", (s) => s.get(record.commitment) as IDBRequest<PositionRecord | undefined>));
+  if (have && rank[record.status] <= rank[have.status]) return false;
+  await putPosition(have ? { ...have, status: record.status } : record);
+  return true;
+}
 
 /** Restores a backup, merging: returns how many records were added or advanced. */
 export async function restoreBackup(text: string, passphrase: string): Promise<number> {

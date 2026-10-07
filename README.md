@@ -50,6 +50,8 @@ The cap is a constant rather than a multiple of collateral on purpose. A positio
 
 **Custody.** The collateral coin is deliberately **not** written to the ledger, because storing a coin publishes its value, and that value is the collateral. Only the trader knows its nonce, kept in `.zkperp/positions.json`. At close, the trader names the coin and the commitment proves it is theirs. **If that file is lost, the position can't be closed and its collateral is stuck.** Each entry in it is marked pending, open, closed or failed.
 
+**Positions on any device.** The browser app also writes the opening to chain, in `openPosition`'s `note`: 128 bytes, AES-GCM-encrypted under a key derived from the trader's **passkey** (WebAuthn PRF), stored in the `notes` set. The owner secret, salt and coin nonce derive from that key and a seed inside the note. On any device, the wallet plus the passkey find every position: the app decrypts the notes and checks each nullifier against `closed`. The payout goes to whichever wallet is connected. Notes are fixed-size and a close names none, so they link nothing. Why a passkey and not the wallet: the DApp connector exposes no seed and no decrypt, and 1AM's `signData` is randomized (measured 2026-10-02, `frontend/public/signdata-determinism.html`). A passkey is bound to the site's domain and needs an authenticator with PRF support (Google Password Manager, iCloud Keychain, phones). The CLI writes random bytes as its note and keeps using `positions.json`. See `core/notes.ts`.
+
 ## What is public, and what is not
 
 | Public | Private |
@@ -150,7 +152,7 @@ npm run frontend               # copies contracts, keys and config into frontend
 npm run fund -- mn_addr_undeployed1…   # sends NIGHT to your browser wallet, for DUST
 ```
 
-Set the wallet to the **Undeployed** network. 1AM proves in the browser tab, so a position's size, direction and collateral never leave the browser; Lace needs the local proof server. Mint pUSDC on the Faucet page, trade, and **download the encrypted backup** on the Portfolio page: a position's opening exists only in that browser, and without it the position cannot be closed.
+Set the wallet to the **Undeployed** network. 1AM proves in the browser tab, so a position's size, direction and collateral never leave the browser; Lace needs the local proof server. Mint pUSDC on the Faucet page, create a passkey once (Trade or Portfolio page), and trade. Positions opened with the passkey show up on any device where you connect your wallet and unlock the passkey. The encrypted backup on the Portfolio page is still there for positions opened without one.
 
 `setup:local` writes `.zkperp/local-stack.json` with the addresses, endpoints and the treasury's keys. Don't run `npm run demo` or `npm run race` while the relayer runs: they set mock prices of their own.
 

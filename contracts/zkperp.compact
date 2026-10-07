@@ -231,6 +231,14 @@ export ledger openPositions: Counter;
 export ledger closed: Set<Bytes<32>>;
 export ledger closedPositions: Counter;
 
+// One encrypted note per position, written at open: the opening, sealed under
+// a key only the trader can reproduce (see core/notes.ts). This lets the trader
+// find and close the position from any device, without a local record. The
+// contract never reads a note. Each one is fixed-size random-looking bytes,
+// and a close names no note, so notes link nothing. A Set, not a list: inserts
+// of different values commute, so concurrent opens do not conflict.
+export ledger notes: Set<Bytes<128>>;
+
 constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
@@ -462,9 +470,9 @@ export circuit removeLiquidity(lp: ShieldedCoinInfo, amount: Uint<64>, capacity:
 // the position's collateral is what remains, and the leverage bounds apply to
 // that.
 //
-// The trader must keep the opening — every field of `Position` — or the
-// position can never be closed. It is not recoverable from the chain; that is
-// the point.
+// `note` is the opening encrypted for the trader (see `notes`). The contract
+// cannot check it: a note that does not describe this position only hurts the
+// trader who wrote it, who then needs a local record to close.
 export circuit openPosition(
   coin: ShieldedCoinInfo,
   size: Uint<64>,
@@ -472,7 +480,8 @@ export circuit openPosition(
   openFee: Uint<64>,
   openTime: Uint<64>,
   ownerSecret: Bytes<32>,
-  salt: Bytes<32>
+  salt: Bytes<32>,
+  note: Bytes<128>
 ): [] {
   // The token type is the same for every pUSDC coin, so disclosing it
   // reveals only that the collateral is pUSDC — which the contract requires.
@@ -518,6 +527,7 @@ export circuit openPosition(
     salt: salt
   };
   positions.insert(disclose(positionCommitment(position)));
+  notes.insert(disclose(note));
   openPositions.increment(1);
 }
 

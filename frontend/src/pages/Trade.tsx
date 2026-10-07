@@ -6,7 +6,9 @@ import { openFeeOf } from "@core/math";
 import { fmt6, parse6 } from "../lib/bytes";
 import { useConfig, useLedger } from "../lib/hooks";
 import { PriceMovedError, openPosition } from "../lib/trading";
+import { usePositionKey } from "../lib/positionKey";
 import { balanceOf, useWallet } from "../lib/wallet";
+import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
 
 /**
@@ -23,6 +25,7 @@ export default function TradePage() {
   const w = useWallet();
   const config = useConfig();
   const { ledger } = useLedger();
+  const key = usePositionKey();
   const [isLong, setLong] = useState(true);
   const [coinText, setCoin] = useState("1000");
   const [leverage, setLeverage] = useState(5);
@@ -57,7 +60,7 @@ export default function TradePage() {
             : null;
 
   async function submit(expectedPrice: bigint) {
-    if (!coin || !plan) return;
+    if (!coin || !plan || !key) return;
     setBusy(true);
     setMoved(null);
     setOpened(null);
@@ -65,7 +68,7 @@ export default function TradePage() {
       setStatus("Preparing…");
       const perp = await w.contract("zkperp");
       setStatus(w.canProve ? "Proving in your wallet — this can take a minute…" : "Proving on the local proof server…");
-      const { txHash } = await openPosition(perp, coin, plan.size, isLong, expectedPrice);
+      const { txHash } = await openPosition(perp, key, coin, plan.size, isLong, expectedPrice);
       setOpened(txHash);
       setStatus(null);
       void w.refresh();
@@ -86,6 +89,7 @@ export default function TradePage() {
         collateral.
       </p>
       {!w.api && <NeedsWallet what="trade" />}
+      {w.api && <PositionKeyPanel compact />}
       <section className="card trade">
         <div className="toggle">
           <button className={isLong ? "on long" : ""} onClick={() => setLong(true)}>
@@ -127,7 +131,7 @@ export default function TradePage() {
           </dl>
         )}
         {w.api && (
-          <button className="primary" disabled={!!problem || busy || !ledger} onClick={() => ledger && submit(ledger.markPrice)}>
+          <button className="primary" disabled={!!problem || busy || !ledger || !key} onClick={() => ledger && submit(ledger.markPrice)}>
             {busy ? "Working…" : `Open ${isLong ? "long" : "short"}`}
           </button>
         )}
@@ -141,8 +145,8 @@ export default function TradePage() {
         )}
         {opened && (
           <div className="banner ok">
-            Position opened ({opened.slice(0, 12)}…). <b>Back up your positions now:</b> the opening exists only in this
-            browser, and without it the position cannot be closed. <Link to="/portfolio">Go to Portfolio →</Link>
+            Position opened ({opened.slice(0, 12)}…). Its opening is on chain, encrypted to your passkey: with the passkey and
+            your wallet you can close it from any device. <Link to="/portfolio">Go to Portfolio →</Link>
           </div>
         )}
       </section>
