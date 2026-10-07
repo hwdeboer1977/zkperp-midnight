@@ -7,7 +7,7 @@ import { fmt6, parse6 } from "../lib/bytes";
 import { useConfig, useLedger } from "../lib/hooks";
 import { PriceMovedError, openPosition } from "../lib/trading";
 import { usePositionKey } from "../lib/positionKey";
-import { balanceOf, useWallet } from "../lib/wallet";
+import { balanceOf, proverLabel, useWallet } from "../lib/wallet";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
 
@@ -67,7 +67,7 @@ export default function TradePage() {
     try {
       setStatus("Preparing…");
       const perp = await w.contract("zkperp");
-      setStatus(w.canProve ? "Proving in your wallet — this can take a minute…" : "Proving on the local proof server…");
+      setStatus(`Proving on ${proverLabel(w.prover)}${w.canProve ? ", through your wallet" : ""} — this can take a minute…`);
       const { txHash } = await openPosition(perp, key, coin, plan.size, isLong, expectedPrice);
       setOpened(txHash);
       setStatus(null);
@@ -145,8 +145,8 @@ export default function TradePage() {
         )}
         {opened && (
           <div className="banner ok">
-            Position opened ({opened.slice(0, 12)}…). Its opening is on chain, encrypted to your passkey: with the passkey and
-            your wallet you can close it from any device. <Link to="/portfolio">Go to Portfolio →</Link>
+            Position opened ({opened.slice(0, 12)}…). Its opening is on chain, encrypted to your password: with the password
+            and this wallet you can close it from any computer. <Link to="/portfolio">Go to Portfolio →</Link>
           </div>
         )}
       </section>

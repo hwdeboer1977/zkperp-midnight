@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useState } from "react";
-import { useWallet } from "../lib/wallet";
+import { proverLabel, useWallet } from "../lib/wallet";
 
 export function WalletButton() {
   const w = useWallet();
@@ -10,8 +10,15 @@ export function WalletButton() {
   if (w.api) {
     return (
       <div className="wallet">
-        <span className="pill ok" title={w.canProve ? "proves in this tab" : "proves on a local proof server"}>
-          {w.name} {w.canProve ? "· proves in-tab" : "· local prover"}
+        <span
+          className={`pill ${w.proverIsLocal ? "ok" : "bad"}`}
+          title={
+            (w.canProve ? "Your wallet sends each trade to the proof server in its settings: " : "Each trade is proven on: ") +
+            `${w.prover}. Whoever runs it sees the trade's size, direction and collateral.`
+          }
+        >
+          {w.name} · prover {proverLabel(w.prover)}
+          {!w.proverIsLocal && " — not on this machine, it sees your positions"}
         </span>
         <button className="ghost" onClick={w.disconnect}>
           Disconnect
@@ -49,8 +56,9 @@ export function WalletButton() {
 export function NeedsWallet({ what }: { what: string }) {
   return (
     <div className="card muted">
-      Connect a wallet to {what}. 1AM proves in this tab, so your position never leaves the browser; Lace needs a proof
-      server on this machine.
+      Connect a wallet to {what}. Every trade is proven by a proof server, which sees its size, direction and collateral:
+      1AM uses the one in its own network settings, Lace the one on this machine. Use a proof server on your own machine.
+      The wallet button shows which one is in use.
     </div>
   );
 }

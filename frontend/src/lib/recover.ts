@@ -6,7 +6,11 @@
  *   · `recoverPositions` tries every note in the contract's `notes` set under
  *     the key. A note that opens is one of this trader's positions: its open
  *     landed, since the note and the commitment are written by the same call.
- *     It is closed if its nullifier is in `closed`, open otherwise.
+ *     It is closed if its nullifier is in `closed`, open otherwise. The note
+ *     does not hold the payout key (`payTo`): it is the connected wallet's,
+ *     and the rebuilt commitment must be in the tree. If it is not, the
+ *     position was opened from another wallet and is skipped; this wallet
+ *     could not be paid by its close anyway.
  *   · `settleClosed` marks records closed whose nullifier has appeared, so a
  *     position closed on another device stops showing as open here.
  *
@@ -20,7 +24,7 @@ import { bytes, hex } from "./bytes";
 import { allPositions, mergePosition, updatePosition, type PositionRecord } from "./positions";
 import { positionOf } from "./trading";
 
-/** Notes already tried under a key, so each ledger poll only tries new ones. */
+/** Notes already tried under a key and wallet, so each ledger poll only tries new ones. */
 const tried = new WeakMap<PositionKey, Set<string>>();
 
 /** What the circuits need: the contract module (for its pure circuits). */
@@ -35,7 +39,8 @@ export async function recoverPositions(
   ledger: any,
   key: PositionKey,
   contractAddress: string,
-  networkId: string
+  networkId: string,
+  payTo: string
 ): Promise<number> {
   const contract = bytes(contractAddress);
   const seen = tried.get(key) ?? new Set<string>();
@@ -43,7 +48,7 @@ export async function recoverPositions(
   const existing = new Map((await allPositions()).map((r) => [r.commitment, r]));
   let changed = 0;
   for (const note of ledger.notes as Iterable<Uint8Array>) {
-    const id = hex(note);
+    const id = `${payTo}:${hex(note)}`;
     if (seen.has(id)) continue;
     seen.add(id);
     const o = await openNote(key, contract, note);
@@ -66,10 +71,12 @@ export async function recoverPositions(
         openTime: o.openTime.toString(),
         collateralNonce: hex(s.collateralNonce),
         salt: hex(s.salt),
+        payTo,
       },
     };
     record.commitment = hex(module.pureCircuits.positionCommitment(positionOf({ module } as any, record)));
-    if (ledger.closed.member(module.pureCircuits.positionNullifier(s.ownerSecret, s.salt))) record.status = "closed";
+    if (!ledger.positions.findPathForLeaf(bytes(record.commitment))) continue;
+    if (ledger.closed.member(module.pureCircuits.positionNullifier(s.salt))) record.status = "closed";
     if (await mergePosition(record, existing.get(record.commitment))) changed += 1;
   }
   return changed;
@@ -80,7 +87,7 @@ export async function settleClosed(module: Module, ledger: any, contractAddress:
   let changed = 0;
   for (const r of await allPositions()) {
     if (r.status !== "open" || r.contractAddress !== contractAddress) continue;
-    const nullifier = module.pureCircuits.positionNullifier(bytes(r.opening.ownerSecret), bytes(r.opening.salt));
+    const nullifier = module.pureCircuits.positionNullifier(bytes(r.opening.salt));
     if (ledger.closed.member(nullifier)) {
       await updatePosition(r.commitment, { status: "closed" });
       changed += 1;

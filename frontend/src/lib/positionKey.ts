@@ -1,58 +1,115 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * The position key, from a passkey.
+ * The position key: from the trader's password, optionally remembered on this
+ * device with a passkey. See docs/privacy.md.
  *
  * Every position opened here leaves an encrypted note on chain (core/notes.ts).
- * The key that opens those notes must be reproducible on any device the trader
- * uses, with nothing to carry. The wallet cannot supply it: the DApp connector
- * exposes no seed and no decrypt, and 1AM's `signData` is randomized (measured
- * 2026-10-02; see public/signdata-determinism.html).
+ * The key that opens those notes must be reproducible on any computer with
+ * nothing to carry. The wallet cannot supply it: the DApp connector exposes no
+ * seed and no decrypt, and 1AM's `signData` is randomized. So the root comes
+ * from a password, salted with the wallet account's coin key
+ * (core/password.ts): wallet + password, anywhere.
  *
- * A passkey can. Its PRF extension (WebAuthn's hmac-secret) returns 32 bytes
- * fixed by the credential and the input, after user verification. A passkey
- * synced by Google Password Manager or iCloud Keychain is the same credential
- * on every device, so every device gets the same root.
+ * A passkey is only a convenience. Its PRF output (WebAuthn hmac-secret) wraps
+ * the password-derived root, and the wrapped root is kept in this browser's
+ * storage, so the trader taps instead of typing. Losing the passkey or the
+ * storage loses nothing: the password still works.
  *
- * Limits worth knowing:
- *   · a passkey belongs to one site, this page's host. A deployment on another
- *     domain needs its own passkey, and sees only the notes made under it;
- *   · the authenticator must support PRF. Google Password Manager, iCloud
- *     Keychain, Android phones and recent security keys do; not all do;
- *   · a SECOND passkey is a second key. Positions opened under one are not
- *     found by the other, so the UI asks for one passkey, created once.
- *
- * The derived keys live only in this page's memory: one passkey tap per session.
+ * The key is bound to the account it was derived for, and reads as locked
+ * while another account is connected. It lives only in this page's memory.
  */
 
 import { useSyncExternalStore } from "react";
 import { positionKey, type PositionKey } from "@core/notes";
+import { passwordRoot } from "@core/password";
+import { bytes, hex } from "./bytes";
+import { useWallet } from "./wallet";
 
-/** The PRF input. It is part of the key: changing it hides every position. */
-const PRF_INPUT = new TextEncoder().encode("zkperp/position-key/v1");
+interface Unlocked {
+  key: PositionKey;
+  root: Uint8Array;
+  /** hex coin public key the root was derived for. */
+  account: string;
+}
 
-let current: PositionKey | null = null;
+let current: Unlocked | null = null;
 const listeners = new Set<() => void>();
 
-function setKey(key: PositionKey | null): void {
-  current = key;
+function set(next: Unlocked | null): void {
+  current = next;
   listeners.forEach((l) => l());
 }
 
-export function usePositionKey(): PositionKey | null {
+function useUnlocked(): Unlocked | null {
   return useSyncExternalStore(
     (l) => (listeners.add(l), () => void listeners.delete(l)),
     () => current
   );
 }
 
-export const lockPositionKey = () => setKey(null);
+/** The position key for the connected account, or null if locked or derived for another account. */
+export function usePositionKey(): PositionKey | null {
+  const unlocked = useUnlocked();
+  const { coinPublicKey } = useWallet();
+  if (!unlocked || !coinPublicKey || unlocked.account !== hex(coinPublicKey)) return null;
+  return unlocked.key;
+}
+
+export const lockPositionKey = () => set(null);
+
+async function unlockWithRoot(root: Uint8Array, coinPublicKey: Uint8Array): Promise<PositionKey> {
+  const key = await positionKey(root);
+  set({ key, root, account: hex(coinPublicKey) });
+  return key;
+}
+
+/** Derives the key from `password` for the account with `coinPublicKey`. Takes about a second. */
+export async function unlockWithPassword(password: string, coinPublicKey: Uint8Array): Promise<PositionKey> {
+  return unlockWithRoot(await passwordRoot(password, coinPublicKey), coinPublicKey);
+}
+
+// ── Passkey: remembering the root on this device ─────────────────────────────
 
 export const passkeysSupported = () => typeof window.PublicKeyCredential === "function" && !!navigator.credentials;
 
+/** The PRF input. Part of the wrapping key: changing it forgets every remembered root. */
+const PRF_INPUT = new TextEncoder().encode("zkperp/root-wrap/v1");
+const STORE = (account: string) => `zkperp.passkey-root.v1.${account}`;
+
+interface Remembered {
+  credentialId: string;
+  iv: string;
+  wrapped: string;
+}
+
+function readRemembered(account: string): Remembered | null {
+  try {
+    const raw = localStorage.getItem(STORE(account));
+    return raw ? (JSON.parse(raw) as Remembered) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether this browser holds a passkey-wrapped root for the account. */
+export function hasRememberedRoot(coinPublicKey: Uint8Array | null): boolean {
+  return !!coinPublicKey && readRemembered(hex(coinPublicKey)) !== null;
+}
+
+export function forgetRememberedRoot(coinPublicKey: Uint8Array): void {
+  try {
+    localStorage.removeItem(STORE(hex(coinPublicKey)));
+  } catch {
+    // Storage blocked: nothing was remembered.
+  }
+}
+
 const NO_PRF =
   "This passkey cannot derive a key: its authenticator does not support the WebAuthn PRF extension. " +
-  "Use a passkey saved in Google Password Manager or iCloud Keychain, or on a phone.";
+  "Keep using your password, or try a passkey saved in Google Password Manager, iCloud Keychain, or on a phone.";
+
+const prf = { prf: { eval: { first: PRF_INPUT } } } as AuthenticationExtensionsClientInputs;
 
 function prfResult(credential: Credential | null): Uint8Array | null {
   const results = (credential as PublicKeyCredential | null)?.getClientExtensionResults() as any;
@@ -61,56 +118,90 @@ function prfResult(credential: Credential | null): Uint8Array | null {
   return ArrayBuffer.isView(first) ? new Uint8Array(first.buffer, first.byteOffset, first.byteLength) : new Uint8Array(first);
 }
 
-const prf = { prf: { eval: { first: PRF_INPUT } } } as AuthenticationExtensionsClientInputs;
-
-/**
- * Asks for a passkey of this site and derives the position key from it. With
- * no `credentialId` the browser offers every passkey it holds for the site.
- */
-export async function unlockWithPasskey(credentialId?: BufferSource): Promise<PositionKey> {
+async function prfFrom(credentialId: Uint8Array): Promise<Uint8Array> {
   const credential = await navigator.credentials.get({
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       userVerification: "required",
-      allowCredentials: credentialId ? [{ type: "public-key", id: credentialId }] : undefined,
+      allowCredentials: [{ type: "public-key", id: credentialId as BufferSource }],
       extensions: prf,
     },
   });
-  const root = prfResult(credential);
-  if (!root) throw new Error(NO_PRF);
-  const key = await positionKey(root);
-  setKey(key);
-  return key;
+  const out = prfResult(credential);
+  if (!out) throw new Error(NO_PRF);
+  return out;
 }
 
-/** Creates the passkey, then unlocks with it. Meant to happen once per trader. */
-export async function createPasskey(): Promise<PositionKey> {
+/** AES-GCM key from a PRF output; the account is the associated data at use. */
+async function wrapKey(prfOutput: Uint8Array): Promise<CryptoKey> {
+  const base = await crypto.subtle.importKey("raw", prfOutput as BufferSource, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: new TextEncoder().encode("zkperp/root-wrap-key/v1") },
+    base,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
+ * Creates a passkey and stores the unlocked root, wrapped by it, in this
+ * browser. Needs the key unlocked for the connected account.
+ */
+export async function rememberWithPasskey(coinPublicKey: Uint8Array): Promise<void> {
+  const account = hex(coinPublicKey);
+  if (!current || current.account !== account) throw new Error("Unlock with your password first.");
   const credential = (await navigator.credentials.create({
     publicKey: {
       rp: { name: "zkperp" },
       user: {
         // Random: the passkey identifies nothing about the trader or the wallet.
         id: crypto.getRandomValues(new Uint8Array(16)),
-        name: "zkperp positions",
-        displayName: "zkperp positions",
+        name: "zkperp on this device",
+        displayName: "zkperp on this device",
       },
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       pubKeyCredParams: [
         { type: "public-key", alg: -7 },
         { type: "public-key", alg: -257 },
       ],
-      // Discoverable, so another device can find it without being told its id.
-      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      authenticatorSelection: { userVerification: "required" },
       extensions: prf,
     },
   })) as PublicKeyCredential | null;
   if (!credential) throw new Error("No passkey was created.");
-  const results = credential.getClientExtensionResults() as any;
-  if (!results.prf?.enabled) throw new Error(NO_PRF);
+  if (!(credential.getClientExtensionResults() as any).prf?.enabled) throw new Error(NO_PRF);
+  const id = new Uint8Array(credential.rawId);
   // A few authenticators evaluate the PRF at creation; most only on a get().
-  const root = prfResult(credential);
-  if (!root) return unlockWithPasskey(credential.rawId);
-  const key = await positionKey(root);
-  setKey(key);
-  return key;
+  const output = prfResult(credential) ?? (await prfFrom(id));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const wrapped = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: coinPublicKey as BufferSource },
+      await wrapKey(output),
+      current.root as BufferSource
+    )
+  );
+  const entry: Remembered = { credentialId: hex(id), iv: hex(iv), wrapped: hex(wrapped) };
+  localStorage.setItem(STORE(account), JSON.stringify(entry));
+}
+
+/** Unwraps the remembered root with the passkey. */
+export async function unlockWithPasskey(coinPublicKey: Uint8Array): Promise<PositionKey> {
+  const entry = readRemembered(hex(coinPublicKey));
+  if (!entry) throw new Error("No passkey is remembered for this wallet account in this browser.");
+  const output = await prfFrom(bytes(entry.credentialId));
+  let root: Uint8Array;
+  try {
+    root = new Uint8Array(
+      await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: bytes(entry.iv) as BufferSource, additionalData: coinPublicKey as BufferSource },
+        await wrapKey(output),
+        bytes(entry.wrapped) as BufferSource
+      )
+    );
+  } catch {
+    throw new Error("The passkey did not open the remembered key. Unlock with your password, then remember it again.");
+  }
+  return unlockWithRoot(root, coinPublicKey);
 }

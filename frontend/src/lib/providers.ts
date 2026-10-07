@@ -4,11 +4,14 @@
  * The Midnight SDK's providers, assembled in the browser from the connected
  * wallet. Modelled on midnight-polisZK's connectContract.
  *
- * Proving: a wallet that offers `getProvingProvider` (1AM) proves in this
- * tab, and the trader's private inputs — size, direction, collateral — never
- * leave the browser. Anything else falls back to a proof server on this
- * machine (127.0.0.1:6300). Never a hosted prover: it would see every
- * position.
+ * Proving: a wallet that offers `getProvingProvider` (1AM) takes the proving
+ * over, and sends it to the proof server in its own network settings
+ * (measured 2026-10-07: on the local network 1AM posts /check and /prove to
+ * localhost:6300, nothing runs in the tab). Anything else proves on this
+ * app's proof server (127.0.0.1:6300). Either way that server sees each
+ * trade's private inputs — size, direction, collateral — so it must be on the
+ * trader's own machine, never hosted. The wallet state exposes which one is
+ * used (`prover`, `proverIsLocal`) so the UI can say so.
  */
 
 import type { ConnectedAPI } from "@midnight-ntwrk/dapp-connector-api";

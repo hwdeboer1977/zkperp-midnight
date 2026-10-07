@@ -30,7 +30,10 @@ import {
   settlement,
 } from "@core/math";
 import { sealNote, secretsOf, type PositionKey } from "@core/notes";
-import { bytes, hex, random32 } from "./bytes";
+import { randomScalar } from "@core/liquidatorNote";
+
+const halvesOf = (b: Uint8Array): [Uint8Array, Uint8Array] => [b.slice(0, 16), b.slice(16, 32)];
+import { bytes, hex, keyBytes, random32 } from "./bytes";
 import { loadConfig } from "./config";
 import { putPosition, updatePosition, type PositionRecord } from "./positions";
 import type { ContractHandle } from "./providers";
@@ -85,7 +88,13 @@ export function positionOf(perp: ContractHandle, record: PositionRecord) {
     openTime: BigInt(o.openTime),
     collateralNonce: bytes(o.collateralNonce),
     salt: bytes(o.salt),
+    payTo: { bytes: bytes(o.payTo) },
   };
+}
+
+/** The connected wallet's coin public key, hex: what `ownPublicKey()` returns in a circuit. */
+export function walletCoinKey(perp: ContractHandle): string {
+  return hex(keyBytes(String(perp.providers.walletProvider.getCoinPublicKey())));
 }
 
 /**
@@ -135,6 +144,7 @@ export async function openPosition(
       openTime: openTime.toString(),
       collateralNonce: hex(collateralNonce),
       salt: hex(salt),
+      payTo: walletCoinKey(perp),
     },
   };
   const position = positionOf(perp, record);
@@ -153,7 +163,14 @@ export async function openPosition(
         openTime,
         ownerSecret,
         position.salt,
-        note
+        note,
+        // A fresh scalar per open: the liquidator note's ephemeral key.
+        randomScalar(),
+        // The payout key in halves, which the circuit ties to the commitment's, and
+        // the encryption key, so the keeper can return any equity a liquidation
+        // leaves to this wallet, visibly. Both go only into the liquidator note.
+        ...halvesOf(position.payTo.bytes),
+        ...halvesOf(keyBytes(String(perp.providers.walletProvider.getEncryptionPublicKey())))
       )
     );
     const txHash: string = (tx as any).public.txHash;
@@ -217,13 +234,12 @@ export async function quoteClose(perp: ContractHandle, record: PositionRecord, l
 }
 
 /**
- * Closes `record` at the current mark price, paying the wallet whose coin key
- * is `recipient`. `expectedPrice` is the price the trader confirmed.
+ * Closes `record` at the current mark price. The payout goes to the wallet that
+ * opened it (`opening.payTo`). `expectedPrice` is the price the trader confirmed.
  */
 export async function closePosition(
   perp: ContractHandle,
   record: PositionRecord,
-  recipient: Uint8Array,
   expectedPrice: bigint
 ): Promise<{ txHash: string; quote: Awaited<ReturnType<typeof quoteClose>> }> {
   if (record.status !== "open") throw new Error(`this position is ${record.status}`);
@@ -255,7 +271,6 @@ export async function closePosition(
           q.closeFee,
           q.borrowFee,
           q.closeTime,
-          { bytes: recipient },
           capacity
         ),
       // The fees go to the treasury as a shielded output, encrypted to its key.

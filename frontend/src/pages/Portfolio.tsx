@@ -1,18 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useCallback, useEffect, useState } from "react";
-import { fmt6 } from "../lib/bytes";
+import { fmt6, hex } from "../lib/bytes";
 import { contractModule } from "../lib/contracts";
 import { useConfig, useLedger, useNow } from "../lib/hooks";
 import { allPositions, backupFile, restoreBackup, type PositionRecord } from "../lib/positions";
 import { usePositionKey } from "../lib/positionKey";
 import { recoverPositions, settleClosed } from "../lib/recover";
+import { circuitNow, liquidationPrice } from "@core/math";
 import { PriceMovedError, closePosition, quoteClose } from "../lib/trading";
-import { useWallet } from "../lib/wallet";
+import { proverLabel, useWallet } from "../lib/wallet";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
 
 type Quote = Awaited<ReturnType<typeof quoteClose>>;
+
+const liquidationView = (o: PositionRecord["opening"]) => ({
+  isLong: o.isLong,
+  size: BigInt(o.size),
+  collateral: BigInt(o.collateral),
+  entryPrice: BigInt(o.entryPrice),
+  openTime: BigInt(o.openTime),
+});
 
 function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger: any; onClosed: () => void }) {
   const w = useWallet();
@@ -36,8 +45,8 @@ function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger:
     setMoved(null);
     try {
       const perp = await w.contract("zkperp");
-      setStatus(w.canProve ? "Proving in your wallet…" : "Proving on the local proof server…");
-      await closePosition(perp, record, w.coinPublicKey, expected);
+      setStatus(`Proving on ${proverLabel(w.prover)}${w.canProve ? ", through your wallet" : ""}…`);
+      await closePosition(perp, record, expected);
       setStatus(null);
       void w.refresh();
       onClosed();
@@ -55,7 +64,16 @@ function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger:
       <td className={o.isLong ? "long" : "short"}>{o.isLong ? "Long" : "Short"}</td>
       <td>{fmt6(BigInt(o.size))}</td>
       <td>{fmt6(BigInt(o.collateral))}</td>
-      <td>${fmt6(BigInt(o.entryPrice))}</td>
+      <td>
+        ${fmt6(BigInt(o.entryPrice))}
+        {ledger?.maintenanceBps !== undefined && (
+          <div>
+            <small className="muted" title="Below this price (above, for a short) the keeper may liquidate the position">
+              liq. ≈ ${fmt6(liquidationPrice(liquidationView(o), ledger, circuitNow()))}
+            </small>
+          </div>
+        )}
+      </td>
       <td className={signed >= 0n ? "good" : "bad"}>
         {quote ? `${signed >= 0n ? "+" : ""}${fmt6(signed)}` : "…"}
         {quote?.capped && <small> capped</small>}
@@ -112,8 +130,8 @@ function Backup() {
     <section className="card">
       <h2>Backup</h2>
       <p className="muted">
-        Positions opened with your passkey are recovered from the chain. Positions opened without one (by the CLI, or before
-        passkeys) exist only in this browser: clear the site data and their collateral is stuck. The backup holds every
+        Positions opened with your position key are recovered from the chain with your password. Positions opened without one
+        (by the CLI) exist only in this browser: clear the site data and their collateral is stuck. The backup holds every
         record here, encrypted with your passphrase.
       </p>
       <div className="row">
@@ -151,7 +169,9 @@ export default function PortfolioPage() {
       const module = await contractModule("zkperp");
       const address = config.contracts.zkperp;
       let changed = await settleClosed(module, ledger, address);
-      if (key) changed += await recoverPositions(module, ledger, key, address, config.network.networkId);
+      if (key && w.coinPublicKey) {
+        changed += await recoverPositions(module, ledger, key, address, config.network.networkId, hex(w.coinPublicKey));
+      }
       if (live && changed > 0) reload();
     })().then(
       () => live && setSyncError(null),
@@ -160,7 +180,7 @@ export default function PortfolioPage() {
     return () => {
       live = false;
     };
-  }, [ledger, config, key, reload]);
+  }, [ledger, config, key, w.coinPublicKey, reload]);
 
   const mine = config ? records.filter((r) => r.contractAddress === config.contracts.zkperp) : [];
   const open = mine.filter((r) => r.status === "open");
@@ -183,7 +203,7 @@ export default function PortfolioPage() {
         <h2>Open positions</h2>
         {open.length === 0 ? (
           <p className="muted">
-            {key ? "No open positions." : "No open positions in this browser. Unlock your passkey to find positions opened elsewhere."}
+            {key ? "No open positions." : "No open positions in this browser. Unlock your position key to find positions opened elsewhere."}
           </p>
         ) : (
           <table>

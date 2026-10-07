@@ -133,6 +133,15 @@ const CONTROL = "zkperp/position-key-root/v1/control";
 
 const STORE_KEY = "zkperp.signdata-probe.v1";
 
+/* The same message in each encoding signData accepts. */
+const ENCODINGS = ["text", "hex", "base64"];
+function encode(message, encoding) {
+  const bytes = new TextEncoder().encode(message);
+  if (encoding === "hex") return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (encoding === "base64") return btoa(String.fromCharCode(...bytes));
+  return message;
+}
+
 /* The wallet's own words for the refusal above, matched loosely because the
  * wording is not part of any contract and may differ between wallets. */
 const DUPLICATE = /duplicate|already pending|similar request/i;
@@ -287,18 +296,23 @@ async function run() {
          * signed HERE so that no two consecutive requests carry the same
          * payload. */
         const started = performance.now();
-        const control = await signWithRetry(api, CONTROL, options, "ctl");
+        const ctlEncoding = ENCODINGS[i % ENCODINGS.length];
+        const control = await signWithRetry(api, encode(CONTROL, ctlEncoding), { ...options, encoding: ctlEncoding }, "ctl");
         const ms = Math.round(performance.now() - started);
         controls.push(control);
         log(`  ctl ${controls.length}  ${String(ms).padStart(5)}ms  sig ${short(control.signature)}`);
         await sleep(400);
       }
 
+      /* Each repeat of MESSAGE goes in another encoding: the request differs, so
+       * 1AM's duplicate check lets it through, but the bytes signed are the
+       * same (`midnight_signed_message:<len>:<message>`). */
+      const encoding = ENCODINGS[i % ENCODINGS.length];
       const started = performance.now();
-      const signature = await signWithRetry(api, MESSAGE, options, `#${i + 1}`);
+      const signature = await signWithRetry(api, encode(MESSAGE, encoding), { ...options, encoding }, `#${i + 1} (${encoding})`);
       const ms = Math.round(performance.now() - started);
       signatures.push(signature);
-      log(`  msg ${i + 1}  ${String(ms).padStart(5)}ms  sig ${short(signature.signature)}`);
+      log(`  msg ${i + 1}  ${encoding.padEnd(6)} ${String(ms).padStart(5)}ms  sig ${short(signature.signature)}`);
       await sleep(400);
     }
 

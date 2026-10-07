@@ -114,6 +114,8 @@ label { display: flex; flex-direction: column; gap: 6px; font-weight: 500; }
 label small, small { color: var(--muted); font-weight: 400; }
 .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 .row input { flex: 1; }
+label.check { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; margin: 8px 0; }
+label.check input { flex: none; width: auto; }
 .file { position: relative; display: inline-block; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; font-weight: 400; white-space: nowrap; }
 .file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 

@@ -25,6 +25,14 @@ interface WalletState {
   api: ConnectedAPI | null;
   name: string | null;
   canProve: boolean;
+  /**
+   * The proof server that will see each trade's private inputs: the one in the
+   * wallet's own settings when the wallet proves (1AM), else this app's local
+   * one. Null until connected; "unknown" if the wallet does not say.
+   */
+  prover: string | null;
+  /** Whether `prover` is on this machine. A remote one sees every position. */
+  proverIsLocal: boolean;
   coinPublicKey: Uint8Array | null;
   shieldedBalances: Record<string, bigint>;
   dust: bigint | null;
@@ -38,6 +46,27 @@ interface WalletState {
 }
 
 const Ctx = createContext<WalletState | null>(null);
+
+/** Whether `url` points at this machine. */
+export function isLocalUrl(url: string | null): boolean {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host.endsWith(".localhost");
+  } catch {
+    return false;
+  }
+}
+
+/** A prover URL shortened for display: its host and port. */
+export function proverLabel(url: string | null): string {
+  if (!url) return "no prover";
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
 
 function installed(): Detected[] {
   return Object.entries(window.midnight ?? {})
@@ -59,6 +88,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [api, setApi] = useState<ConnectedAPI | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [coinPublicKey, setCoinPublicKey] = useState<Uint8Array | null>(null);
+  const [prover, setProver] = useState<string | null>(null);
   const [shieldedBalances, setShielded] = useState<Record<string, bigint>>({});
   const [dust, setDust] = useState<bigint | null>(null);
   const [connecting, setConnecting] = useState(false);
@@ -96,12 +126,23 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setError(null);
       try {
         const config = await loadConfig();
-        const connected = await d.api.connect(config.network.networkId);
+        // 1AM refuses the first request after it has been idle ("InternalError:
+        // Request failed") and accepts the next: retry once.
+        const connected = await d.api.connect(config.network.networkId).catch(async (first: any) => {
+          if (first?.code !== "InternalError") throw first;
+          await new Promise((r) => setTimeout(r, 1000));
+          return d.api.connect(config.network.networkId);
+        });
         const wallet = await connected.getConfiguration();
         if (wallet.networkId !== config.network.networkId) {
           throw new Error(`The wallet is on "${wallet.networkId}"; this deployment runs on "${config.network.networkId}".`);
         }
         const shielded = await connected.getShieldedAddresses();
+        setProver(
+          walletCanProve(connected)
+            ? String((wallet as any).proverServerUri ?? "unknown")
+            : config.network.proofServer
+        );
         handles.clear();
         setCoinPublicKey(keyBytes(shielded.shieldedCoinPublicKey));
         setApi(connected);
@@ -124,6 +165,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setApi(null);
     setName(null);
     setCoinPublicKey(null);
+    setProver(null);
     setShielded({});
     setDust(null);
     handles.clear();
@@ -148,6 +190,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       api,
       name,
       canProve: api ? walletCanProve(api) : false,
+      prover: api ? prover : null,
+      proverIsLocal: isLocalUrl(prover),
       coinPublicKey,
       shieldedBalances,
       dust,
@@ -158,7 +202,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       refresh,
       contract,
     }),
-    [detected, api, name, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, contract]
+    [detected, api, name, prover, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, contract]
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
