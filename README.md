@@ -1,5 +1,7 @@
 # ZKPERP on Midnight
 
+[![CI](https://github.com/hwdeboer1977/zkperp-midnight/actions/workflows/ci.yml/badge.svg)](https://github.com/hwdeboer1977/zkperp-midnight/actions/workflows/ci.yml)
+
 Private perpetuals on [Midnight](https://midnight.network): go leveraged long or short against a GMX-style liquidity pool without publishing your position's direction, size, collateral or leverage, or linking it to your wallet.
 
 > ⚠️ **pUSDC is a mock token. Anyone can mint any amount of it.** It exists so the devnet can hand out collateral without a faucet, and it has none of the supply control a real stablecoin needs. zkperp itself only accepts the one token it was deployed with; swapping pUSDC for a real shielded stablecoin changes nothing in zkperp's contract.

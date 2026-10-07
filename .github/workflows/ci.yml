@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Compiles the contracts from source and runs the suite against what it just
+# produced; then typechecks the frontend against the same build.
+#
+# `contracts/managed/` is gitignored, so nothing compiled is trusted here: the
+# job installs the pinned compiler and compiles every `contracts/*.compact`
+# first. `--skip-zk` omits the proving keys: the tests run the compiled
+# circuits through `compact-runtime` and never prove. (Adapted from
+# midnight-polisZK's CI.)
+#
+# Not here: the devnet runs (`npm run demo`, `npm run liquidation`), which need
+# a node, an indexer and a proof server.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Compiler 0.31.1 goes with compact-runtime 0.16.0; a mismatched pair makes
+  # the generated module throw at import.
+  COMPACT_COMPILER_VERSION: "0.31.1"
+
+jobs:
+  test:
+    name: compile contracts, run the suite, typecheck the frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache the Compact toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.compact
+          key: compact-${{ runner.os }}-${{ env.COMPACT_COMPILER_VERSION }}
+
+      - name: Install the Compact toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Pin the compiler
+        run: |
+          compact update "$COMPACT_COMPILER_VERSION"
+          compact compile --version
+
+      - name: Compile the contracts from source (no proving keys)
+        run: npm run compile:skip-zk
+
+      # tsc over core, scripts and services, then the four test files:
+      # pUSDC, zkperp (rules, privacy sweeps, liquidation), notes, password.
+      - name: Typecheck and run the suite
+        run: npm test
+
+      # The frontend imports the compiled contract modules from
+      # src/generated/, which `npm run frontend:config` normally copies along
+      # with keys and a deployed stack; for a typecheck the modules suffice.
+      - name: Typecheck the frontend
+        run: |
+          npm ci --prefix frontend
+          for name in zkperp pusdc; do
+            mkdir -p "frontend/src/generated/$name"
+            cp -r "contracts/managed/$name/contract/." "frontend/src/generated/$name/"
+          done
+          (cd frontend && npx tsc --noEmit -p .)
