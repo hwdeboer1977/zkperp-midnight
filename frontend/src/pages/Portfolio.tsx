@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { fmt6, hex } from "../lib/bytes";
 import { contractModule } from "../lib/contracts";
 import { useConfig, useLedger, useNow } from "../lib/hooks";
-import { allPositions, backupFile, restoreBackup, type PositionRecord } from "../lib/positions";
+import { allPositions, type PositionRecord } from "../lib/positions";
 import { usePositionKey } from "../lib/positionKey";
 import { recoverPositions, settleClosed } from "../lib/recover";
 import { circuitNow, liquidationPrice } from "@core/math";
@@ -101,55 +101,6 @@ function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger:
   );
 }
 
-function Backup() {
-  const [pass, setPass] = useState("");
-  const [restorePass, setRestorePass] = useState("");
-  const [note, setNote] = useState<string | null>(null);
-
-  async function download() {
-    if (pass.length < 8) return setNote("Use a passphrase of at least 8 characters.");
-    const url = URL.createObjectURL(await backupFile(pass));
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `zkperp-positions-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setNote("Backup downloaded. Keep the file and the passphrase apart.");
-  }
-
-  async function restore(file: File) {
-    try {
-      const n = await restoreBackup(await file.text(), restorePass);
-      setNote(`Restored: ${n} record(s) added or updated.`);
-    } catch (e: any) {
-      setNote(`Restore failed: ${e?.message ?? e}`);
-    }
-  }
-
-  return (
-    <section className="card">
-      <h2>Backup</h2>
-      <p className="muted">
-        Positions opened with your position key are recovered from the chain with your password. Positions opened without one
-        (by the CLI) exist only in this browser: clear the site data and their collateral is stuck. The backup holds every
-        record here, encrypted with your passphrase.
-      </p>
-      <div className="row">
-        <input type="password" placeholder="passphrase" value={pass} onChange={(e) => setPass(e.target.value)} />
-        <button onClick={download}>Download backup</button>
-      </div>
-      <div className="row">
-        <input type="password" placeholder="passphrase of the backup" value={restorePass} onChange={(e) => setRestorePass(e.target.value)} />
-        <label className="file">
-          Restore from file…
-          <input type="file" accept="application/json" onChange={(e) => e.target.files?.[0] && restore(e.target.files[0])} />
-        </label>
-      </div>
-      {note && <p className="muted">{note}</p>}
-    </section>
-  );
-}
-
 export default function PortfolioPage() {
   const w = useWallet();
   const config = useConfig();
@@ -227,7 +178,6 @@ export default function PortfolioPage() {
           </table>
         )}
       </section>
-      <Backup />
       {history.length > 0 && (
         <section className="card">
           <h2>History</h2>

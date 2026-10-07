@@ -56,24 +56,45 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
 
   if (key) {
     return compact ? null : (
-      <div className="banner ok row">
+      <div className="banner ok row" style={{ flexWrap: "wrap" }}>
         <span style={{ flex: 1 }}>
           Position key unlocked for wallet account <code>{short(hex(account))}</code>. Positions opened with it can be closed
           from any computer with this wallet and your password.
         </span>
         {passkeysSupported() &&
           (remembered ? (
-            <button className="ghost" onClick={() => (forgetRememberedRoot(account), rerender((n) => n + 1))}>
+            <button
+              className="ghost"
+              title="Removes the passkey shortcut from this browser. Your password keeps working everywhere."
+              onClick={() => (forgetRememberedRoot(account), rerender((n) => n + 1))}
+            >
               Forget passkey on this device
             </button>
           ) : (
-            <button className="ghost" disabled={!!busy} onClick={() => run("passkey", () => rememberWithPasskey(account))}>
+            <button
+              className="ghost"
+              title="Next time in this browser, unlock with your fingerprint, face or PIN instead of typing the password."
+              disabled={!!busy}
+              onClick={() => run("passkey", () => rememberWithPasskey(account))}
+            >
               {busy === "passkey" ? "Waiting for passkey…" : "Remember on this device with a passkey"}
             </button>
           ))}
-        <button className="ghost" onClick={lockPositionKey}>
+        <button
+          className="ghost"
+          title="Forgets the key in this tab now. Your positions stay safe on chain; unlock again with your password."
+          onClick={lockPositionKey}
+        >
           Lock
         </button>
+        <small className="muted" style={{ flexBasis: "100%" }}>
+          {passkeysSupported() &&
+            (remembered
+              ? "Forget passkey: this browser no longer unlocks with your fingerprint or PIN; the password still works everywhere. "
+              : "Remember with a passkey: next time in this browser, unlock with your fingerprint, face or PIN instead of typing the password; on other computers you still use the password. ")}
+          Lock: forget the key in this tab now, for example on a shared computer. Your positions stay on chain; closing or
+          reloading the tab locks it too.
+        </small>
         {error && <p className="bad">{error}</p>}
       </div>
     );
@@ -123,13 +144,13 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
       {!generated ? (
         <p>
           <button className="ghost" disabled={!!busy} onClick={() => setGenerated(generatePassphrase())}>
-            First time? Generate a passphrase
+            First time? Generate a password
           </button>
         </p>
       ) : (
         <div className="warn">
           <p>
-            Your passphrase: <code style={{ fontSize: "1.1em" }}>{generated}</code>{" "}
+            Your new password, six random words: <code style={{ fontSize: "1.1em" }}>{generated}</code>{" "}
             <button className="ghost" onClick={() => void navigator.clipboard?.writeText(generated)}>
               Copy
             </button>
@@ -141,10 +162,10 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
           </p>
           <label className="check">
             <input type="checkbox" checked={savedIt} onChange={(e) => setSavedIt(e.target.checked)} /> I have saved this
-            passphrase
+            password
           </label>
           <button disabled={!savedIt || !!busy} onClick={() => run("password", () => unlockWithPassword(generated, account))}>
-            {busy === "password" ? "Deriving key…" : "Use this passphrase"}
+            {busy === "password" ? "Deriving key…" : "Use this password"}
           </button>{" "}
           <button className="ghost" disabled={!!busy} onClick={() => setGenerated(null)}>
             Cancel
