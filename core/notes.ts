@@ -19,9 +19,10 @@
  * 128 bytes. It is bound to its contract by the AES-GCM associated data: a note
  * copied to another deployment does not decrypt.
  *
- * Whoever holds the key root can close every position opened under it, and
- * a close pays whichever key the closer names. It is the owner secret of all of
- * them at once, and must be guarded as such.
+ * Whoever holds the key root can close every position opened under it: it is
+ * the owner secret of all of them at once. It cannot take the money, though: a
+ * close pays only the wallet that opened the position (`payTo` in the
+ * commitment). A stolen root lets a thief force closes, nothing more.
  *
  * Layout. Note: iv (12) ‖ ciphertext (100) ‖ tag (16) = 128 bytes.
  * Plaintext: version (1) ‖ seed (32) ‖ isLong (1) ‖ size, collateral, openFee,
@@ -36,6 +37,8 @@ const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const PLAIN_BYTES = NOTE_BYTES - IV_BYTES - TAG_BYTES;
 const VERSION = 1;
+
+import { belowField } from "./liquidatorNote.js";
 
 const subtle = globalThis.crypto.subtle;
 const text = (s: string) => new TextEncoder().encode(s);
@@ -86,7 +89,8 @@ export async function secretsOf(key: PositionKey, seed: Uint8Array): Promise<Pos
     derive("zkperp/salt/v1:"),
     derive("zkperp/collateral-nonce/v1:"),
   ]);
-  return { ownerSecret, salt, collateralNonce };
+  // The liquidator's note casts both to field elements: keep them below the field size.
+  return { ownerSecret, salt: belowField(salt), collateralNonce: belowField(collateralNonce) };
 }
 
 /** Seals `o` for the contract at `contractAddress` (32 bytes). */

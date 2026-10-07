@@ -27,6 +27,8 @@ export interface PositionRecord {
     openTime: string;
     collateralNonce: string;
     salt: string;
+    /** hex: the coin public key of the wallet that opened it, the only one a close pays. */
+    payTo: string;
   };
   createdAt: string;
   txHash?: string;

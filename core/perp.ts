@@ -19,11 +19,14 @@ import {
 import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js-contracts";
 import { confirmOpen, markClosed, markFailed, recordPending, type PositionRecord } from "./positions.js";
 import { NOTE_BYTES } from "./notes.js";
+import { belowField, decodeLiquidatorPlaintext, randomScalar, type LiquidatorView } from "./liquidatorNote.js";
 import {
   borrowFeeOf,
   capacityOf,
   circuitNow,
   closeFeeOf,
+  isLiquidatable,
+  liquidationFeeOf,
   openFeeOf,
   positionPnl,
   settlement,
@@ -76,7 +79,21 @@ export function positionOf(perp: ContractHandle, record: PositionRecord) {
     openTime: BigInt(o.openTime),
     collateralNonce: bytes(o.collateralNonce),
     salt: bytes(o.salt),
+    payTo: { bytes: bytes(o.payTo) },
   };
+}
+
+/** The coin public key of the wallet behind `perp.providers`: what `ownPublicKey()` returns in a circuit. */
+export function walletCoinKey(perp: ContractHandle): string {
+  return String(perp.providers.walletProvider.getCoinPublicKey()).replace(/^0x/, "");
+}
+
+/** 32 bytes as the two 16-byte halves the open circuit takes. */
+export const halvesOf = (b: Uint8Array): [Uint8Array, Uint8Array] => [b.slice(0, 16), b.slice(16, 32)];
+
+/** The same wallet's encryption public key, which the liquidator note carries. */
+export function walletEncKey(perp: ContractHandle): Uint8Array {
+  return bytes(String(perp.providers.walletProvider.getEncryptionPublicKey()));
 }
 
 export interface Opened {
@@ -116,8 +133,9 @@ export async function openPosition(
       openFee: openFee.toString(),
       entryPrice: ledger.markPrice.toString(),
       openTime: openTime.toString(),
-      collateralNonce: hex(randomBytes(32)),
-      salt: hex(randomBytes(32)),
+      collateralNonce: hex(belowField(randomBytes(32))),
+      salt: hex(belowField(randomBytes(32))),
+      payTo: walletCoinKey(perp),
     },
   };
   const position = positionOf(perp, record);
@@ -135,7 +153,10 @@ export async function openPosition(
       position.salt,
       // The CLI keeps its openings in .zkperp/positions.json and writes no
       // real note. Random bytes look on chain exactly like one.
-      new Uint8Array(randomBytes(NOTE_BYTES))
+      new Uint8Array(randomBytes(NOTE_BYTES)),
+      randomScalar(),
+      ...halvesOf(position.payTo.bytes),
+      ...halvesOf(walletEncKey(perp))
     );
     const txHash: string = tx.public.txHash;
     confirmOpen(record.commitment, txHash);
@@ -224,8 +245,8 @@ export interface Closed {
 }
 
 /**
- * Closes a position at the current mark price, paying out to the wallet behind
- * `perp.providers` (whose coin public key is `recipient`).
+ * Closes a position at the current mark price. The payout goes to the wallet
+ * that opened it (`opening.payTo`), whichever wallet submits the close.
  *
  * The close creates a shielded output to the treasury, and a shielded output
  * is encrypted to its recipient so their wallet can find it. The contract
@@ -236,7 +257,6 @@ export async function closePosition(
   perp: ContractHandle,
   record: PositionRecord,
   usdc: Uint8Array,
-  recipient: Uint8Array,
   treasuryEncKey: string
 ): Promise<Closed> {
   if (record.status !== "open") throw new Error(`position ${record.commitment.slice(0, 12)}… is ${record.status}`);
@@ -279,7 +299,6 @@ export async function closePosition(
         closeFee,
         borrowFee,
         closeTime,
-        { bytes: recipient },
         capacity
       ),
     { additionalCoinEncPublicKeyMappings: new Map([[hex(ledger.treasury.bytes), treasuryEncKey]]) }
@@ -296,6 +315,98 @@ export async function closePosition(
     borrowFee,
     held,
     settled,
-    nullifier: perp.module.pureCircuits.positionNullifier(ownerSecret, position.salt),
+    nullifier: perp.module.pureCircuits.positionNullifier(position.salt),
   };
+}
+
+// ── Liquidation: the keeper's side ───────────────────────────────────────────
+
+/** A live position the keeper can read: its liquidator note opened, its commitment in the tree, not yet closed. */
+export interface Watched extends LiquidatorView {
+  commitment: string;
+}
+
+/**
+ * Every live position whose liquidator note opens under `secret`. A note under
+ * another key decodes to garbage or to a commitment that is not in the tree,
+ * and is skipped.
+ */
+export function watchedPositions(perp: ContractHandle, ledger: any, secret: bigint): Watched[] {
+  const out: Watched[] = [];
+  for (const note of ledger.liquidatorNotes as Iterable<any>) {
+    let view: LiquidatorView;
+    try {
+      view = decodeLiquidatorPlaintext(perp.module.pureCircuits.openLiquidatorNote(note, secret));
+    } catch {
+      continue;
+    }
+    const commitment = perp.module.pureCircuits.positionCommitment(view.position) as Uint8Array;
+    if (!ledger.positions.findPathForLeaf(commitment)) continue;
+    if (ledger.closed.member(perp.module.pureCircuits.positionNullifier(view.position.salt))) continue;
+    out.push({ ...view, commitment: hex(commitment) });
+  }
+  return out;
+}
+
+/** Whether `w` is below maintenance margin at the ledger's price, as the circuit tests it. */
+export function canLiquidate(ledger: any, w: Watched, closeTime = circuitNow()): boolean {
+  return isLiquidatable(w.position, ledger, closeTime);
+}
+
+export interface Liquidated {
+  txHash: string;
+  pnl: bigint;
+  liquidationFee: bigint;
+  settled: ReturnType<typeof settlement>;
+}
+
+/**
+ * Liquidates `w` at the current mark price, from the keeper's wallet behind
+ * `perp.providers`. The equity left goes to the trader's `payTo`, encrypted
+ * to the key their liquidator note carries; the fees go to the treasury.
+ */
+export async function liquidatePosition(
+  perp: ContractHandle,
+  w: Watched,
+  usdc: Uint8Array,
+  treasuryEncKey: string
+): Promise<Liquidated> {
+  const ledger = await readLedger(perp);
+  const path = ledger.positions.findPathForLeaf(bytes(w.commitment));
+  if (!path) throw new Error("the position's commitment is not in the tree");
+  const p = w.position;
+  const coin = { nonce: p.collateralNonce, color: usdc, value: p.collateral + p.openFee };
+  const mt_index = await collateralIndex(perp, coin);
+
+  const { profit, pnl } = positionPnl(p.isLong, p.size, p.entryPrice, ledger.markPrice, ledger.maxPayout);
+  const closeTime = circuitNow();
+  const closeFee = closeFeeOf(p.size, BigInt(ledger.closeFeeBps));
+  const borrowFee = borrowFeeOf(p.size, BigInt(ledger.borrowRate), closeTime - p.openTime);
+  const liquidationFee = liquidationFeeOf(p.size, BigInt(ledger.liquidationFeeBps));
+  const settled = settlement(p, { profit, pnl }, closeFee, borrowFee, liquidationFee);
+  const capacity = capacityOf(ledger.poolValue + settled.toPool - settled.fromPool, ledger.maxPayout);
+
+  const tx: any = await withContractScopedTransaction(
+    perp.providers,
+    (txCtx: any) =>
+      perp.deployed.callTx.liquidatePosition(
+        txCtx,
+        p,
+        path,
+        { ...coin, mt_index },
+        pnl,
+        closeFee,
+        borrowFee,
+        liquidationFee,
+        closeTime,
+        capacity
+      ),
+    {
+      additionalCoinEncPublicKeyMappings: new Map([
+        [hex(ledger.treasury.bytes), treasuryEncKey],
+        [hex(p.payTo.bytes), hex(w.payToEnc)],
+      ]),
+    }
+  );
+  return { txHash: tx.public.txHash, pnl, liquidationFee, settled };
 }

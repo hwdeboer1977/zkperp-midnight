@@ -77,24 +77,66 @@ export function positionPnl(
  * Where a closing position's coin and any profit go, as the circuit divides
  * them: the loss to the pool, the fees to the treasury, the rest to the
  * trader; a profit from the pool, less fees the collateral could not cover.
+ * A liquidation also takes `liquidationFee` out of what equity is left, to the
+ * treasury; a close passes none.
  */
 export function settlement(
   p: { collateral: bigint; openFee: bigint },
   pnl: { profit: boolean; pnl: bigint },
   closeFee: bigint,
-  borrowFee: bigint
-): { toPool: bigint; toTreasury: bigint; toTrader: bigint; fromPool: bigint } {
+  borrowFee: bigint,
+  liquidationFee = 0n
+): { toPool: bigint; toTreasury: bigint; toTrader: bigint; fromPool: bigint; equity: bigint } {
   const loss = pnl.profit ? 0n : pnl.pnl < p.collateral ? pnl.pnl : p.collateral;
   const afterLoss = p.collateral - loss;
   const fees = closeFee + borrowFee;
   const feeTaken = fees < afterLoss ? fees : afterLoss;
   const shortfall = fees - feeTaken;
+  const equity = afterLoss - feeTaken;
+  const liqTaken = liquidationFee < equity ? liquidationFee : equity;
   const profit = pnl.profit ? pnl.pnl : 0n;
   const fromPool = profit > shortfall ? profit - shortfall : 0n;
   return {
     toPool: loss,
-    toTreasury: p.openFee + feeTaken,
-    toTrader: afterLoss - feeTaken + fromPool,
+    toTreasury: p.openFee + feeTaken + liqTaken,
+    toTrader: equity - liqTaken + fromPool,
     fromPool,
+    equity,
   };
+}
+
+export function liquidationFeeOf(size: bigint, liquidationFeeBps: bigint): bigint {
+  return ceilDiv(size * liquidationFeeBps, 10_000n);
+}
+
+/** The circuit's margin test: equity below `maintenanceBps` of size, and not in profit. */
+export function isLiquidatable(
+  p: { isLong: boolean; size: bigint; collateral: bigint; openFee: bigint; entryPrice: bigint; openTime: bigint },
+  l: { markPrice: bigint; maxPayout: bigint; closeFeeBps: bigint; borrowRate: bigint; maintenanceBps: bigint },
+  closeTime: bigint
+): boolean {
+  const pnl = positionPnl(p.isLong, p.size, p.entryPrice, l.markPrice, l.maxPayout);
+  if (pnl.profit && pnl.pnl > 0n) return false;
+  const closeFee = closeFeeOf(p.size, l.closeFeeBps);
+  const borrowFee = borrowFeeOf(p.size, l.borrowRate, closeTime - p.openTime);
+  const { equity } = settlement(p, pnl, closeFee, borrowFee);
+  return equity * 10_000n < p.size * l.maintenanceBps;
+}
+
+/**
+ * About where a position becomes liquidatable, with the fees it would owe at
+ * `atTime`: the price at which its equity meets the maintenance margin. For
+ * display; the keeper uses `isLiquidatable`, which rounds as the circuit does.
+ */
+export function liquidationPrice(
+  p: { isLong: boolean; size: bigint; collateral: bigint; entryPrice: bigint; openTime: bigint },
+  l: { closeFeeBps: bigint; borrowRate: bigint; maintenanceBps: bigint },
+  atTime: bigint
+): bigint {
+  const fees = closeFeeOf(p.size, l.closeFeeBps) + borrowFeeOf(p.size, l.borrowRate, atTime - p.openTime);
+  const maintenance = ceilDiv(p.size * l.maintenanceBps, 10_000n);
+  // The adverse move the equity can absorb before it meets maintenance.
+  const room = p.collateral - fees - maintenance;
+  const move = (p.entryPrice * room) / p.size;
+  return p.isLong ? p.entryPrice - move : p.entryPrice + move;
 }

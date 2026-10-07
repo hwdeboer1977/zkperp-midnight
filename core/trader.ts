@@ -17,13 +17,14 @@
 import { createHash } from "crypto";
 import { MidnightBech32m, UnshieldedAddress } from "@midnight-ntwrk/wallet-sdk-address-format";
 import { nativeToken } from "@midnight-ntwrk/ledger-v8";
+import { scalarFrom } from "./liquidatorNote.js";
 import type { NetworkConfig } from "./network.js";
 import { buildWallet, currentState, waitForSync, type BuiltWallet } from "./wallet.js";
 
 const NIGHT = nativeToken().raw;
 const NIGHT_FOR_TRADER = 5_000_000n;
 
-function seedFor(role: "trader" | "treasury", devSeed: string): string {
+function seedFor(role: "trader" | "treasury" | "keeper", devSeed: string): string {
   const variable = `${role.toUpperCase()}_SEED`;
   const explicit = process.env[variable]?.trim();
   if (explicit) {
@@ -38,6 +39,22 @@ export const traderSeed = (devSeed: string) => seedFor("trader", devSeed);
 
 /** TREASURY_SEED, or one derived from the dev seed. */
 export const treasurySeed = (devSeed: string) => seedFor("treasury", devSeed);
+
+/** KEEPER_SEED, or one derived from the dev seed: the wallet that submits liquidations. */
+export const keeperSeed = (devSeed: string) => seedFor("keeper", devSeed);
+
+/**
+ * The liquidator's secret scalar: LIQUIDATOR_SECRET (hex), or one derived from
+ * the dev seed. Every open encrypts its position to this key's public half,
+ * so whoever holds it sees every position; see docs/privacy.md.
+ */
+export function liquidatorSecret(devSeed: string): bigint {
+  const explicit = process.env.LIQUIDATOR_SECRET?.trim();
+  const raw = explicit
+    ? Buffer.from(explicit.replace(/^0x/, "").padStart(128, "0"), "hex")
+    : createHash("sha512").update(`zkperp-liquidator:${devSeed}`).digest();
+  return scalarFrom(raw);
+}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
