@@ -282,7 +282,7 @@ On `preview`, 1AM uses its hosted prover (`api-preview.1am.xyz`). Measured 2026-
 - **Done on 2026-10-07 on the devnet:**
   - Liquidation end to end (`npm run liquidation`): the trader's wallet received the leftover equity.
   - Through 1AM in the browser: password unlock (about 1 s), open (49 s), recovery after deleting the browser's local records (the position reappeared from chain within a second), and close (49 s).
-- Re-measure open and close through 1AM on `preview` with the contract call proven locally (see "Who sees the proof inputs").
+- **Done on 2026-10-08 on `preview`,** with the contract call proven locally and 1AM's prover set to LOCAL: a close in about 17 s and an open in about 11 s of proving, against about 80 s per trade through 1AM's hosted prover the day before. A liquidation after a hand-set price drop (`npm run price:preview -- 2370`): the keeper liquidated a 10x long of 198.02 on 19.80 pUSDC, with 14.98 to the pool, 1.40 to the treasury and 3.63 back to the trader.
 - The keeper as a long-running service (`npm run keeper`) has not been run against live price moves yet; `npm run liquidation` runs the same steps in-process.
 - Funding rates are not built.
 - Ask the 1AM team for a deterministic signature or a way to derive a key from the wallet. If they ship one, the password could become optional.

@@ -31,7 +31,9 @@
     "frontend:config:preview": "npm run build && ZKPERP_NETWORK=preview node dist/scripts/frontend-config.js",
     "frontend": "npm run frontend:config && npm --prefix frontend run dev",
     "frontend:preview": "npm run frontend:config:preview && npm --prefix frontend run dev",
-    "fund": "npm run build && node dist/scripts/fund-wallet.js"
+    "fund": "npm run build && node dist/scripts/fund-wallet.js",
+    "price": "npm run build && ZKPERP_NETWORK=local node dist/scripts/set-price.js",
+    "price:preview": "npm run build && ZKPERP_NETWORK=preview node dist/scripts/set-price.js"
   },
   "dependencies": {
     "@midnight-ntwrk/compact-js": "2.5.1",
