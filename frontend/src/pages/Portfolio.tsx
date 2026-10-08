@@ -7,6 +7,7 @@ import { useConfig, useLedger, useNow } from "../lib/hooks";
 import { allPositions, type PositionRecord } from "../lib/positions";
 import { usePositionKey } from "../lib/positionKey";
 import { recoverPositions, settleClosed } from "../lib/recover";
+import { describeClosings } from "../lib/history";
 import { circuitNow, liquidationPrice } from "@core/math";
 import { PriceMovedError, closePosition, quoteClose } from "../lib/trading";
 import { proverLabel, useWallet } from "../lib/wallet";
@@ -101,6 +102,47 @@ function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger:
   );
 }
 
+/** A finished position: how it ended and what it returned on the coin posted. */
+function HistoryRow({ record }: { record: PositionRecord }) {
+  const o = record.opening;
+  const c = record.closing;
+  // The coin posted at open: collateral plus the opening fee.
+  const posted = BigInt(o.collateral) + BigInt(o.openFee);
+  const pnl = c ? BigInt(c.pnl) : 0n;
+  const net = c ? BigInt(c.received) - posted : 0n;
+  const approx = c && !c.exact ? "≈ " : "";
+  const signed = (v: bigint) => `${v >= 0n ? "+" : "−"}${fmt6(v >= 0n ? v : -v)}`;
+  const outcome =
+    record.status !== "closed" ? record.status : !c ? "closed" : c.by === "liquidation" ? "liquidated" : "closed by you";
+  return (
+    <tr>
+      <td>{new Date(record.createdAt).toLocaleString()}</td>
+      <td className={o.isLong ? "long" : "short"}>{o.isLong ? "Long" : "Short"}</td>
+      <td>{fmt6(BigInt(o.size))}</td>
+      <td>${fmt6(BigInt(o.entryPrice))}</td>
+      <td>{c ? `$${fmt6(BigInt(c.exitPrice))}` : record.status === "closed" ? "…" : ""}</td>
+      <td className={c ? (pnl >= 0n ? "good" : "bad") : ""}>{c ? signed(pnl) : ""}</td>
+      <td title="Opening fee + closing, borrow and any liquidation fee">
+        {c ? `${approx}${fmt6(BigInt(o.openFee) + BigInt(c.fees), 4)}` : ""}
+      </td>
+      <td title={c && !c.exact ? "Estimated from the closing block's time; the borrow fee may differ slightly" : undefined}>
+        {c ? (
+          <b>
+            {approx}
+            {fmt6(BigInt(c.received))}
+          </b>
+        ) : (
+          ""
+        )}
+      </td>
+      <td className={c ? (net >= 0n ? "good" : "bad") : ""} title={`On the ${fmt6(posted)} pUSDC posted, fees included`}>
+        {c ? `${net >= 0n ? "+" : "−"}${(Number((net >= 0n ? net : -net) * 10_000n / posted) / 100).toFixed(2)}%` : ""}
+      </td>
+      <td className={c?.by === "liquidation" ? "bad" : ""}>{outcome}</td>
+    </tr>
+  );
+}
+
 export default function PortfolioPage() {
   const w = useWallet();
   const config = useConfig();
@@ -124,6 +166,9 @@ export default function PortfolioPage() {
         changed += await recoverPositions(module, ledger, key, address, config.network.networkId, hex(w.coinPublicKey));
       }
       if (live && changed > 0) reload();
+      // How each closed position ended; a slower lookup, so after the rest shows.
+      if (!live) return;
+      if ((await describeClosings(config, module, address)) > 0 && live) reload();
     })().then(
       () => live && setSyncError(null),
       (e) => live && setSyncError(String(e?.message ?? e))
@@ -188,18 +233,17 @@ export default function PortfolioPage() {
                 <th></th>
                 <th>Size</th>
                 <th>Entry</th>
-                <th>Status</th>
+                <th>Exit</th>
+                <th>PnL</th>
+                <th>Fees</th>
+                <th>Received</th>
+                <th>Return</th>
+                <th>Outcome</th>
               </tr>
             </thead>
             <tbody>
               {history.map((r) => (
-                <tr key={r.commitment}>
-                  <td>{new Date(r.createdAt).toLocaleString()}</td>
-                  <td className={r.opening.isLong ? "long" : "short"}>{r.opening.isLong ? "Long" : "Short"}</td>
-                  <td>{fmt6(BigInt(r.opening.size))}</td>
-                  <td>${fmt6(BigInt(r.opening.entryPrice))}</td>
-                  <td>{r.status}</td>
-                </tr>
+                <HistoryRow key={r.commitment} record={r} />
               ))}
             </tbody>
           </table>

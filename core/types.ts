@@ -33,4 +33,25 @@ export interface PositionRecord {
   createdAt: string;
   txHash?: string;
   closeTxHash?: string;
+  /** How a closed position ended, once known. Amounts in pUSDC's smallest unit. */
+  closing?: PositionClosing;
+}
+
+export interface PositionClosing {
+  /** Closed by its owner, or liquidated by the keeper. */
+  by: "trader" | "liquidation";
+  exitPrice: string;
+  /** Seconds since the epoch. */
+  closeTime: string;
+  /** Signed: the profit or loss before fees. */
+  pnl: string;
+  /** Close, borrow and liquidation fees; the opening fee is in `opening.openFee`. */
+  fees: string;
+  /** What the owner's wallet received. */
+  received: string;
+  /**
+   * False when rebuilt from the closing transaction: the close time is then
+   * the block's, so the borrow fee (and what was received) is an estimate.
+   */
+  exact: boolean;
 }

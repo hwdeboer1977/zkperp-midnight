@@ -279,7 +279,20 @@ export async function closePosition(
     return { txHash: tx.public.txHash as string, quote: q };
   };
   const result = await withConflicts(perp, ledger.markPrice, attempt);
-  await updatePosition(record.commitment, { status: "closed", closeTxHash: result.txHash });
+  const q = result.quote;
+  await updatePosition(record.commitment, {
+    status: "closed",
+    closeTxHash: result.txHash,
+    closing: {
+      by: "trader",
+      exitPrice: q.exit.toString(),
+      closeTime: q.closeTime.toString(),
+      pnl: (q.profit ? q.pnl : -q.pnl).toString(),
+      fees: (q.closeFee + q.borrowFee).toString(),
+      received: q.settled.toTrader.toString(),
+      exact: true,
+    },
+  });
   return result;
 }
 
