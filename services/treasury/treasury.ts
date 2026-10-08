@@ -18,12 +18,15 @@
  *   · at least EPOCH_MIN_SECONDS passed since it (1 hour).
  *
  * There is no upper limit: when trading is slow, LPs wait for their fees
- * rather than a trade's size becoming public. `POST /epoch` runs one now,
- * skipping the time rule but never the closes rule.
+ * rather than a trade's size becoming public.
  *
- *   GET  http://127.0.0.1:3011/health   the wallet, fees pending, the rules
- *   GET  http://127.0.0.1:3011/epochs   every epoch so far
- *   POST http://127.0.0.1:3011/epoch    run one now, if enough closes
+ * The HTTP endpoints are public (the frontend proxies them), so they show only
+ * what the chain already shows. The fees received since the last epoch, or
+ * the wallet's balance, would give away each trade's fee — and with it its
+ * size — to anyone polling before and after it; they stay in this log.
+ *
+ *   GET  http://127.0.0.1:3011/health   up, closes since the last epoch, the rules
+ *   GET  http://127.0.0.1:3011/epochs   every epoch so far: when, closes, deposit, tx
  *
  * Epochs are logged in .zkperp/epochs.json, per contract.
  */
@@ -145,13 +148,13 @@ async function main() {
   }
 
   let busy = false;
-  async function runEpoch(manual: boolean): Promise<string> {
+  async function runEpoch(): Promise<string> {
     if (busy) return "an epoch is already running";
     busy = true;
     try {
       const p = await pending();
       if (p.closes < MIN_CLOSES) return `waiting: ${p.closes} of ${MIN_CLOSES} closes since the last epoch`;
-      if (!manual && p.elapsed < MIN_SECONDS) return `waiting: ${p.elapsed}s of ${MIN_SECONDS}s since the last epoch`;
+      if (p.elapsed < MIN_SECONDS) return `waiting: ${p.elapsed}s of ${MIN_SECONDS}s since the last epoch`;
       if (p.toLps <= 0n) return "no fees to pay out";
       log(`epoch: ${p.closes} closes, fees ${fmt(p.fees)}, ${LP_SHARE_PCT}% to LPs: ${fmt(p.toLps)}…`);
       const txHash = await depositFees(perp, usdc, p.toLps);
@@ -182,18 +185,19 @@ async function main() {
           const p = await pending();
           return json(200, {
             contract: perpAddress,
-            treasuryBalance: fmt(p.held),
-            feesSinceLastEpoch: fmt(p.fees),
             closesSinceLastEpoch: Number(p.closes),
             secondsSinceLastEpoch: p.last.at ? p.elapsed : null,
             rules: { minCloses: Number(MIN_CLOSES), minSeconds: MIN_SECONDS, lpSharePct: Number(LP_SHARE_PCT) },
           });
         }
         if (req.method === "GET" && req.url === "/epochs") {
-          return json(200, readEpochs().filter((e) => e.contractAddress === perpAddress && !e.baseline));
-        }
-        if (req.method === "POST" && req.url === "/epoch") {
-          return json(200, { result: await runEpoch(true) });
+          // Only what each deposit already shows on chain.
+          return json(
+            200,
+            readEpochs()
+              .filter((e) => e.contractAddress === perpAddress && !e.baseline)
+              .map(({ at, closedPositions, deposited, txHash }) => ({ at, closedPositions, deposited, txHash }))
+          );
         }
         return json(404, { error: "not found" });
       } catch (error) {
@@ -210,7 +214,7 @@ async function main() {
   let lastNote = "";
   while (!stopping) {
     try {
-      const result = await runEpoch(false);
+      const result = await runEpoch();
       if (result !== lastNote) log(result);
       lastNote = result;
     } catch (error) {

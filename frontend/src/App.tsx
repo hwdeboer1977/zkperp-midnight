@@ -4,6 +4,7 @@ import { NavLink, Route, Routes } from "react-router-dom";
 import { useConfig, useLedger, useNow } from "./lib/hooks";
 import { fmt6 } from "./lib/bytes";
 import { WalletButton } from "./components/WalletButton";
+import { Logo } from "./components/Market";
 import PublicPage from "./pages/Public";
 import TradePage from "./pages/Trade";
 import PortfolioPage from "./pages/Portfolio";
@@ -18,7 +19,8 @@ function PriceTicker() {
   const stale = age >= Number(ledger.maxPriceAge);
   return (
     <span className={`ticker ${stale ? "bad" : ""}`} title={`price published ${age}s ago; limit ${ledger.maxPriceAge}s`}>
-      ETH ${fmt6(ledger.markPrice)} <small>{Math.floor(age / 60)}m ago</small>
+      <span className="pair">ETH-USD · {Math.floor(age / 60)}m ago</span>
+      <span className="price">${fmt6(ledger.markPrice)}</span>
     </span>
   );
 }
@@ -43,10 +45,16 @@ export default function App() {
   return (
     <>
       <header>
-        <div className="brand">
-          zk<b>perp</b>
-          {config && <span className="net">{config.network.networkId}</span>}
-        </div>
+        <NavLink to="/" className="brand" end>
+          <Logo />
+          <span>
+            <span className="name">
+              zk<b>perp</b>
+            </span>
+            <span className="tag">Private perpetuals</span>
+          </span>
+        </NavLink>
+        {config && <span className="net">{config.network.networkId}</span>}
         <nav>
           <NavLink to="/" end>
             Public

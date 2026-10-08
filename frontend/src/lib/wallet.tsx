@@ -42,6 +42,8 @@ interface WalletState {
   connect: (d: Detected) => Promise<void>;
   disconnect: () => void;
   refresh: () => Promise<void>;
+  /** Looks for this app's proof server again (after starting it), without reconnecting. True if it now proves. */
+  recheckProver: () => Promise<boolean>;
   /** A contract callable through this wallet; built once per connection. */
   contract: (name: "zkperp" | "pusdc") => Promise<ContractHandle>;
 }
@@ -168,6 +170,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     handles.clear();
   }, [handles]);
 
+  const recheckProver = useCallback(async () => {
+    if (!api) return false;
+    const next = await proverRoute(api);
+    handles.clear();
+    setRoute(next);
+    return !next.walletProves;
+  }, [api, handles]);
+
   const contract = useCallback(
     (which: "zkperp" | "pusdc") => {
       if (!api || !route) return Promise.reject(new Error("Connect a wallet first."));
@@ -197,9 +207,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       connect,
       disconnect,
       refresh,
+      recheckProver,
       contract,
     }),
-    [detected, api, name, route, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, contract]
+    [detected, api, name, route, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, recheckProver, contract]
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

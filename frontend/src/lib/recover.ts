@@ -51,35 +51,75 @@ export async function recoverPositions(
     const id = `${payTo}:${hex(note)}`;
     if (seen.has(id)) continue;
     seen.add(id);
-    const o = await openNote(key, contract, note);
-    if (!o) continue;
-    const s = await secretsOf(key, o.seed);
-    const record: PositionRecord = {
-      status: "open",
-      contractAddress,
-      networkId,
-      commitment: "",
-      // The open time is the closest thing to a creation time the note has.
-      createdAt: new Date(Number(o.openTime) * 1000).toISOString(),
-      opening: {
-        ownerSecret: hex(s.ownerSecret),
-        isLong: o.isLong,
-        size: o.size.toString(),
-        collateral: o.collateral.toString(),
-        openFee: o.openFee.toString(),
-        entryPrice: o.entryPrice.toString(),
-        openTime: o.openTime.toString(),
-        collateralNonce: hex(s.collateralNonce),
-        salt: hex(s.salt),
-        payTo,
-      },
-    };
-    record.commitment = hex(module.pureCircuits.positionCommitment(positionOf({ module } as any, record)));
-    if (!ledger.positions.findPathForLeaf(bytes(record.commitment))) continue;
-    if (ledger.closed.member(module.pureCircuits.positionNullifier(s.salt))) record.status = "closed";
-    if (await mergePosition(record, existing.get(record.commitment))) changed += 1;
+    const record = await recordFromNote(module, ledger, key, contract, note, contractAddress, networkId, payTo);
+    if (record && (await mergePosition(record, existing.get(record.commitment)))) changed += 1;
   }
   return changed;
+}
+
+/**
+ * The record a note describes, if it opens under `key` and its position is
+ * this wallet's (its rebuilt commitment is in the tree); null otherwise.
+ */
+async function recordFromNote(
+  module: Module,
+  ledger: any,
+  key: PositionKey,
+  contract: Uint8Array,
+  note: Uint8Array,
+  contractAddress: string,
+  networkId: string,
+  payTo: string
+): Promise<PositionRecord | null> {
+  const o = await openNote(key, contract, note);
+  if (!o) return null;
+  const s = await secretsOf(key, o.seed);
+  const record: PositionRecord = {
+    status: "open",
+    contractAddress,
+    networkId,
+    commitment: "",
+    // The open time is the closest thing to a creation time the note has.
+    createdAt: new Date(Number(o.openTime) * 1000).toISOString(),
+    opening: {
+      ownerSecret: hex(s.ownerSecret),
+      isLong: o.isLong,
+      size: o.size.toString(),
+      collateral: o.collateral.toString(),
+      openFee: o.openFee.toString(),
+      entryPrice: o.entryPrice.toString(),
+      openTime: o.openTime.toString(),
+      collateralNonce: hex(s.collateralNonce),
+      salt: hex(s.salt),
+      payTo,
+    },
+  };
+  record.commitment = hex(module.pureCircuits.positionCommitment(positionOf({ module } as any, record)));
+  if (!ledger.positions.findPathForLeaf(bytes(record.commitment))) return null;
+  if (ledger.closed.member(module.pureCircuits.positionNullifier(s.salt))) record.status = "closed";
+  return record;
+}
+
+/**
+ * Commitments of every position on `contractAddress` that a note under `key`
+ * rebuilds for this wallet: the records this browser could drop and get back.
+ * Tries every note, uncached.
+ */
+export async function recoverableCommitments(
+  module: Module,
+  ledger: any,
+  key: PositionKey,
+  contractAddress: string,
+  networkId: string,
+  payTo: string
+): Promise<Set<string>> {
+  const contract = bytes(contractAddress);
+  const found = new Set<string>();
+  for (const note of ledger.notes as Iterable<Uint8Array>) {
+    const record = await recordFromNote(module, ledger, key, contract, note, contractAddress, networkId, payTo);
+    if (record) found.add(record.commitment);
+  }
+  return found;
 }
 
 /** Marks open records on `contractAddress` closed once their nullifier is on chain. */

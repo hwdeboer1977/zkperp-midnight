@@ -131,6 +131,19 @@ function inMemoryPrivateState(): any {
   };
 }
 
+/**
+ * Where a transaction is: proving its contract call, in the wallet (fees and
+ * signature), or submitted. The providers below report each step as the SDK
+ * reaches it, so the UI shows real progress rather than a spinner.
+ */
+export type TxStage = "proving" | "wallet" | "submitting";
+const stageListeners = new Set<(stage: TxStage) => void>();
+export function onTxStage(listener: (stage: TxStage) => void): () => void {
+  stageListeners.add(listener);
+  return () => void stageListeners.delete(listener);
+}
+const reportStage = (stage: TxStage) => stageListeners.forEach((l) => l(stage));
+
 /** A contract, callable through the connected wallet, proven by `route`. */
 export async function connectContract(api: ConnectedAPI, name: ContractName, route: ProverRoute): Promise<ContractHandle> {
   const config = await loadConfig();
@@ -148,21 +161,29 @@ export async function connectContract(api: ConnectedAPI, name: ContractName, rou
     getCoinPublicKey: () => shielded.shieldedCoinPublicKey as any,
     getEncryptionPublicKey: () => shielded.shieldedEncryptionPublicKey as any,
     balanceTx: async (tx: any) => {
+      reportStage("wallet");
       const { tx: balanced } = await api.balanceUnsealedTransaction(toHex(tx.serialize()));
       return Transaction.deserialize("signature", "proof", "binding", fromHex(balanced)) as any;
     },
   };
   const midnightProvider = {
     submitTx: async (tx: any) => {
+      reportStage("submitting");
       await api.submitTransaction(toHex(tx.serialize()));
       const ids: string[] = tx.identifiers?.() ?? [];
       if (ids.length === 0) throw new Error("The transaction was submitted but reported no identifier.");
       return ids[0] as any;
     },
   };
-  const proofProvider = route.walletProves
+  const prover = route.walletProves
     ? createProofProvider(await (api as any).getProvingProvider(zkConfigProvider.asKeyMaterialProvider()))
     : httpClientProofProvider(route.url, zkConfigProvider as any);
+  const proofProvider = {
+    proveTx: (tx: any, proveConfig?: any) => {
+      reportStage("proving");
+      return prover.proveTx(tx, proveConfig);
+    },
+  };
 
   const providers: any = {
     privateStateProvider: inMemoryPrivateState(),

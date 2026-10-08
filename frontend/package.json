@@ -25,6 +25,7 @@
     "buffer": "^6.0.3",
     "effect": "3.22.1",
     "hash-wasm": "4.12.0",
+    "lightweight-charts": "5.2.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.1.0"

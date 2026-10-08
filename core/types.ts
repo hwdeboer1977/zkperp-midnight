@@ -50,6 +50,13 @@ export interface PositionClosing {
   /** What the owner's wallet received. */
   received: string;
   /**
+   * The fees as charged, when known: each is taken from what equity is left,
+   * so in a wipe-out the sum may exceed `fees`, which is what was actually taken.
+   */
+  closeFee?: string;
+  borrowFee?: string;
+  liquidationFee?: string;
+  /**
    * False when rebuilt from the closing transaction: the close time is then
    * the block's, so the borrow fee (and what was received) is an estimate.
    */

@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import { useEffect, useRef } from "react";
+import {
+  CandlestickSeries,
+  ColorType,
+  CrosshairMode,
+  LineStyle,
+  createChart,
+  type IChartApi,
+  type IPriceLine,
+  type ISeriesApi,
+  type UTCTimestamp,
+} from "lightweight-charts";
+import type { Candle } from "../lib/market";
+
+const css = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+/**
+ * ETH-USD candles from the live market, with the contract's execution price
+ * drawn across them as a dashed line, so any gap between the two is visible.
+ */
+export function CandleChart({ candles, oracle }: { candles: Candle[] | null; oracle: number | null }) {
+  const box = useRef<HTMLDivElement>(null);
+  const chart = useRef<IChartApi | null>(null);
+  const series = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const line = useRef<IPriceLine | null>(null);
+  const fitted = useRef(false);
+  // Read by the price scale, so the execution line stays in view however far it is from the market.
+  const oracleRef = useRef<number | null>(oracle);
+  oracleRef.current = oracle;
+
+  useEffect(() => {
+    if (!box.current) return;
+    const c = createChart(box.current, {
+      autoSize: true,
+      layout: { background: { type: ColorType.Solid, color: "transparent" }, textColor: css("--muted"), fontFamily: css("--mono"), fontSize: 11 },
+      grid: { vertLines: { color: css("--border") }, horzLines: { color: css("--border") } },
+      rightPriceScale: { borderColor: css("--border") },
+      timeScale: { borderColor: css("--border"), timeVisible: true, secondsVisible: false },
+      crosshair: { mode: CrosshairMode.Normal },
+    });
+    series.current = c.addSeries(CandlestickSeries, {
+      upColor: css("--good"),
+      downColor: css("--bad"),
+      wickUpColor: css("--good"),
+      wickDownColor: css("--bad"),
+      borderVisible: false,
+      autoscaleInfoProvider: (original: () => any) => {
+        const r = original();
+        const o = oracleRef.current;
+        if (!r || o === null) return r;
+        return { ...r, priceRange: { minValue: Math.min(r.priceRange.minValue, o), maxValue: Math.max(r.priceRange.maxValue, o) } };
+      },
+    });
+    chart.current = c;
+    return () => {
+      c.remove();
+      chart.current = series.current = line.current = null;
+      fitted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!series.current) return;
+    if (!candles) {
+      fitted.current = false;
+      return;
+    }
+    series.current.setData(candles.map((k) => ({ ...k, time: k.time as UTCTimestamp })));
+    if (!fitted.current && candles.length > 0) {
+      chart.current?.timeScale().fitContent();
+      fitted.current = true;
+    }
+  }, [candles]);
+
+  useEffect(() => {
+    const s = series.current;
+    if (!s) return;
+    if (line.current) s.removePriceLine(line.current);
+    line.current =
+      oracle === null
+        ? null
+        : s.createPriceLine({ price: oracle, color: css("--accent"), lineWidth: 2, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "execution" });
+  }, [oracle]);
+
+  return (
+    <div className="candles">
+      <div ref={box} className="candles-box" />
+      {!candles && <div className="candles-wait">Loading ETH-USD market data…</div>}
+    </div>
+  );
+}

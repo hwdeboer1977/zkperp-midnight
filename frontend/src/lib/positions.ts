@@ -48,6 +48,8 @@ export const allPositions = () => tx<PositionRecord[]>("readonly", (s) => s.getA
 
 export const putPosition = (record: PositionRecord) => tx("readwrite", (s) => s.put(record));
 
+export const deletePosition = (commitment: string) => tx("readwrite", (s) => s.delete(commitment));
+
 export async function updatePosition(commitment: string, patch: Partial<PositionRecord>): Promise<void> {
   const current = await tx<PositionRecord | undefined>("readonly", (s) => s.get(commitment) as IDBRequest<PositionRecord | undefined>);
   if (!current) throw new Error(`no record of position ${commitment.slice(0, 12)}…`);

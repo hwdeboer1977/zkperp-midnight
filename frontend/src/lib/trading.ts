@@ -290,6 +290,9 @@ export async function closePosition(
       pnl: (q.profit ? q.pnl : -q.pnl).toString(),
       fees: (q.closeFee + q.borrowFee).toString(),
       received: q.settled.toTrader.toString(),
+      closeFee: q.closeFee.toString(),
+      borrowFee: q.borrowFee.toString(),
+      liquidationFee: "0",
       exact: true,
     },
   });

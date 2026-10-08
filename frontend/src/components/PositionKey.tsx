@@ -14,6 +14,8 @@ import {
   usePositionKey,
 } from "../lib/positionKey";
 import { useWallet } from "../lib/wallet";
+import { useConfig, useLedger } from "../lib/hooks";
+import { lockAndClear } from "../lib/usePositions";
 
 const short = (h: string) => `${h.slice(0, 8)}…${h.slice(-6)}`;
 
@@ -27,6 +29,9 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
   const key = usePositionKey();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const config = useConfig();
+  const { ledger } = useLedger();
   const [password, setPassword] = useState("");
   const [generated, setGenerated] = useState<string | null>(null);
   const [savedIt, setSavedIt] = useState(false);
@@ -56,45 +61,60 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
 
   if (key) {
     return compact ? null : (
-      <div className="banner ok row" style={{ flexWrap: "wrap" }}>
-        <span style={{ flex: 1 }}>
-          Position key unlocked for wallet account <code>{short(hex(account))}</code>. Positions opened with it can be closed
-          from any computer with this wallet and your password.
+      <div className="card flat row" style={{ flexWrap: "wrap", gap: 10 }}>
+        <span className="chip good">Position key unlocked</span>
+        <span
+          className="muted"
+          style={{ flex: 1, fontSize: 13 }}
+          title="Positions opened with this key can be closed from any computer with this wallet and your password."
+        >
+          for account <code>{short(hex(account))}</code>
         </span>
         {passkeysSupported() &&
           (remembered ? (
             <button
-              className="ghost"
+              className="ghost small"
               title="Removes the passkey shortcut from this browser. Your password keeps working everywhere."
               onClick={() => (forgetRememberedRoot(account), rerender((n) => n + 1))}
             >
-              Forget passkey on this device
+              Forget passkey
             </button>
           ) : (
             <button
-              className="ghost"
-              title="Next time in this browser, unlock with your fingerprint, face or PIN instead of typing the password."
+              className="ghost small"
+              title="Next time in this browser, unlock with your fingerprint, face or PIN instead of typing the password. On other computers you still use the password."
               disabled={!!busy}
               onClick={() => run("passkey", () => rememberWithPasskey(account))}
             >
-              {busy === "passkey" ? "Waiting for passkey…" : "Remember on this device with a passkey"}
+              {busy === "passkey" ? "Waiting for passkey…" : "Remember with passkey"}
             </button>
           ))}
         <button
-          className="ghost"
-          title="Forgets the key in this tab now. Your positions stay safe on chain; unlock again with your password."
-          onClick={lockPositionKey}
+          className="ghost small"
+          title="Forgets the position key in this tab now. Positions stay on chain and in this browser's cache; closing or reloading the tab locks too."
+          onClick={() => (setInfo(null), lockPositionKey())}
         >
           Lock
         </button>
-        <small className="muted" style={{ flexBasis: "100%" }}>
-          {passkeysSupported() &&
-            (remembered
-              ? "Forget passkey: this browser no longer unlocks with your fingerprint or PIN; the password still works everywhere. "
-              : "Remember with a passkey: next time in this browser, unlock with your fingerprint, face or PIN instead of typing the password; on other computers you still use the password. ")}
-          Lock: forget the key in this tab now, for example on a shared computer. Your positions stay on chain; closing or
-          reloading the tab locks it too.
-        </small>
+        <button
+          className="ghost small"
+          title="Locks, and deletes this browser's cached position records (which hold owner secrets) for every position the chain can rebuild. For a shared computer. Your password brings them back."
+          disabled={!!busy || !config || !ledger}
+          onClick={() =>
+            config &&
+            ledger &&
+            key &&
+            run("clear", async () => {
+              const { deleted, kept } = await lockAndClear(config, ledger, key, account);
+              setInfo(
+                `Locked and cleared ${deleted} cached position record(s) from this browser; your password brings them back.` +
+                  (kept ? ` ${kept} record(s) with no note on chain were kept: only this browser holds them.` : "")
+              );
+            })
+          }
+        >
+          {busy === "clear" ? "Clearing…" : "Lock and clear this browser"}
+        </button>
         {error && <p className="bad">{error}</p>}
       </div>
     );
@@ -104,8 +124,9 @@ export function PositionKeyPanel({ compact = false }: { compact?: boolean }) {
 
   return (
     <section className="card">
-      <h2>Your position key</h2>
-      <p className="muted">
+      <h2>Unlock your position key</h2>
+      {info && <div className="banner ok">{info}</div>}
+      <p className="muted" style={{ marginTop: 0, lineHeight: 1.6, fontSize: 14 }}>
         Each position is stored on chain, encrypted to a key from your <b>password</b> and this wallet account (
         <code>{short(hex(account))}</code>). With both you can see and close your positions on any computer. Your wallet pays
         and receives; the password only unlocks the records, and a close always pays the wallet that opened the position.
