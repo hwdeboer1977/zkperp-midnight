@@ -4,14 +4,15 @@
  * The Midnight SDK's providers, assembled in the browser from the connected
  * wallet. Modelled on midnight-polisZK's connectContract.
  *
- * Proving: a wallet that offers `getProvingProvider` (1AM) takes the proving
- * over, and sends it to the proof server in its own network settings
- * (measured 2026-10-07: on the local network 1AM posts /check and /prove to
- * localhost:6300, nothing runs in the tab). Anything else proves on this
- * app's proof server (127.0.0.1:6300). Either way that server sees each
- * trade's private inputs — size, direction, collateral — so it must be on the
- * trader's own machine, never hosted. The wallet state exposes which one is
- * used (`prover`, `proverIsLocal`) so the UI can say so.
+ * Proving: the contract call is proven on this app's proof server
+ * (127.0.0.1:6300) whenever it answers, and the wallet only balances the fees
+ * and signs; its own fee proofs hold no position data. Only when that server
+ * is down does a wallet that offers `getProvingProvider` (1AM) prove the call,
+ * on the proof server in its own network settings: on preview that is 1AM's
+ * hosted one, which took ~40 s a proof (measured 2026-10-07) against 1–13 s
+ * locally, and which sees each trade's private inputs — size, direction,
+ * collateral. The wallet state exposes the route (`prover`, `proverIsLocal`,
+ * `walletProves`) so the UI can say so.
  */
 
 import type { ConnectedAPI } from "@midnight-ntwrk/dapp-connector-api";
@@ -62,6 +63,36 @@ export function walletCanProve(api: ConnectedAPI): boolean {
   return typeof (api as any)?.getProvingProvider === "function";
 }
 
+/** Who proves the contract calls, and on which proof server. */
+export interface ProverRoute {
+  /** True when the wallet proves (on its own server), false when this app's proof server does. */
+  walletProves: boolean;
+  /** The proof server that sees each trade's private inputs; "unknown" if the wallet does not say. */
+  url: string;
+}
+
+/** Whether the proof server at `url` answers its health check. */
+export async function proofServerUp(url: string): Promise<boolean> {
+  try {
+    const res = await fetch(new URL("/health", url), { signal: AbortSignal.timeout(2000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * This app's proof server when it answers, else the wallet's if it can prove.
+ * With neither, still this app's: proving then fails with a clear error.
+ */
+export async function proverRoute(api: ConnectedAPI): Promise<ProverRoute> {
+  const config = await loadConfig();
+  const local = config.network.proofServer;
+  if (!walletCanProve(api) || (await proofServerUp(local))) return { walletProves: false, url: local };
+  const wallet = await api.getConfiguration();
+  return { walletProves: true, url: String((wallet as any).proverServerUri ?? "unknown") };
+}
+
 // Keys are served with a long cache; the version stops a browser that cached
 // one deployment's keys from proving against the next one's.
 function zkFetch(version: string): typeof fetch {
@@ -100,8 +131,8 @@ function inMemoryPrivateState(): any {
   };
 }
 
-/** A contract, callable through the connected wallet. */
-export async function connectContract(api: ConnectedAPI, name: ContractName): Promise<ContractHandle> {
+/** A contract, callable through the connected wallet, proven by `route`. */
+export async function connectContract(api: ConnectedAPI, name: ContractName, route: ProverRoute): Promise<ContractHandle> {
   const config = await loadConfig();
   const walletConfig = await api.getConfiguration();
   if (walletConfig.networkId !== config.network.networkId) {
@@ -129,9 +160,9 @@ export async function connectContract(api: ConnectedAPI, name: ContractName): Pr
       return ids[0] as any;
     },
   };
-  const proofProvider = walletCanProve(api)
+  const proofProvider = route.walletProves
     ? createProofProvider(await (api as any).getProvingProvider(zkConfigProvider.asKeyMaterialProvider()))
-    : httpClientProofProvider(config.network.proofServer, zkConfigProvider as any);
+    : httpClientProofProvider(route.url, zkConfigProvider as any);
 
   const providers: any = {
     privateStateProvider: inMemoryPrivateState(),

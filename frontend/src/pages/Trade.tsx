@@ -67,7 +67,7 @@ export default function TradePage() {
     try {
       setStatus("Preparing…");
       const perp = await w.contract("zkperp");
-      setStatus(`Proving on ${proverLabel(w.prover)}${w.canProve ? ", through your wallet" : ""} — this can take a minute…`);
+      setStatus(`Proving on ${proverLabel(w.prover)}${w.walletProves ? ", through your wallet" : ""} — this can take a minute…`);
       const { txHash } = await openPosition(perp, key, coin, plan.size, isLong, expectedPrice);
       setOpened(txHash);
       setStatus(null);

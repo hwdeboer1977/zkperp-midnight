@@ -252,7 +252,7 @@ The cryptography was never the problem; slicing was. The current note uses no `s
 1. Install 1AM and restore the same account from its recovery phrase.
 2. Open ZKPerp and connect the wallet.
 3. Enter the password. Argon2id takes about a second, then the app decrypts the notes and drops those whose nullifier is already in `closed`.
-4. Close. 1AM has the proof made by the proof server in its settings (which should be on your own machine; the wallet button shows it), and the payout goes to this same account.
+4. Close. The app proves it on the proof server on this machine (`npm run proof:up`; the wallet button shows it), 1AM adds the fees and signs, and the payout goes to this same account.
 
 No file, backup or passkey is needed.
 
@@ -263,23 +263,26 @@ Every trade is a zero-knowledge proof, and the **proof server that builds it see
 | Route | Who sends the work | To which proof server |
 |---|---|---|
 | CLI and scripts | our code | the one in the network config, `127.0.0.1:6300` locally |
-| Browser with Lace | the app | the app's configured one, `127.0.0.1:6300` locally |
-| Browser with 1AM | 1AM (`getProvingProvider`) | **the one in 1AM's own network settings** |
+| Browser with Lace | the app | the app's configured one, `127.0.0.1:6300` |
+| Browser with 1AM | the app | the app's configured one, `127.0.0.1:6300`; 1AM only adds fees and signs |
+| Browser with 1AM, local proof server down | 1AM (`getProvingProvider`) | **the one in 1AM's own network settings** (on `preview`, 1AM's hosted one) |
 
-**1AM does not prove in the browser tab, as we had assumed.** Measured 2026-10-07 on the local network: when the browser opened and closed a position through 1AM, the local proof server logged `/check` and `/prove` requests at exactly those moments, with nothing else running. 1AM's `getConfiguration()` reports `proverServerUri: http://localhost:6300`. So the app's earlier claim that "1AM proves in this tab, so your position never leaves the browser" was wrong for this setup. The app now says this:
+**1AM does not prove in the browser tab, as we had assumed.** Measured 2026-10-07 on the local network: when the browser opened and closed a position through 1AM, the local proof server logged `/check` and `/prove` requests at exactly those moments, with nothing else running. 1AM's `getConfiguration()` reports `proverServerUri: http://localhost:6300`. So the app's earlier claim that "1AM proves in this tab, so your position never leaves the browser" was wrong for this setup.
 
-- The wallet button shows the prover in use (`prover <host>`), from 1AM's settings for 1AM and from the app's config for Lace.
-- The button turns red, with "not on this machine, it sees your positions", when that prover is not local.
+On `preview`, 1AM uses its hosted prover (`api-preview.1am.xyz`). Measured 2026-10-07: an open and a close went entirely through it, at about 40 s per proof and two proofs per trade (the contract call, then 1AM's fee balancing). The local proof server makes the same kinds of proofs in 1–13 s.
+
+**So since 2026-10-08 the app proves the contract call itself,** on the proof server in its config, whenever that server answers its `/health` check at connect time. 1AM then only balances the fees (DUST) and signs, through `balanceUnsealedTransaction`. Its fee proofs, still made on its own prover, hold no position data. Only if the local proof server is down does 1AM prove the contract call. The app shows this:
+
+- The wallet button shows the contract call's prover (`prover <host>`).
+- The button turns red, with "not on this machine, it sees your positions", when that prover is not local. Start the proof server and reconnect to switch back.
 - Status messages say where a proof is being made.
-
-**For the testnet demo,** the plan said never to use a hosted prover for trades. That holds only if each trader's 1AM points at a proof server on their own machine. Before the demo, check what 1AM uses on `preview` and whether a trader can point it at a local one. If 1AM can only use a hosted prover there, trades through 1AM would reveal every position to whoever runs that prover. The alternative is the Lace route with a local proof server.
 
 ## Open items
 
 - **Done on 2026-10-07 on the devnet:**
   - Liquidation end to end (`npm run liquidation`): the trader's wallet received the leftover equity.
   - Through 1AM in the browser: password unlock (about 1 s), open (49 s), recovery after deleting the browser's local records (the position reappeared from chain within a second), and close (49 s).
-- Check which prover 1AM uses on `preview`, and whether traders can point it at a local proof server (see "Who sees the proof inputs").
+- Re-measure open and close through 1AM on `preview` with the contract call proven locally (see "Who sees the proof inputs").
 - The keeper as a long-running service (`npm run keeper`) has not been run against live price moves yet; `npm run liquidation` runs the same steps in-process.
 - Funding rates are not built.
 - Ask the 1AM team for a deterministic signature or a way to derive a key from the wallet. If they ship one, the password could become optional.

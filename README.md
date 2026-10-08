@@ -157,7 +157,7 @@ npm run frontend               # copies contracts, keys and config into frontend
 npm run fund -- mn_addr_undeployed1…   # sends NIGHT to your browser wallet, for DUST
 ```
 
-Set the wallet to the **Undeployed** network. Every trade is proven by a proof server, which sees the trade's size, direction and collateral. 1AM sends it to the proof server in its own network settings (on the local network, `localhost:6300`); Lace uses the one on this machine. The wallet button shows which one is in use, in red if it is not local. Mint pUSDC on the Faucet page, unlock your position key with a password (or generate a passphrase the first time), and trade. Positions opened with it show up on any computer where you connect the same wallet account and enter the password. See `docs/privacy.md`. The encrypted backup on the Portfolio page is still there for positions opened without a key.
+Set the wallet to the **Undeployed** network. Every trade is proven by a proof server, which sees the trade's size, direction and collateral. The app uses the one on this machine (`npm run proof:up`) and lets the wallet only add fees and sign; if that one is down when you connect, 1AM proves on the one in its own network settings. The wallet button shows which one is in use, in red if it is not local. Mint pUSDC on the Faucet page, unlock your position key with a password (or generate a passphrase the first time), and trade. Positions opened with it show up on any computer where you connect the same wallet account and enter the password. See `docs/privacy.md`. The encrypted backup on the Portfolio page is still there for positions opened without a key.
 
 After `npm run frontend:config` (or a recompile), restart the dev server: a running one keeps serving the old circuit files' list and answers new ones with HTML, which the wallet reports as "Proof server check failed (400): bad input".
 
@@ -170,7 +170,7 @@ The same stack runs on Midnight's public `preview` network; the scripts and serv
 1. Put a fresh, secret 64-hex `WALLET_SEED_PREVIEW` in `.env` (per network, so it does not replace the devnet's seed). This is the **operator** wallet: it deploys, submits prices, adds the first liquidity and funds the treasury and keeper. Traders, you included, use their own 1AM accounts in the browser; keep the two apart, since the operator wallet's transactions are public. On the devnet the dev seed is public; here it controls the oracle, the liquidator key and every derived wallet, and the scripts refuse to run without it.
 2. Run `npm run setup:preview`. The first run stops with the dev wallet's address: get tNIGHT for it at <https://midnight-tmnight-preview.nethermind.dev/>, then run it again. It registers the NIGHT for DUST, funds the trader, treasury and keeper wallets with `NIGHT_PER_WALLET` (default 100 NIGHT each), deploys pUSDC and zkperp, adds liquidity, and writes `.zkperp/preview-stack.json`.
 3. Run `npm run relayer:preview`, `npm run treasury:preview` and `npm run keeper:preview`, each in its own terminal.
-4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the prover is remote and sees your positions.
+4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the local proof server did not answer and 1AM's hosted prover, which sees your positions, is in use.
 
 The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`) refuse to run against `preview`.
 

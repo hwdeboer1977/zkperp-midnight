@@ -45,7 +45,7 @@ function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger:
     setMoved(null);
     try {
       const perp = await w.contract("zkperp");
-      setStatus(`Proving on ${proverLabel(w.prover)}${w.canProve ? ", through your wallet" : ""}…`);
+      setStatus(`Proving on ${proverLabel(w.prover)}${w.walletProves ? ", through your wallet" : ""}…`);
       await closePosition(perp, record, expected);
       setStatus(null);
       void w.refresh();

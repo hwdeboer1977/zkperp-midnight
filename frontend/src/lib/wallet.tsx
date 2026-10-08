@@ -13,7 +13,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import type { ConnectedAPI, InitialAPI } from "@midnight-ntwrk/dapp-connector-api";
 import { loadConfig } from "./config";
 import { keyBytes } from "./bytes";
-import { connectContract, walletCanProve, type ContractHandle } from "./providers";
+import { connectContract, proverRoute, type ContractHandle, type ProverRoute } from "./providers";
 
 export interface Detected {
   key: string;
@@ -24,11 +24,12 @@ interface WalletState {
   detected: Detected[];
   api: ConnectedAPI | null;
   name: string | null;
-  canProve: boolean;
+  /** Whether the wallet proves the contract calls (only when this app's proof server is down). */
+  walletProves: boolean;
   /**
-   * The proof server that will see each trade's private inputs: the one in the
-   * wallet's own settings when the wallet proves (1AM), else this app's local
-   * one. Null until connected; "unknown" if the wallet does not say.
+   * The proof server that will see each trade's private inputs: this app's
+   * local one when it answers, else the one in the wallet's settings (1AM).
+   * Null until connected; "unknown" if the wallet does not say.
    */
   prover: string | null;
   /** Whether `prover` is on this machine. A remote one sees every position. */
@@ -88,7 +89,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [api, setApi] = useState<ConnectedAPI | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [coinPublicKey, setCoinPublicKey] = useState<Uint8Array | null>(null);
-  const [prover, setProver] = useState<string | null>(null);
+  const [route, setRoute] = useState<ProverRoute | null>(null);
   const [shieldedBalances, setShielded] = useState<Record<string, bigint>>({});
   const [dust, setDust] = useState<bigint | null>(null);
   const [connecting, setConnecting] = useState(false);
@@ -138,11 +139,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
           throw new Error(`The wallet is on "${wallet.networkId}"; this deployment runs on "${config.network.networkId}".`);
         }
         const shielded = await connected.getShieldedAddresses();
-        setProver(
-          walletCanProve(connected)
-            ? String((wallet as any).proverServerUri ?? "unknown")
-            : config.network.proofServer
-        );
+        setRoute(await proverRoute(connected));
         handles.clear();
         setCoinPublicKey(keyBytes(shielded.shieldedCoinPublicKey));
         setApi(connected);
@@ -165,7 +162,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     setApi(null);
     setName(null);
     setCoinPublicKey(null);
-    setProver(null);
+    setRoute(null);
     setShielded({});
     setDust(null);
     handles.clear();
@@ -173,15 +170,15 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
   const contract = useCallback(
     (which: "zkperp" | "pusdc") => {
-      if (!api) return Promise.reject(new Error("Connect a wallet first."));
+      if (!api || !route) return Promise.reject(new Error("Connect a wallet first."));
       if (!handles.has(which)) {
-        const p = connectContract(api, which);
+        const p = connectContract(api, which, route);
         p.catch(() => handles.delete(which));
         handles.set(which, p);
       }
       return handles.get(which)!;
     },
-    [api, handles]
+    [api, route, handles]
   );
 
   const value = useMemo<WalletState>(
@@ -189,9 +186,9 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       detected,
       api,
       name,
-      canProve: api ? walletCanProve(api) : false,
-      prover: api ? prover : null,
-      proverIsLocal: isLocalUrl(prover),
+      walletProves: api ? (route?.walletProves ?? false) : false,
+      prover: api ? (route?.url ?? null) : null,
+      proverIsLocal: isLocalUrl(route?.url ?? null),
       coinPublicKey,
       shieldedBalances,
       dust,
@@ -202,7 +199,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       refresh,
       contract,
     }),
-    [detected, api, name, prover, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, contract]
+    [detected, api, name, route, coinPublicKey, shieldedBalances, dust, connecting, error, connect, disconnect, refresh, contract]
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
