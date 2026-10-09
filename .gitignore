@@ -14,3 +14,4 @@ frontend/dist/
 frontend/src/generated/
 frontend/public/zk/
 frontend/public/config.json
+coverage/

@@ -494,6 +494,36 @@ export interface Executed {
 }
 
 /**
+ * The arguments `executeOrder` passes the circuit for `w` at the ledger's mark
+ * price and `closeTime`, and what they settle to. Pure, so the tests can check
+ * it against the circuit; `mt_index` is where the collateral coin sits.
+ */
+export function executeOrderCall(
+  pureCircuits: any,
+  ledger: any,
+  w: WatchedOrder,
+  usdc: Uint8Array,
+  mt_index: bigint,
+  closeTime: bigint
+): { args: unknown[]; profit: boolean; pnl: bigint; exit: bigint; settled: ReturnType<typeof settlement> } {
+  const p = w.position.position;
+  const path = ledger.positions.findPathForLeaf(bytes(w.position.commitment));
+  if (!path) throw new Error("the position's commitment is not in the tree");
+  const orderPath = ledger.orders.findPathForLeaf(pureCircuits.orderCommitment(w.order));
+  if (!orderPath) throw new Error("the order's commitment is not in the tree");
+  const coin = { nonce: p.collateralNonce, color: usdc, value: p.collateral + p.openFee, mt_index };
+
+  const exit: bigint = ledger.markPrice;
+  const { profit, pnl } = positionPnl(p.isLong, p.size, p.entryPrice, exit, ledger.maxPayout);
+  const closeFee = closeFeeOf(p.size, BigInt(ledger.closeFeeBps));
+  const borrowFee = borrowFeeOf(p.size, BigInt(ledger.borrowRate), closeTime - p.openTime);
+  const settled = settlement(p, { profit, pnl }, closeFee, borrowFee);
+  const capacity = capacityOf(ledger.poolValue + settled.toPool - settled.fromPool, ledger.maxPayout);
+  const args = [p, path, w.order, orderPath, coin, pnl, closeFee, borrowFee, closeTime, capacity];
+  return { args, profit, pnl, exit, settled };
+}
+
+/**
  * Executes `w` at the current mark price, from the keeper's wallet behind
  * `perp.providers`: closes its position as the trader's own close would, and
  * pays the trader's `payTo`, encrypted to the key the liquidator note carries.
@@ -506,37 +536,15 @@ export async function executeOrder(
 ): Promise<Executed> {
   const ledger = await readLedger(perp);
   const p = w.position.position;
-  const path = ledger.positions.findPathForLeaf(bytes(w.position.commitment));
-  if (!path) throw new Error("the position's commitment is not in the tree");
-  const orderPath = ledger.orders.findPathForLeaf(perp.module.pureCircuits.orderCommitment(w.order));
-  if (!orderPath) throw new Error("the order's commitment is not in the tree");
-  const coin = { nonce: p.collateralNonce, color: usdc, value: p.collateral + p.openFee };
-  const mt_index = await collateralIndex(perp, coin);
-
-  const exit: bigint = ledger.markPrice;
-  const { profit, pnl } = positionPnl(p.isLong, p.size, p.entryPrice, exit, ledger.maxPayout);
-  const closeTime = circuitNow();
-  const closeFee = closeFeeOf(p.size, BigInt(ledger.closeFeeBps));
-  const borrowFee = borrowFeeOf(p.size, BigInt(ledger.borrowRate), closeTime - p.openTime);
-  const settled = settlement(p, { profit, pnl }, closeFee, borrowFee);
-  const capacity = capacityOf(ledger.poolValue + settled.toPool - settled.fromPool, ledger.maxPayout);
+  // Fails fast when the position or the order is not in its tree, before
+  // waiting up to two minutes on the indexer for the coin.
+  executeOrderCall(perp.module.pureCircuits, ledger, w, usdc, 0n, circuitNow());
+  const mt_index = await collateralIndex(perp, { nonce: p.collateralNonce, color: usdc, value: p.collateral + p.openFee });
+  const { args, profit, pnl, exit, settled } = executeOrderCall(perp.module.pureCircuits, ledger, w, usdc, mt_index, circuitNow());
 
   const tx: any = await withContractScopedTransaction(
     perp.providers,
-    (txCtx: any) =>
-      perp.deployed.callTx.executeOrder(
-        txCtx,
-        p,
-        path,
-        w.order,
-        orderPath,
-        { ...coin, mt_index },
-        pnl,
-        closeFee,
-        borrowFee,
-        closeTime,
-        capacity
-      ),
+    (txCtx: any) => perp.deployed.callTx.executeOrder(txCtx, ...args),
     {
       additionalCoinEncPublicKeyMappings: new Map([
         [hex(ledger.treasury.bytes), treasuryEncKey],

@@ -28,6 +28,8 @@ import {
 import { Contract, ledger, pureCircuits } from "../contracts/managed/zkperp/contract/index.js";
 import { JUBJUB_ORDER as JUBJUB_ORDER_TS, belowField, decodeLiquidatorPlaintext, randomScalar } from "../dist/core/liquidatorNote.js";
 import { deriveOrder, findOwnOrderNote, firesAbove, openOrderNote, orderReached, sealOrderNote } from "../dist/core/orders.js";
+import { cancelOrder, executeOrderCall, orderFires, placeOrder, positionOf, watchedOrders, watchedPositions } from "../dist/core/perp.js";
+import * as m from "../dist/core/math.js";
 
 let failures = 0;
 const expect = (name, cond, detail = "") => {
@@ -932,8 +934,84 @@ console.log("\n  trigger orders\n");
     expect("below its level a long's take profit cannot fire", !below.ok && /not been reached/.test(below.error), why(below));
     const up = TP + 10_000_000n;
     const profit = floorDiv(SIZE * (up - PRICE), PRICE);
-    const tp = execute(priced(tpPlaced.state, up), takeProfit, { pnl: profit });
+    const upState = priced(tpPlaced.state, up);
+    const tp = execute(upState, takeProfit, { pnl: profit });
     expect("at or above it the keeper takes the profit for the trader", tp.ok && paidTo(tp, TRADER) === KEEP + profit, tp.ok ? `${paidTo(tp, TRADER)} vs ${KEEP + profit}` : why(tp));
+    if (tp.ok) {
+      expect("the treasury gets the three fees from a take profit", paidTo(tp, TREASURY) === FEES, `${paidTo(tp, TREASURY)} vs ${FEES}`);
+      expect("the keeper is paid nothing for it", paidTo(tp, KEEPER) === 0n);
+      expect("the pool pays exactly the profit", ledger(tp.state).poolValue === ledger(upState).poolValue - profit);
+      expect("the reservation is released", reservedOf(ledger(tp.state)) === 0n);
+      expect("the take profit spends the position's nullifier", ledger(tp.state).closed.member(pureCircuits.positionNullifier(SALT)));
+    }
+    const greedy = execute(upState, takeProfit, { pnl: profit + 1n });
+    expect("the keeper cannot overstate a take profit's profit", !greedy.ok && /overstated/.test(greedy.error), why(greedy));
+  }
+
+  // The keeper's view of the ledger (core/perp.ts): which orders it watches.
+  {
+    const keeperView = { module: { pureCircuits } };
+    const watching = (state) => {
+      const l = ledger(state);
+      return watchedOrders(keeperView, l, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, LIQUIDATOR_SECRET));
+    };
+    expect("with no order placed the keeper watches none", watching(opened.state).length === 0);
+    if (placed.ok && tpPlaced.ok) {
+      const [w] = watching(placed.state);
+      expect(
+        "the keeper rebuilds the placed order exactly from its note",
+        w !== undefined && hex(pureCircuits.orderCommitment(w.order)) === hex(pureCircuits.orderCommitment(stopLoss)) && w.position.commitment === hex(commitment)
+      );
+      expect("another key watches nothing", watchedOrders(keeperView, ledger(placed.state), LIQUIDATOR_SECRET - 1n, watchedPositions(keeperView, ledger(placed.state), LIQUIDATOR_SECRET)).length === 0);
+      expect("orderFires: not above the stop", w !== undefined && !orderFires(ledger(priced(placed.state, STOP + 1n)), w));
+      expect("orderFires: at the stop", w !== undefined && orderFires(ledger(priced(placed.state, STOP)), w));
+      const cancelled = callAt(T0, TRADER, placed.state, "cancelOrder", position, OWNER_SECRET, stopLoss);
+      expect("a cancelled order is no longer watched", cancelled.ok && watching(cancelled.state).length === 0, why(cancelled));
+      const hitState = priced(placed.state, STOP);
+      const ran = execute(hitState, stopLoss, { pnl: lossAt(STOP) });
+      expect("an executed order is no longer watched", ran.ok && watching(ran.state).length === 0, why(ran));
+      const closed = close(hitState, { pnl: lossAt(STOP) });
+      expect("nor is an order whose position the trader closed", closed.ok && watching(closed.state).length === 0, why(closed));
+    }
+  }
+
+  // A take profit whose profit is above the payout cap: a 20x long of 10,000
+  // pUSDC and a 60% rise, raw profit 120k against a 100k cap.
+  {
+    const BIG = 10_000_000_000n;
+    const bigCoin = coin(BIG);
+    const bigSize = BIG * 20n;
+    const big = {
+      ...position,
+      size: bigSize,
+      collateral: BIG,
+      openFee: openFeeOf(bigSize),
+      collateralNonce: bigCoin.nonce,
+      salt: bytes32(0x5c),
+    };
+    const bigCommitment = pureCircuits.positionCommitment(big);
+    const openedBig = openCall(TRADER, pooled, bigCoin, bigSize, true, OWNER_SECRET, big.salt);
+    const { salt, ephemeral } = await deriveOrder(OWNER_SECRET, big.salt, 0);
+    const bigTp = { position: bigCommitment, price: 4_500_000_000n, above: firesAbove(true, "takeProfit"), salt };
+    const bigPlaced = openedBig.ok
+      ? place(openedBig.state, { position: big, order: bigTp, note: sealOrderNote(pureCircuits, LIQUIDATOR_KEY, big.salt, bigTp, ephemeral) })
+      : openedBig;
+    expect("a take profit is placed on a 20x long", bigPlaced.ok, why(bigPlaced));
+    if (bigPlaced.ok) {
+      const moon = priced(bigPlaced.state, 4_800_000_000n);
+      const fees = { closeFee: closeFeeOf(bigSize), borrowFee: borrowFeeOf(bigSize, HELD) };
+      const run = (pnl) =>
+        execute(moon, bigTp, { position: big, path: ledger(moon).positions.findPathForLeaf(bigCommitment), coin: held(bigCoin, bigSize), pnl, ...fees });
+      const raw = run(floorDiv(bigSize * 1_800_000_000n, PRICE));
+      expect("a take profit above the cap cannot pay the raw profit", !raw.ok && /payout cap/.test(raw.error), why(raw));
+      const capped = run(MAX_PAYOUT);
+      expect(
+        "it pays exactly the cap",
+        capped.ok && paidTo(capped, TRADER) === BIG - fees.closeFee - fees.borrowFee + MAX_PAYOUT,
+        capped.ok ? String(paidTo(capped, TRADER)) : why(capped)
+      );
+      if (capped.ok) expect("the pool pays exactly the cap", ledger(capped.state).poolValue === ledger(moon).poolValue - MAX_PAYOUT);
+    }
   }
 }
 
@@ -1102,6 +1180,345 @@ const shortPool = ledger(shortOpened.state).poolValue;
     capped.ok && paidTo(capped, RECIPIENT) === BIG - closeFeeOf(bigSize) - borrowFeeOf(bigSize, HELD) + MAX_PAYOUT,
     why(capped)
   );
+}
+
+// Trigger orders on the short: the directions flip. Its stop loss fires on a
+// rise, its take profit on a fall.
+{
+  const STOP = 3_090_000_000n; // 3% above the entry
+  const TAKE = 2_850_000_000n; // 5% below it
+  const order = async (kind, price, index) => {
+    const { salt, ephemeral } = await deriveOrder(OWNER_SECRET, SHORT_SALT, index);
+    const o = { position: shortCommitment, price, above: firesAbove(false, kind), salt };
+    return { order: o, note: sealOrderNote(pureCircuits, LIQUIDATOR_KEY, SHORT_SALT, o, ephemeral) };
+  };
+  const placeShort = (state, { order: o, note }) =>
+    callAt(T0, TRADER, state, "placeOrder", shortPosition, OWNER_SECRET, o, note);
+  const executeShort = (state, o, pnl) => {
+    const args = {
+      position: shortPosition,
+      coin: held(shortCoin, SIZE),
+      pnl,
+      closeFee: CLOSE_FEE,
+      borrowFee: BORROW_FEE,
+    };
+    const capacity = closeCapacity(state, args);
+    const l = ledger(state);
+    return callAt(
+      T1, KEEPER, state, "executeOrder",
+      shortPosition, l.positions.findPathForLeaf(shortCommitment), o, l.orders.findPathForLeaf(pureCircuits.orderCommitment(o)),
+      args.coin, pnl, CLOSE_FEE, BORROW_FEE, T1, capacity
+    );
+  };
+  const lossAt = (price) => ceilDiv(SIZE * (price - PRICE), PRICE);
+  const profitAt = (price) => floorDiv(SIZE * (PRICE - price), PRICE);
+
+  const sl = await order("stopLoss", STOP, 0);
+  const tp = await order("takeProfit", TAKE, 1);
+  expect("a short's stop loss fires at or above its level", sl.order.above === true && orderReached(sl.order, STOP) && !orderReached(sl.order, STOP - 1n));
+  expect("a short's take profit fires at or below its level", tp.order.above === false && orderReached(tp.order, TAKE) && !orderReached(tp.order, TAKE + 1n));
+
+  const slPlaced = placeShort(shortOpened.state, sl);
+  expect("the owner places a stop loss on the short", slPlaced.ok, why(slPlaced));
+  if (slPlaced.ok) {
+    const below = shortAt(STOP - 1n);
+    const early = executeShort(callAt(T0, TRADER, below, "placeOrder", shortPosition, OWNER_SECRET, sl.order, sl.note).state, sl.order, lossAt(STOP - 1n));
+    expect("below its level a short's stop loss cannot fire", !early.ok && /not been reached/.test(early.error), why(early));
+    const falling = executeShort(placeShort(shortAt(TAKE), sl).state, sl.order, profitAt(TAKE));
+    expect("nor when the price falls, in the short's favour", !falling.ok && /not been reached/.test(falling.error), why(falling));
+
+    const hit = STOP + 5_000_000n;
+    const state = placeShort(shortAt(hit), sl).state;
+    const loss = lossAt(hit);
+    const ran = executeShort(state, sl.order, loss);
+    expect("at or above its level the keeper executes a short's stop loss", ran.ok, why(ran));
+    if (ran.ok) {
+      expect("the trader gets the collateral less the loss and fees", paidTo(ran, TRADER) === KEEP - loss, `${paidTo(ran, TRADER)} vs ${KEEP - loss}`);
+      expect("the treasury gets the three fees", paidTo(ran, TREASURY) === FEES);
+      expect("the pool gains the short's loss", ledger(ran.state).poolValue === ledger(state).poolValue + loss);
+      expect("the short's nullifier is spent", ledger(ran.state).closed.member(pureCircuits.positionNullifier(SHORT_SALT)));
+    }
+    const asProfit = executeShort(state, sl.order, 1n);
+    expect("the keeper cannot book a short's stop loss as a profit", !asProfit.ok, why(asProfit));
+  }
+
+  const tpPlaced = placeShort(shortOpened.state, tp);
+  expect("the owner places a take profit on the short", tpPlaced.ok, why(tpPlaced));
+  if (tpPlaced.ok) {
+    const early = executeShort(placeShort(shortAt(TAKE + 1n), tp).state, tp.order, profitAt(TAKE + 1n));
+    expect("above its level a short's take profit cannot fire", !early.ok && /not been reached/.test(early.error), why(early));
+    const rising = executeShort(placeShort(shortAt(STOP), tp).state, tp.order, lossAt(STOP));
+    expect("nor when the price rises, against the short", !rising.ok && /not been reached/.test(rising.error), why(rising));
+
+    const hit = TAKE - 5_000_000n;
+    const state = placeShort(shortAt(hit), tp).state;
+    const profit = profitAt(hit);
+    const ran = executeShort(state, tp.order, profit);
+    expect("at or below its level the keeper takes a short's profit", ran.ok, why(ran));
+    if (ran.ok) {
+      expect("the trader gets the collateral less fees plus the profit", paidTo(ran, TRADER) === KEEP + profit, `${paidTo(ran, TRADER)} vs ${KEEP + profit}`);
+      expect("the treasury gets the three fees", paidTo(ran, TREASURY) === FEES);
+      expect("the keeper is paid nothing", paidTo(ran, KEEPER) === 0n);
+      expect("the pool pays exactly the short's profit", ledger(ran.state).poolValue === ledger(state).poolValue - profit);
+    }
+    const greedy = executeShort(state, tp.order, profit + 1n);
+    expect("the keeper cannot overstate a short's take profit", !greedy.ok && /overstated/.test(greedy.error), why(greedy));
+  }
+}
+
+// ── core/math.ts against the circuit ────────────────────────────────────────
+
+// The services, scripts and frontend compute fees, PnL and payouts with
+// core/math.ts. Over a grid of exit prices, for a long and a short, the
+// circuit must accept exactly those numbers and pay exactly that settlement.
+
+console.log("\n  core/math.ts against the circuit\n");
+
+{
+  const l0 = ledger(opened.state);
+  expect(
+    "math.ts gives the fees the circuit demands",
+    m.openFeeOf(SIZE, OPEN_FEE_BPS) === OPEN_FEE &&
+      m.closeFeeOf(SIZE, l0.closeFeeBps) === CLOSE_FEE &&
+      m.borrowFeeOf(SIZE, l0.borrowRate, HELD) === BORROW_FEE &&
+      m.liquidationFeeOf(SIZE, l0.liquidationFeeBps) === LIQ_FEE
+  );
+  let sameCapacity = true;
+  for (const v of [0n, 1n, MAX_PAYOUT - 1n, MAX_PAYOUT, MAX_PAYOUT + 1n, 4n * MAX_PAYOUT + 1n, 123_456_789_012n]) {
+    if (m.capacityOf(v, MAX_PAYOUT) !== capOf(v)) sameCapacity = false;
+  }
+  expect("math.ts gives the slot capacity the circuit pins", sameCapacity);
+  expect("and the reserved liquidity", m.reservedOf(l0) === reservedOf(l0));
+
+  // A loss leaving less than the closing and borrow fees: the fee shortfall.
+  const thinMove = ceilDiv((COLLATERAL - 5n * 1_000_000n) * PRICE, SIZE);
+  const moves = [0n, 1n, 2n, 999n, 12_345_679n, 30_000_000n, 150_000_000n, 210_000_000n, 233_000_000n, 240_000_000n, thinMove, 450_000_000n];
+  const cases = [];
+  for (const isLong of [true, false]) {
+    for (const move of moves) {
+      for (const sign of move === 0n ? [1n] : [1n, -1n]) cases.push({ isLong, exit: PRICE + sign * move });
+    }
+  }
+  // The exact price where math.ts flips to liquidatable, and a unit either side.
+  for (const isLong of [true, false]) {
+    const p = isLong ? position : shortPosition;
+    const l = ledger(opened.state);
+    const sick = (exit) => m.isLiquidatable(p, { ...l, markPrice: exit }, T1);
+    let [healthy, liquidatable] = isLong ? [PRICE, PRICE / 2n] : [PRICE, PRICE * 2n];
+    while ((healthy > liquidatable ? healthy - liquidatable : liquidatable - healthy) > 1n) {
+      const mid = (healthy + liquidatable) / 2n;
+      if (sick(mid)) liquidatable = mid;
+      else healthy = mid;
+    }
+    const away = isLong ? -1n : 1n;
+    for (const exit of [healthy, liquidatable, liquidatable + away]) cases.push({ isLong, exit });
+  }
+  const mismatches = { close: [], liquidate: [], refused: [] };
+  let shortfalls = 0;
+  let liquidations = 0;
+  for (const { isLong, exit } of cases) {
+    const p = isLong ? position : shortPosition;
+    const state = isLong ? at(exit) : shortAt(exit);
+    const l = ledger(state);
+    const pnl = m.positionPnl(isLong, SIZE, PRICE, exit, l.maxPayout);
+    const closeFee = m.closeFeeOf(SIZE, l.closeFeeBps);
+    const borrowFee = m.borrowFeeOf(SIZE, l.borrowRate, HELD);
+    const label = `${isLong ? "long" : "short"} exit ${exit}`;
+    const expected = (r, s) =>
+      r.ok &&
+      paidTo(r, TRADER) === s.toTrader &&
+      paidTo(r, TREASURY) === s.toTreasury &&
+      ledger(r.state).poolValue === l.poolValue + s.toPool - s.fromPool;
+
+    const s = m.settlement(p, pnl, closeFee, borrowFee);
+    if (s.toTreasury < p.openFee + closeFee + borrowFee) shortfalls += 1;
+    const closed = isLong
+      ? close(state, { pnl: pnl.pnl, closeFee, borrowFee })
+      : closeShort(state, { pnl: pnl.pnl, closeFee, borrowFee });
+    if (!expected(closed, s)) mismatches.close.push(`${label}: ${closed.ok ? `trader ${paidTo(closed, TRADER)} vs ${s.toTrader}` : closed.error}`);
+
+    const coin = isLong ? qualified : held(shortCoin, SIZE);
+    const liquidationFee = m.liquidationFeeOf(SIZE, l.liquidationFeeBps);
+    const predicted = m.isLiquidatable(p, l, T1);
+    const liq = liquidate(state, { position: p, coin, pnl: pnl.pnl, closeFee, borrowFee, liquidationFee });
+    if (liq.ok !== predicted) mismatches.refused.push(`${label}: math.ts says ${predicted}, the circuit ${liq.ok ? "liquidated" : liq.error}`);
+    if (liq.ok) {
+      liquidations += 1;
+      const sl = m.settlement(p, pnl, closeFee, borrowFee, liquidationFee);
+      if (!expected(liq, sl)) mismatches.liquidate.push(`${label}: trader ${paidTo(liq, TRADER)} vs ${sl.toTrader}`);
+    }
+  }
+  expect(`(${cases.length} exits, ${liquidations} liquidatable, ${shortfalls} with a fee shortfall)`, liquidations > 0 && shortfalls > 0);
+  expect("every close: the circuit accepts math.ts's PnL and fees, and pays its settlement", mismatches.close.length === 0, mismatches.close.join("\n        "));
+  expect("isLiquidatable agrees with the circuit at every exit", mismatches.refused.length === 0, mismatches.refused.join("\n        "));
+  expect("every liquidation pays math.ts's settlement", mismatches.liquidate.length === 0, mismatches.liquidate.join("\n        "));
+
+  // liquidationPrice is for display, but should sit where the circuit flips.
+  for (const [name, p, priceAt] of [["long", position, at], ["short", shortPosition, shortAt]]) {
+    const lp = m.liquidationPrice(p, ledger(opened.state), T1);
+    const step = 100_000n; // $0.10
+    const worse = p.isLong ? lp - step : lp + step;
+    const better = p.isLong ? lp + step : lp - step;
+    const tryAt = (price) => {
+      const state = priceAt(price);
+      const l = ledger(state);
+      const pnl = m.positionPnl(p.isLong, SIZE, PRICE, price, l.maxPayout);
+      return liquidate(state, { position: p, coin: p.isLong ? qualified : held(shortCoin, SIZE), pnl: pnl.pnl }).ok;
+    };
+    expect(`the circuit liquidates a ${name} $0.10 past its liquidationPrice, not $0.10 before`, tryAt(worse) && !tryAt(better), String(lp));
+  }
+}
+
+// ── core/perp.ts's order functions against the circuit ──────────────────────
+
+// placeOrder and cancelOrder run as the trader's client does, through a
+// handle whose callTx runs the circuit here instead of proving and submitting.
+// What that skips — proving, balancing, the wallet, the indexer — the devnet
+// script (npm run stoploss) covers. executeOrder's transport needs the SDK and
+// the indexer; the arguments it passes, from executeOrderCall, are checked here.
+
+console.log("\n  core/perp.ts order functions against the circuit\n");
+
+{
+  /** A ContractHandle on `state`: readLedger reads it, callTx runs circuits on it. */
+  const simulated = (state, caller = TRADER, time = T0) => {
+    const sim = { state, txs: 0 };
+    sim.handle = {
+      address: hex(bytes32(0x51)),
+      module: { pureCircuits, ledger },
+      providers: { publicDataProvider: { queryContractState: async () => ({ data: sim.state }) } },
+      deployed: {
+        callTx: new Proxy({}, {
+          get: (_target, circuit) => async (...args) => {
+            const r = callAt(time, caller, sim.state, circuit, ...args);
+            if (!r.ok) throw new Error(r.error);
+            sim.state = r.state;
+            sim.txs += 1;
+            return { public: { txHash: `sim-${sim.txs}` } };
+          },
+        }),
+      },
+    };
+    return sim;
+  };
+  /** The record the client saves at an open (core/positions.ts). */
+  const recordOf = (p, status = "open", secret = OWNER_SECRET) => ({
+    status,
+    contractAddress: hex(bytes32(0x51)),
+    networkId: "undeployed",
+    commitment: hex(pureCircuits.positionCommitment(p)),
+    opening: {
+      ownerSecret: hex(secret),
+      isLong: p.isLong,
+      size: String(p.size),
+      collateral: String(p.collateral),
+      openFee: String(p.openFee),
+      entryPrice: String(p.entryPrice),
+      openTime: String(p.openTime),
+      collateralNonce: hex(p.collateralNonce),
+      salt: hex(p.salt),
+      payTo: hex(p.payTo.bytes),
+    },
+    createdAt: "",
+  });
+  const rejects = async (f, pattern) => {
+    try {
+      await f();
+      return false;
+    } catch (error) {
+      return pattern.test(String(error instanceof Error ? error.message : error));
+    }
+  };
+  const keeperView = { module: { pureCircuits } };
+  const watching = (state) => {
+    const l = ledger(state);
+    return watchedOrders(keeperView, l, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, LIQUIDATOR_SECRET));
+  };
+
+  const longRecord = recordOf(position);
+  const shortRecord = recordOf(shortPosition);
+  const sim = simulated(opened.state);
+  expect("positionOf rebuilds the long from its record, commitment and all", hex(pureCircuits.positionCommitment(positionOf(sim.handle, longRecord))) === hex(commitment));
+  expect("and the short", hex(pureCircuits.positionCommitment(positionOf(sim.handle, shortRecord))) === hex(shortCommitment));
+  expect("(the ledger's liquidator key is the keeper's)", hex(ledger(opened.state).liquidator.x.toString(16)) === hex(LIQUIDATOR_KEY.x.toString(16)));
+
+  const STOP = 2_910_000_000n;
+  const TAKE = 3_150_000_000n;
+  const stop = await placeOrder(sim.handle, longRecord, "stopLoss", STOP);
+  expect("placeOrder places a long's stop loss", sim.txs === 1 && stop.index === 0 && stop.order.above === false && stop.order.price === STOP);
+  expect("its commitment is in the orders tree", ledger(sim.state).orders.findPathForLeaf(pureCircuits.orderCommitment(stop.order)) !== undefined);
+  const [seen] = watching(sim.state);
+  expect(
+    "the keeper rebuilds the order placeOrder sealed",
+    seen !== undefined && hex(pureCircuits.orderCommitment(seen.order)) === hex(pureCircuits.orderCommitment(stop.order))
+  );
+  const take = await placeOrder(sim.handle, longRecord, "takeProfit", TAKE, 1);
+  expect("a second order takes index 1: a long's take profit fires from below", take.order.above === true && take.index === 1);
+  expect("the keeper watches both", watching(sim.state).length === 2);
+  const recovered = findOwnOrderNote(pureCircuits, ledger(sim.state).orderNotes, LIQUIDATOR_KEY, (await deriveOrder(OWNER_SECRET, SALT, 1)).ephemeral);
+  expect("the trader recovers the take profit from the record alone", recovered !== null && recovered.price === TAKE && hex(recovered.salt) === hex(take.order.salt));
+
+  expect(
+    "placeOrder refuses a position that is not open, before any transaction",
+    (await rejects(() => placeOrder(sim.handle, recordOf(position, "closed"), "stopLoss", STOP, 2), /is closed/)) && sim.txs === 2
+  );
+  // The owner key is derived from the secret, so a wrong secret rebuilds a
+  // position whose commitment is not the order's.
+  expect(
+    "the circuit refuses a record with the wrong owner secret",
+    await rejects(() => placeOrder(sim.handle, recordOf(position, "open", bytes32(0x4b)), "stopLoss", STOP, 2), /another position/)
+  );
+
+  const beforeCancel = sim.state;
+  const cancelled = await cancelOrder(sim.handle, longRecord, stop.order);
+  expect("cancelOrder cancels it", cancelled === "sim-3" && ledger(sim.state).cancelledOrders.member(pureCircuits.orderNullifier(stop.order.salt)));
+  const left = watching(sim.state);
+  expect("the keeper now watches only the take profit", left.length === 1 && left[0].order.price === TAKE);
+
+  const shortSim = simulated(shortOpened.state);
+  const shortStop = await placeOrder(shortSim.handle, shortRecord, "stopLoss", 3_090_000_000n);
+  const shortTake = await placeOrder(shortSim.handle, shortRecord, "takeProfit", 2_850_000_000n, 1);
+  expect("on a short, placeOrder flips both directions", shortStop.order.above === true && shortTake.order.above === false);
+
+  // executeOrderCall: the arguments executeOrder submits, run through the circuit.
+  const runCall = (state, w, label) => {
+    const l = ledger(state);
+    const c = executeOrderCall(pureCircuits, l, w, USDC, 0n, T1);
+    const r = callAt(T1, KEEPER, state, "executeOrder", ...c.args);
+    expect(`${label}: the circuit accepts executeOrderCall's arguments`, r.ok, why(r));
+    if (r.ok) {
+      expect(
+        `${label}: and pays what it predicted`,
+        paidTo(r, TRADER) === c.settled.toTrader &&
+          paidTo(r, TREASURY) === c.settled.toTreasury &&
+          ledger(r.state).poolValue === l.poolValue + c.settled.toPool - c.settled.fromPool,
+        `trader ${paidTo(r, TRADER)} vs ${c.settled.toTrader}`
+      );
+    }
+    return c;
+  };
+  const priced = (state, price) => call(DEPLOYER, state, "setPrice", price, T0, ADMIN_SECRET).state;
+  const watched = (state, order) => watching(state).find((w) => hex(w.order.salt) === hex(order.salt));
+
+  const stopState = priced(beforeCancel, STOP - 3_000_000n);
+  const longStop = runCall(stopState, watched(stopState, stop.order), "long stop loss");
+  expect("(a loss)", !longStop.profit && longStop.pnl > 0n);
+  const takeState = priced(beforeCancel, TAKE + 3_000_000n);
+  const longTake = runCall(takeState, watched(takeState, take.order), "long take profit");
+  expect("(a profit)", longTake.profit && longTake.pnl > 0n);
+  const shortStopState = priced(shortSim.state, 3_100_000_000n);
+  runCall(shortStopState, watched(shortStopState, shortStop.order), "short stop loss");
+  const shortTakeState = priced(shortSim.state, 2_800_000_000n);
+  runCall(shortTakeState, watched(shortTakeState, shortTake.order), "short take profit");
+
+  const notPlaced = { ...watched(stopState, stop.order), order: { ...stop.order, price: STOP + 1n } };
+  let refused = false;
+  try {
+    executeOrderCall(pureCircuits, ledger(stopState), notPlaced, USDC, 0n, T1);
+  } catch (error) {
+    refused = /not in the tree/.test(error.message);
+  }
+  expect("executeOrderCall refuses an order that was never placed", refused);
 }
 
 // ── Fees beyond the collateral ──────────────────────────────────────────────
