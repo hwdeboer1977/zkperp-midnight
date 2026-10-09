@@ -38,8 +38,8 @@ export interface PositionRecord {
 }
 
 export interface PositionClosing {
-  /** Closed by its owner, or liquidated by the keeper. */
-  by: "trader" | "liquidation";
+  /** Closed by its owner, liquidated by the keeper, or by the keeper executing the owner's order. */
+  by: "trader" | "liquidation" | "stopLoss" | "takeProfit";
   exitPrice: string;
   /** Seconds since the epoch. */
   closeTime: string;

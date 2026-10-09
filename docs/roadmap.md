@@ -166,7 +166,9 @@ Tasks for the separate deployment:
 
 **Contract change:** yes. Ships with steps 3 and 4.
 
-**Status 2026-10-08:** stop loss and take profit built in the contract (`placeOrder`, `cancelOrder`, `executeOrder`), the core code, the keeper and the tests, and run on the devnet with the keeper service (`npm run stoploss -- --keeper`). Separate orders, not inside the position commitment. Not yet: the frontend, the execution fee, merging into `closePosition`. See `docs/privacy.md`, section 5.
+**Status 2026-10-08:** stop loss and take profit built in the contract (`placeOrder`, `cancelOrder`, `executeOrder`), the core code, the keeper and the tests, and run on the devnet with the keeper service (`npm run stoploss -- --keeper`). Separate orders, not inside the position commitment. See `docs/privacy.md`, section 5.
+
+**Status 2026-10-09:** the frontend sets, moves and cancels orders, and `preview` was redeployed with this contract. A take profit placed from the browser was executed there by the keeper (at a price set with `npm run price:preview`), and paid out exactly as computed. Not yet: the execution fee, merging into `closePosition`.
 
 Today only the owner can close a position (with the owner secret), and keepers can only liquidate. A take profit or stop loss must fire while the trader is offline, so a keeper has to send the close. A browser tab that closes the position itself needs no contract change, but fails exactly when the laptop is shut: at most an extra, not the feature.
 
@@ -196,7 +198,7 @@ Tasks:
 - [x] Contract: order commitment and note; cancel. Executed by its own circuit, `executeOrder`, for now.
 - [ ] Contract: merge execution into `closePosition`; execution fee to the keeper.
 - [x] Keeper: decrypt orders, watch the oracle, execute, retry on the next tick.
-- [ ] Frontend: TP and SL inputs in the order ticket (with the PnL at each level), lines on the candle chart, edit and cancel in Portfolio; history shows "take profit" or "stop loss" instead of "closed by trader".
+- [x] Frontend: a red "Set SL" and a green "Set TP" button on each open position (Trade page row, Portfolio card), with the PnL at the level; move (place the new order, then cancel the old) and cancel; lines on the candle chart; history shows "take profit" or "stop loss". Orders are set on open positions only: inputs in the order ticket as well were tried and dropped, because two places to set them was confusing.
 - [x] Tests: a stop loss and take profit fire only beyond the level; a keeper cannot place, move or fire an unmet order; the payout reaches the opener; a cancelled order cannot fire; the level is not published.
 - [ ] Tests: the execution fee reaches the keeper; `/check` fuzzing of the merged close circuit (both branches are evaluated in the proof).
 - [ ] Re-measure the close circuit's proving-key size when merging: it is already 38.8 MB, just above the 37 MB 1AM proved, so the trigger branch must stay small (no `slice`). As its own circuit, `executeOrder` is 76.7 MB, which only the keeper proves.
@@ -297,3 +299,79 @@ Launch:
 - [ ] The preview checks again on preprod: open, close, TP/SL, liquidation, recovery on a second browser.
 - [ ] A short trader guide: Docker proof server, 1AM set to Local, the password, what is private and what is not (linking `docs/privacy.md`).
 - [ ] Keep preview running until preprod is stable, then retire it (close positions, let LPs withdraw).
+
+## Running it 24/7: who proves what
+
+Written 2026-10-09, after the first take profit executed on `preview`. Not a step of its own; it shapes steps 4, 8 and 9.
+
+Every transaction carries zero-knowledge proofs, and a proof needs the circuit's private inputs. Who proves is therefore also who learns those inputs.
+
+### Traders
+
+A trader's open, close, `placeOrder` and `cancelOrder` take size, side, collateral and the owner secret as private inputs. Three places can prove them:
+
+| Prover | What the trader needs | Who sees the private inputs |
+|---|---|---|
+| A proof server on the trader's own machine (Docker) | Docker running | Only the trader |
+| The wallet's prover (1AM sends `/prove` to the proof server it is configured with) | Nothing extra | Whoever runs that proof server |
+| A hosted proof server, run by the operator or a third party | Nothing extra | Whoever runs that proof server |
+
+- This is the frontend's prover setting; the Privacy inspector says whether the prover is on this machine.
+- A remote prover learns the position, and with the owner secret it could close it early. It cannot take the money: the payout key is bound to the wallet that opened the position, and the circuit enforces it.
+- So Docker is needed for full privacy, not to trade at all. Most traders will not run Docker: a production deployment should offer a hosted prover as the default and local proving as the private option, and say plainly what each one reveals.
+- The browser proves only the trader's circuits. When 1AM proves them, the proving key travels with the request, and 1AM carried 37 MB but refused 81 MB (measured 2026-10-07): `placeOrder` (10 MB) and `cancelOrder` (5.2 MB) fit easily; `closePosition` (38.8 MB) is just above what was measured to work. With a local proof server, 1AM only balances and signs, so its limit does not apply.
+
+### Keepers
+
+A keeper is a server running 24/7:
+
+- the keeper service, which watches the chain and executes orders and liquidations;
+- its own proof server (Docker) on the same machine;
+- a wallet with NIGHT, for the DUST that pays transaction fees.
+
+Proving locally costs a keeper no privacy: it proves with what it already decrypted from its notes. A hosted prover would only add a dependency. The relayer and the treasury job can run on the same machines.
+
+Measured 2026-10-09 on `preview`, a take profit, keeper and proof server on one machine with 24 cores:
+
+| Step | Took |
+|---|---|
+| The price update lands, and the keeper's next check (every 15 s, `KEEPER_CHECK_MS`) sees it | ~23 s |
+| Eight small proofs in parallel: the transaction's coins | ~10 s |
+| **The `executeOrder` proof** | **31.6 s** |
+| One more small proof, submission, the block | ~18 s |
+
+About a minute from the keeper's decision to the payout. `executeOrder` is the contract's largest circuit (76.7 MB of proving key): it does a whole close, two Merkle paths (position and order), the PnL and fees, and three payouts.
+
+Sizing a keeper machine:
+
+- **CPU** sets the time to execute. Expect a 4–8 core VPS to be noticeably slower than the 24 cores measured; this is the machine to spend on.
+- **Memory:** the 77 MB key and the proving itself take several GB; start at 16 GB.
+- **Throughput:** one keeper proves its executions one after another. A sharp move that fires many stop losses at once queues them. Several keepers on separate machines (step 4) spread that load, and cover one being down.
+
+What would make an execution faster, by gain:
+
+1. **A smaller `executeOrder`** (or the merged close of step 6): proving time follows circuit size. A contract change.
+2. **Checking sooner:** a 3 s `KEEPER_CHECK_MS` saves up to 12 s per order at the cost of more indexer reads; reacting to each new block is better still.
+3. **Proof server tuning:** workers and CPU for the Docker container; helps the parallel small proofs more than the large one.
+
+Block time and finality are the network's.
+
+### Who runs what in production
+
+| Who | Runs |
+|---|---|
+| Trader | Browser and wallet; Docker for private proving, optionally |
+| Each keeper operator | A machine with the keeper service and a proof server; also the relayer, for an oracle signer |
+| The treasury | The treasury job |
+
+No keeper is trusted with funds: an order executes only once its level is reached, a liquidation only below maintenance margin, and the payout always goes to the trader's wallet. More keepers, even run by others, add speed and availability, not risk.
+
+Tasks:
+
+- [ ] A hosted proof server for traders who do not run Docker, behind HTTPS, with the frontend stating that it sees their positions.
+- [ ] A keeper machine spec and a deployment recipe (keeper, proof server, relayer; restart on failure; logs).
+- [x] A benchmark kit that needs no chain: capture a proving request once, replay it on any machine (`bench/`, with results). On a Ryzen 9 3900X, `executeOrder` takes 67.7 s on 1 vCPU, 23.5 s on 4, 16.2 s on 8, 12.8 s on 24; it flattens past 8 vCPUs, and needs about 4 GiB per proof in flight.
+- [ ] Run `bench/scale.sh` on rented candidates (Hetzner CCX, AWS c7a, GCP c3d) before choosing machines for step 9.
+- [ ] Keeper: prove several executions at once on a large machine (two at once on 24 vCPUs: 8.6 s per proof instead of 12.8 s); today it executes one after another.
+- [ ] Try a shorter `KEEPER_CHECK_MS`, or a block subscription, and measure the indexer load.
+
