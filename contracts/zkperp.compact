@@ -138,6 +138,26 @@ import CompactStandardLibrary;
 // position's size, direction, entry and collateral, and can tell when each one
 // closes. It cannot close a healthy position nor take any payout.
 //
+// ── Trigger orders: stop loss and take profit ──────────────────────────────
+//
+// The owner may attach an order to an open position: close it once the mark
+// price reaches a level, from below or from above. A long's stop loss and a
+// short's take profit fire at or below their level; a long's take profit and
+// a short's stop loss at or above. The trader is offline when it fires, so the
+// keeper executes it, with `executeOrder`, and the close settles exactly as
+// `closePosition` does, at the mark price, paying the position's `payTo`.
+//
+// An order exists on chain only as a commitment in `orders`, with a note
+// encrypted to the liquidator key (written by the trader, not the circuit: a
+// false note only stops the trader's own order from firing). Placing one needs
+// the owner secret, or the keeper, who knows every other field, could attach
+// an order at the current price and close any position. Cancelling publishes
+// the order's nullifier, from its salt, so it links to nothing.
+//
+// ⚠️ The keeper sees each order's level. The public sees that some position
+// got an order, and later that an order closed some position; executing
+// through its own circuit tells that the close was not the trader's own.
+//
 // Not yet here: funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
@@ -287,6 +307,32 @@ export struct LiquidatorNote {
 }
 export ledger liquidatorNotes: Set<LiquidatorNote>;
 
+// ── Trigger orders ─────────────────────────────────────────────────────────
+
+// Everything an order commits to. Never stored; only its hash is.
+export struct TriggerOrder {
+  // `positionCommitment` of the position it closes.
+  position: Bytes<32>;
+  // The mark price at which it fires, 6 decimals.
+  price: Uint<64>;
+  // Fires when the mark price is at or above `price` if true, at or below if
+  // false.
+  above: Boolean;
+  // Random, below the field size, as the keeper's note carries it.
+  salt: Bytes<32>;
+}
+
+// Commitments to every order ever placed; a Merkle tree, so executing proves
+// membership without naming the leaf.
+export ledger orders: HistoricMerkleTree<20, Bytes<32>>;
+
+// Nullifiers of cancelled orders; see `orderNullifier`.
+export ledger cancelledOrders: Set<Bytes<32>>;
+
+// One note per order for the keeper, in the liquidator note's format: see
+// `orderPlaintext` in core/orders.ts.
+export ledger orderNotes: Set<LiquidatorNote>;
+
 constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
@@ -357,6 +403,16 @@ export pure circuit positionCommitment(p: Position): Bytes<32> {
 // owner secret: a liquidation must be able to retire the position without it.
 export pure circuit positionNullifier(salt: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:nullifier:v2"), salt]);
+}
+
+export pure circuit orderCommitment(o: TriggerOrder): Bytes<32> {
+  return persistentHash<TriggerOrder>(o);
+}
+
+// Published when an order is cancelled. From the salt, which only the trader
+// and the keeper know, so it cannot be matched to the order's commitment.
+export pure circuit orderNullifier(salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:order:nullifier"), salt]);
 }
 
 // ── The liquidator's note ──────────────────────────────────────────────────
@@ -782,6 +838,55 @@ export circuit liquidatePosition(
 ): [] {
   retire(position, path);
   settle(position, collateral, pnl, closeFee, borrowFee, liquidationFee, closeTime, capacity, true);
+}
+
+// Attaches a trigger order to the caller's position; see "Trigger orders"
+// above. Proves ownership, so only the owner can place one. Does not check the
+// position is still open: an order on a closed position can never fire.
+export circuit placeOrder(position: Position, ownerSecret: Bytes<32>, order: TriggerOrder, note: LiquidatorNote): [] {
+  assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
+  assert(order.position == positionCommitment(position), "the order is for another position");
+  assert(order.price > 0, "the order's price must be positive");
+  orders.insert(disclose(orderCommitment(order)));
+  orderNotes.insert(disclose(note));
+}
+
+// Cancels an order, so it can no longer fire. Owner only, like placing one.
+export circuit cancelOrder(position: Position, ownerSecret: Bytes<32>, order: TriggerOrder): [] {
+  assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
+  assert(order.position == positionCommitment(position), "the order is for another position");
+  cancelledOrders.insert(disclose(orderNullifier(order.salt)));
+}
+
+// Closes a position whose order's price has been reached, without the owner
+// secret: the keeper knows the position from its liquidator note and the
+// order from its order note. Settles as `closePosition` does, at the mark
+// price, to the position's `payTo`.
+export circuit executeOrder(
+  position: Position,
+  path: MerkleTreePath<20, Bytes<32>>,
+  order: TriggerOrder,
+  orderPath: MerkleTreePath<20, Bytes<32>>,
+  collateral: QualifiedShieldedCoinInfo,
+  pnl: Uint<64>,
+  closeFee: Uint<64>,
+  borrowFee: Uint<64>,
+  closeTime: Uint<64>,
+  capacity: Uint<64>
+): [] {
+  assert(order.position == positionCommitment(position), "the order is for another position");
+  assert(orderPath.leaf == orderCommitment(order), "path is for a different order");
+  assert(
+    orders.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(orderPath))),
+    "no such order"
+  );
+  assert(!cancelledOrders.member(disclose(orderNullifier(order.salt))), "the order was cancelled");
+  // The price is read once, outside the condition: a ledger read inside a
+  // branch would publish which branch, and so the order's direction.
+  const mark = markPrice;
+  assert(order.above ? mark >= order.price : mark <= order.price, "the order's price has not been reached");
+  retire(position, path);
+  settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, capacity, false);
 }
 
 // Proves `position` is in `positions` without naming its leaf, and spends its

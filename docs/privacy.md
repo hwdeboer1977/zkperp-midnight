@@ -209,6 +209,30 @@ The local stack uses 2.5% maintenance and a 0.5% fee. The keeper is `services/ke
 - **`transientHash` is not promised to stay the same across compiler versions,** so the keeper decrypts each note when it appears.
 - **Cost:** the `openPosition` proving key is 10.5 MB, against 9.5 MB without a liquidator note. Close and liquidation are about 37 MB. See "Proof size" below for how it got there.
 
+### 5. Stop loss and take profit (built 2026-10-08, devnet)
+
+A trigger order closes a position once the mark price reaches a level: a long's stop loss and a short's take profit fire at or below it, the other two at or above. The trader is offline when it fires, so the keeper executes it.
+
+- **Placing** (`placeOrder`) needs the owner secret. Without that check the keeper, who knows every other field, could attach an order at the current price and close any position.
+- **The order is a commitment** in an `orders` tree: position, level, direction, salt. Its note uses the liquidator note's format, but the trader seals it, outside the circuit. A false note only stops the trader's own order from firing.
+- **Executing** (`executeOrder`) proves the order is in the tree, not cancelled, and reached at the mark price, then settles exactly as a close: at the mark price, paying the opener's `payTo`, with no liquidation fee.
+- **Cancelling** (`cancelOrder`, owner only) publishes the order's nullifier, from its salt, which links to nothing.
+- **Recovery:** each order's salt and ephemeral scalar are derived from the position's owner secret, its salt and the order's number, so the trader finds and reads their own orders on another device (`core/orders.ts`).
+
+**Who sees what:**
+
+- **The public** sees that some position got an order, and later that an order closed some position (the circuit name), but not the level, the direction or which position. The level is not in the placing or executing transcript (tested).
+- **The keeper** sees every order's level, on top of the position it already sees.
+
+**Limits, for now:**
+
+- It fills at the mark price, not the level. The oracle moves on a 0.5% move or the hourly heartbeat, so a stop can fill past its level.
+- A separate circuit tells the public that a close was an order's. Merging it into `closePosition` would hide that, at the cost of a larger close circuit.
+- No execution fee: the keeper is paid nothing for it yet (roadmap step 4).
+- `executeOrder`'s proving key is 76.7 MB, proven by the keeper on its own server; the trader's circuits are small (`placeOrder` 10 MB, `cancelOrder` 5.2 MB).
+
+Tests: `test/zkperp.test.mjs` ("trigger orders"), and `npm run stoploss` on the devnet, with `--keeper` to have the keeper service execute.
+
 ### Proof size, and 1AM's limit
 
 The first version of the liquidator note made `openPosition`'s proving key 81 MB. 1AM refused to prove it: **"Payload too large or too deeply nested"**. 1AM receives the key through the extension's messaging channel, which has a size limit.

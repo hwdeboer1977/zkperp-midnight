@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * The keeper: liquidates positions whose equity fell below maintenance margin.
+ * The keeper: liquidates positions whose equity fell below maintenance margin,
+ * and executes trigger orders (stop loss, take profit) whose level is reached.
  *
  *   npm run keeper
  *
@@ -12,7 +13,12 @@
  * tick submits `liquidatePosition` for those below maintenance at the current
  * price. The fee goes to the treasury; what equity remains goes to the trader.
  *
- * ⚠️ Whoever runs this sees every position. That is the trust the design
+ * Trigger orders come with a note of their own, sealed by the trader to the
+ * same key (core/orders.ts): the keeper matches it to its position by salt and
+ * submits `executeOrder` once the mark price reaches the order's level. The
+ * close pays the trader as their own close would.
+ *
+ * ⚠️ Whoever runs this sees every position, and every order's level. That is the trust the design
  * accepts; see docs/privacy.md.
  *
  * It decrypts each note once and keeps the plaintext in memory:
@@ -34,7 +40,10 @@ import { getDeployment } from "../../core/contracts.js";
 import {
   canLiquidate,
   circuitNow,
+  executeOrder,
   liquidatePosition,
+  orderFires,
+  watchedOrders,
   liquidationPrice,
   readLedger,
   watchedPositions,
@@ -80,6 +89,7 @@ async function main() {
   log(chalk.green(`keeper ready on ${perpAddress}, checking every ${CHECK_MS / 1000}s`));
 
   const seen = new Set<string>();
+  const seenOrders = new Set<string>();
   for (;;) {
     try {
       const ledger = await readLedger(perp);
@@ -93,7 +103,35 @@ async function main() {
             `from $${fmt(p.entryPrice)}, liquidation near $${fmt(liquidationPrice(p, ledger, circuitNow()))}`
         );
       }
-      for (const w of live.filter((x) => canLiquidate(ledger, x))) {
+      const orders = watchedOrders(perp, ledger, secret, live);
+      for (const o of orders) {
+        const id = Buffer.from(o.view.salt).toString("hex");
+        if (seenOrders.has(id)) continue;
+        seenOrders.add(id);
+        log(
+          `watching an order on ${o.position.commitment.slice(0, 12)}…: close at or ${o.order.above ? "above" : "below"} $${fmt(o.order.price)}`
+        );
+      }
+      // An order that fires on a position also below maintenance is executed,
+      // not liquidated: the trader asked for this close, and it costs no fee.
+      const executed = new Set<string>();
+      for (const o of orders.filter((x) => orderFires(ledger, x))) {
+        if (executed.has(o.position.commitment)) continue;
+        executed.add(o.position.commitment);
+        log(chalk.yellow(`executing an order on ${o.position.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
+        try {
+          const r = await executeOrder(perp, o, usdc, treasuryEncKey);
+          log(
+            chalk.green(
+              `executed on ${o.position.commitment.slice(0, 12)}…: ${r.profit ? "profit" : "loss"} ${fmt(r.pnl)}, ` +
+                `${fmt(r.settled.toTreasury)} to the treasury, ${fmt(r.settled.toTrader)} to the trader (tx ${r.txHash.slice(0, 12)}…)`
+            )
+          );
+        } catch (error) {
+          log(chalk.red(`order execution failed: ${error instanceof Error ? error.message : String(error)}`));
+        }
+      }
+      for (const w of live.filter((x) => !executed.has(x.commitment) && canLiquidate(ledger, x))) {
         log(chalk.yellow(`liquidating ${w.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
         try {
           const r = await liquidatePosition(perp, w, usdc, treasuryEncKey);

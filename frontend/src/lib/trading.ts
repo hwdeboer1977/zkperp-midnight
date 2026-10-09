@@ -195,6 +195,9 @@ async function contractCoinLeaves(perp: ContractHandle): Promise<Map<string, num
   return leaves;
 }
 
+// The runtime returns the commitment as a field-style value, with its trailing
+// zero bytes trimmed: one coin in 256 ends in a zero byte and would never
+// match the indexer's 32 bytes. Padded back to 64 hex characters.
 function contractCoinCommitment(coin: { nonce: Uint8Array; color: Uint8Array; value: bigint }, contractAddress: string): string {
   return hex(
     runtimeCoinCommitment(
@@ -209,7 +212,7 @@ function contractCoinCommitment(coin: { nonce: Uint8Array; color: Uint8Array; va
         alignment: ShieldedCoinRecipientDescriptor.alignment(),
       } as any
     ).value[0] as Uint8Array
-  );
+  ).padEnd(64, "0");
 }
 
 async function collateralIndex(perp: ContractHandle, coin: { nonce: Uint8Array; color: Uint8Array; value: bigint }): Promise<bigint> {

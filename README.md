@@ -56,6 +56,8 @@ The cap is a constant rather than a multiple of collateral on purpose. A positio
 
 **Liquidation.** A position whose equity falls below 2.5% of its size can be closed by a keeper without the owner secret (`liquidatePosition`). Every open writes a second note, encrypted in the circuit to the keeper's key, holding the position without the owner secret; the keeper (`npm run keeper`) decrypts these, watches the price, and liquidates. A 0.5% fee goes to the treasury, and what equity is left goes to the trader. The keeper sees every position, which is a trust assumption like the treasury's; see `docs/privacy.md`. `npm run liquidation` runs the whole path on the local stack.
 
+**Stop loss and take profit.** The owner can attach an order to an open position (`placeOrder`): close it once the mark price reaches a level. The keeper reads the order from a note sealed to its key and executes it (`executeOrder`), settling as a normal close to the opener's wallet; the public does not see the level. `npm run stoploss` runs it on the local stack (add `--keeper` to let the running keeper service execute). See `docs/privacy.md`.
+
 ## What is public, and what is not
 
 | Public | Private |
@@ -172,7 +174,7 @@ The same stack runs on Midnight's public `preview` network; the scripts and serv
 3. Run `npm run relayer:preview`, `npm run treasury:preview` and `npm run keeper:preview`, each in its own terminal.
 4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the local proof server did not answer and 1AM's hosted prover, which sees your positions, is in use.
 
-The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`) refuse to run against `preview`.
+The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`, `stoploss`) refuse to run against `preview`.
 
 ## Not built yet
 

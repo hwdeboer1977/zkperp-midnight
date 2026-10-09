@@ -20,6 +20,7 @@ import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js-contr
 import { confirmOpen, markClosed, markFailed, recordPending, type PositionRecord } from "./positions.js";
 import { NOTE_BYTES } from "./notes.js";
 import { belowField, decodeLiquidatorPlaintext, randomScalar, type LiquidatorView } from "./liquidatorNote.js";
+import { deriveOrder, firesAbove, openOrderNote, orderReached, sealOrderNote, type OrderView, type TriggerOrder } from "./orders.js";
 import {
   borrowFeeOf,
   capacityOf,
@@ -189,6 +190,9 @@ async function contractCoinLeaves(perp: ContractHandle): Promise<Map<string, num
 }
 
 /** The commitment of a coin owned by `contractAddress`, hex. */
+// The runtime returns the commitment as a field-style value, with its trailing
+// zero bytes trimmed: one coin in 256 ends in a zero byte and would never
+// match the indexer's 32 bytes. Padded back to 64 hex characters.
 function contractCoinCommitment(
   coin: { nonce: Uint8Array; color: Uint8Array; value: bigint },
   contractAddress: string
@@ -207,7 +211,7 @@ function contractCoinCommitment(
         alignment: ShieldedCoinRecipientDescriptor.alignment(),
       } as any
     ).value[0] as Uint8Array
-  );
+  ).padEnd(64, "0");
 }
 
 /** Where the collateral coin sits in the Zswap tree. Waits out indexer lag. */
@@ -409,4 +413,136 @@ export async function liquidatePosition(
     }
   );
   return { txHash: tx.public.txHash, pnl, liquidationFee, settled };
+}
+
+// ── Trigger orders: stop loss and take profit ────────────────────────────────
+
+export interface Placed {
+  txHash: string;
+  order: TriggerOrder;
+  /** Which of the position's orders this is; it derives the order's salt and note. */
+  index: number;
+}
+
+/**
+ * Attaches a stop loss or take profit to the trader's open position. The
+ * keeper executes it once the mark price reaches `price`; see `executeOrder`
+ * in the contract. `index` numbers the position's orders (0 for the first);
+ * a cancelled order's index is not reused.
+ */
+export async function placeOrder(
+  perp: ContractHandle,
+  record: PositionRecord,
+  kind: "stopLoss" | "takeProfit",
+  price: bigint,
+  index = 0
+): Promise<Placed> {
+  if (record.status !== "open") throw new Error(`position ${record.commitment.slice(0, 12)}… is ${record.status}`);
+  const position = positionOf(perp, record);
+  const ownerSecret = bytes(record.opening.ownerSecret);
+  const { salt, ephemeral } = await deriveOrder(ownerSecret, position.salt, index);
+  const order: TriggerOrder = { position: bytes(record.commitment), price, above: firesAbove(position.isLong, kind), salt };
+  const ledger = await readLedger(perp);
+  const note = sealOrderNote(perp.module.pureCircuits, ledger.liquidator, position.salt, order, ephemeral);
+  const tx = await perp.deployed.callTx.placeOrder(position, ownerSecret, order, note);
+  return { txHash: tx.public.txHash, order, index };
+}
+
+/** Cancels `order` on the trader's position, so it can no longer fire. */
+export async function cancelOrder(perp: ContractHandle, record: PositionRecord, order: TriggerOrder): Promise<string> {
+  const tx = await perp.deployed.callTx.cancelOrder(positionOf(perp, record), bytes(record.opening.ownerSecret), order);
+  return tx.public.txHash;
+}
+
+/** A live order the keeper can execute: its note opened, in the tree, not cancelled, its position live. */
+export interface WatchedOrder {
+  order: TriggerOrder;
+  view: OrderView;
+  position: Watched;
+}
+
+/** Every live order whose note opens under `secret`, matched to the live positions in `live`. */
+export function watchedOrders(perp: ContractHandle, ledger: any, secret: bigint, live: Watched[]): WatchedOrder[] {
+  const bySalt = new Map(live.map((w) => [hex(w.position.salt), w]));
+  const out: WatchedOrder[] = [];
+  for (const note of ledger.orderNotes as Iterable<any>) {
+    let view: OrderView;
+    try {
+      view = openOrderNote(perp.module.pureCircuits, note, secret);
+    } catch {
+      continue;
+    }
+    const position = bySalt.get(hex(view.positionSalt));
+    if (!position) continue;
+    const order: TriggerOrder = { position: bytes(position.commitment), price: view.price, above: view.above, salt: view.salt };
+    if (!ledger.orders.findPathForLeaf(perp.module.pureCircuits.orderCommitment(order))) continue;
+    if (ledger.cancelledOrders.member(perp.module.pureCircuits.orderNullifier(view.salt))) continue;
+    out.push({ order, view, position });
+  }
+  return out;
+}
+
+/** Whether `w` fires at the ledger's mark price. */
+export const orderFires = (ledger: any, w: WatchedOrder) => orderReached(w.order, ledger.markPrice);
+
+export interface Executed {
+  txHash: string;
+  profit: boolean;
+  pnl: bigint;
+  exit: bigint;
+  settled: ReturnType<typeof settlement>;
+}
+
+/**
+ * Executes `w` at the current mark price, from the keeper's wallet behind
+ * `perp.providers`: closes its position as the trader's own close would, and
+ * pays the trader's `payTo`, encrypted to the key the liquidator note carries.
+ */
+export async function executeOrder(
+  perp: ContractHandle,
+  w: WatchedOrder,
+  usdc: Uint8Array,
+  treasuryEncKey: string
+): Promise<Executed> {
+  const ledger = await readLedger(perp);
+  const p = w.position.position;
+  const path = ledger.positions.findPathForLeaf(bytes(w.position.commitment));
+  if (!path) throw new Error("the position's commitment is not in the tree");
+  const orderPath = ledger.orders.findPathForLeaf(perp.module.pureCircuits.orderCommitment(w.order));
+  if (!orderPath) throw new Error("the order's commitment is not in the tree");
+  const coin = { nonce: p.collateralNonce, color: usdc, value: p.collateral + p.openFee };
+  const mt_index = await collateralIndex(perp, coin);
+
+  const exit: bigint = ledger.markPrice;
+  const { profit, pnl } = positionPnl(p.isLong, p.size, p.entryPrice, exit, ledger.maxPayout);
+  const closeTime = circuitNow();
+  const closeFee = closeFeeOf(p.size, BigInt(ledger.closeFeeBps));
+  const borrowFee = borrowFeeOf(p.size, BigInt(ledger.borrowRate), closeTime - p.openTime);
+  const settled = settlement(p, { profit, pnl }, closeFee, borrowFee);
+  const capacity = capacityOf(ledger.poolValue + settled.toPool - settled.fromPool, ledger.maxPayout);
+
+  const tx: any = await withContractScopedTransaction(
+    perp.providers,
+    (txCtx: any) =>
+      perp.deployed.callTx.executeOrder(
+        txCtx,
+        p,
+        path,
+        w.order,
+        orderPath,
+        { ...coin, mt_index },
+        pnl,
+        closeFee,
+        borrowFee,
+        closeTime,
+        capacity
+      ),
+    {
+      additionalCoinEncPublicKeyMappings: new Map([
+        [hex(ledger.treasury.bytes), treasuryEncKey],
+        [hex(p.payTo.bytes), hex(w.position.payToEnc)],
+      ]),
+    }
+  );
+  return { txHash: tx.public.txHash, profit, pnl, exit, settled };
 }
