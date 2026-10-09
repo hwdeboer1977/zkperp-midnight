@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Fragment, useEffect, useState } from "react";
-import { fmt6 } from "../lib/bytes";
+import { fmt6, parse6 } from "../lib/bytes";
 import { contractModule } from "../lib/contracts";
 import { useLedger, useNow } from "../lib/hooks";
 import { backupFile, type PositionRecord } from "../lib/positions";
@@ -9,6 +9,7 @@ import { usePositionKey } from "../lib/positionKey";
 import { usePositions } from "../lib/usePositions";
 import { circuitNow, liquidationPrice, positionPnl } from "@core/math";
 import { PriceMovedError, closePosition, quoteClose } from "../lib/trading";
+import { KIND_LABEL, cancelOrder, checkLevel, liveOrders, placeOrder, replaceOrder, useOrders, type OrderKind, type OwnOrder } from "../lib/orders";
 import { proverLabel, useWallet } from "../lib/wallet";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
@@ -93,8 +94,14 @@ function CloseControls({ c, ledger, label = "Close" }: { c: ReturnType<typeof us
 /** An open position as a table row (the Trade page's compact list). */
 export function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; ledger: any; onClosed: () => void }) {
   const c = useClose(record, ledger, onClosed);
+  const orders = useOrders(record, ledger);
+  const live = orders ? liveOrders(orders) : null;
+  // Which order the panel under the row edits; null when closed.
+  const [editing, setEditing] = useState<OrderKind | null>(null);
+  const toggle = (kind: OrderKind) => setEditing(editing === kind ? null : kind);
   const o = record.opening;
   return (
+    <Fragment>
     <tr>
       <td className={`text ${o.isLong ? "long" : "short"}`}>{o.isLong ? "Long" : "Short"}</td>
       <td>{fmt6(BigInt(o.size))}</td>
@@ -113,6 +120,20 @@ export function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; 
         {c.pnl === null ? "…" : signed(c.pnl)}
         {c.quote?.capped && <small> capped</small>}
       </td>
+      <td className="text" title="Stop loss and take profit on this position">
+        {live === null ? (
+          "…"
+        ) : (
+          <span className="order-buttons">
+            <button type="button" className={`small order-btn sl ${editing === "stopLoss" ? "on" : ""}`} onClick={() => toggle("stopLoss")}>
+              {live.stopLoss ? `SL ${fmt6(live.stopLoss.order.price, 0)}` : "Set SL"}
+            </button>
+            <button type="button" className={`small order-btn tp ${editing === "takeProfit" ? "on" : ""}`} onClick={() => toggle("takeProfit")}>
+              {live.takeProfit ? `TP ${fmt6(live.takeProfit.order.price, 0)}` : "Set TP"}
+            </button>
+          </span>
+        )}
+      </td>
       <td>{c.quote ? fmt6(c.quote.closeFee + c.quote.borrowFee, 4) : "…"}</td>
       <td>
         <b>{c.quote ? fmt6(c.quote.settled.toTrader) : "…"}</b>
@@ -121,6 +142,188 @@ export function OpenRow({ record, ledger, onClosed }: { record: PositionRecord; 
         <CloseControls c={c} ledger={ledger} />
       </td>
     </tr>
+    {editing && (
+      <tr className="details">
+        <td colSpan={9} className="text">
+          <OrderPanel key={editing} record={record} ledger={ledger} liq={c.liq} only={editing} onDone={() => setEditing(null)} />
+        </td>
+      </tr>
+    )}
+    </Fragment>
+  );
+}
+
+/** One order kind on a position: its level, and setting, moving or cancelling it. */
+function OrderLine({
+  record,
+  ledger,
+  kind,
+  current,
+  liq,
+  busy,
+  run,
+  startEditing = false,
+  onDone,
+}: {
+  record: PositionRecord;
+  ledger: any;
+  kind: OrderKind;
+  current: OwnOrder | undefined;
+  liq: bigint | null;
+  busy: boolean;
+  run: (label: string, f: (perp: any, step: (s: string) => void) => Promise<unknown>) => Promise<boolean>;
+  startEditing?: boolean;
+  onDone?: () => void;
+}) {
+  const w = useWallet();
+  const [editing, setEditing] = useState(startEditing && !current);
+  const [text, setText] = useState("");
+  const o = record.opening;
+  const price = parse6(text);
+  const check = editing && ledger && price !== undefined ? checkLevel(kind, o.isLong, price, ledger.markPrice, liq) : null;
+  const label = KIND_LABEL[kind];
+  /** The PnL before fees if the order fires at `p`. */
+  const pnlAt = (p: bigint) => {
+    const q = positionPnl(o.isLong, BigInt(o.size), BigInt(o.entryPrice), p, ledger.maxPayout);
+    return q.profit ? q.pnl : -q.pnl;
+  };
+  const move = (p: bigint) => (Number(p - BigInt(o.entryPrice)) / Number(BigInt(o.entryPrice))) * 100;
+
+  async function save() {
+    if (price === undefined || check?.error) return;
+    const ok = await run(current ? `Moving the ${label}` : `Placing the ${label}`, (perp, step) =>
+      current
+        ? replaceOrder(perp, record, current, price, (s) => step(s === 1 ? `Placing the new ${label} (1 of 2)` : `Cancelling the old ${label} (2 of 2)`))
+        : placeOrder(perp, record, kind, price)
+    );
+    if (ok) (setEditing(false), setText(""), onDone?.());
+  }
+
+  return (
+    <div className="order-line">
+      <span className={`order-kind ${kind === "stopLoss" ? "bad" : "good"}`}>{kind === "stopLoss" ? "Stop loss" : "Take profit"}</span>
+      {!editing ? (
+        <>
+          <span className="order-level">
+            {current ? (
+              <>
+                <b>${fmt6(current.order.price)}</b>{" "}
+                <small className="muted">
+                  {move(current.order.price) >= 0 ? "+" : ""}
+                  {move(current.order.price).toFixed(1)}% from entry
+                  {ledger && <> · {signed(pnlAt(current.order.price))} before fees</>}
+                </small>
+              </>
+            ) : (
+              <span className="muted">none</span>
+            )}
+          </span>
+          {w.api && (
+            <span className="order-actions">
+              <button className="small" disabled={busy || !ledger} onClick={() => (setEditing(true), setText(current ? fmt6(current.order.price).replace(/,/g, "") : ""))}>
+                {current ? "Move" : "Set"}
+              </button>
+              {current && (
+                <button
+                  className="small ghost"
+                  disabled={busy}
+                  onClick={async () => {
+                    if (await run(`Cancelling the ${label}`, (perp) => cancelOrder(perp, record, current.order))) onDone?.();
+                  }}
+                >
+                  Cancel
+                </button>
+              )}
+            </span>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="input-unit order-input">
+            <span>$</span>
+            <input autoFocus value={text} onChange={(e) => setText(e.target.value)} inputMode="decimal" placeholder={kind === "stopLoss" ? (o.isLong ? "below the price" : "above the price") : o.isLong ? "above the price" : "below the price"} />
+          </span>
+          <span className="order-actions">
+            <button className="small" disabled={busy || price === undefined || !!check?.error} onClick={() => void save()}>
+              {current ? "Move" : "Place"}
+            </button>
+            <button className="small ghost" disabled={busy} onClick={() => (current || !onDone ? setEditing(false) : onDone())}>
+              Back
+            </button>
+          </span>
+          {check?.error && <small className="bad order-note">{check.error}</small>}
+          {check?.warning && <small className="warn-text order-note">{check.warning}</small>}
+          {price !== undefined && !check?.error && ledger && (
+            <small className="muted order-note">
+              Fires at ${fmt6(price)}: {signed(pnlAt(price))} pUSDC before fees. The level is sealed to the keeper; nobody else sees it.
+            </small>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** A position's stop loss and take profit. */
+function OrderPanel({
+  record,
+  ledger,
+  liq,
+  only,
+  onDone,
+}: {
+  record: PositionRecord;
+  ledger: any;
+  liq: bigint | null;
+  /** Show just this kind, ready to edit (the Trade page's row buttons). */
+  only?: OrderKind;
+  onDone?: () => void;
+}) {
+  const w = useWallet();
+  const orders = useOrders(record, ledger);
+  const live = orders ? liveOrders(orders) : null;
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const busy = status !== null;
+
+  async function run(label: string, f: (perp: any, step: (s: string) => void) => Promise<unknown>): Promise<boolean> {
+    setError(null);
+    setStatus(`${label}: proving on ${proverLabel(w.prover)}${w.walletProves ? ", through your wallet" : ""}…`);
+    try {
+      const perp = await w.contract("zkperp");
+      await f(perp, (s) => setStatus(`${s}: proving on ${proverLabel(w.prover)}…`));
+      setStatus(null);
+      return true;
+    } catch (e: any) {
+      setStatus(null);
+      setError(e?.message ?? String(e));
+      return false;
+    }
+  }
+
+  return (
+    <div className="pos-orders">
+      {live === null ? (
+        <small className="muted">Reading orders…</small>
+      ) : (
+        (only ? [only] : (["stopLoss", "takeProfit"] as OrderKind[])).map((kind) => (
+          <OrderLine
+            key={kind}
+            record={record}
+            ledger={ledger}
+            kind={kind}
+            current={live[kind]}
+            liq={liq}
+            busy={busy}
+            run={run}
+            startEditing={!!only}
+            onDone={onDone}
+          />
+        ))
+      )}
+      {status && <small className="muted">{status}</small>}
+      {error && <small className="bad">Failed: {error}</small>}
+    </div>
   );
 }
 
@@ -188,6 +391,7 @@ function OpenCard({ record, ledger, onClosed }: { record: PositionRecord; ledger
           <CloseControls c={c} ledger={ledger} label="Close position" />
         </div>
       </div>
+      <OrderPanel record={record} ledger={ledger} liq={c.liq} />
     </div>
   );
 }
@@ -200,7 +404,16 @@ function HistoryRow({ record }: { record: PositionRecord }) {
   const posted = postedOf(record);
   const net = c ? BigInt(c.received) - posted : null;
   const approx = c && !c.exact ? "≈ " : "";
-  const outcome = record.status !== "closed" ? record.status : !c ? "closed" : c.by === "liquidation" ? "liquidated" : "closed";
+  const outcome =
+    record.status !== "closed"
+      ? record.status
+      : !c
+        ? "closed"
+        : c.by === "liquidation"
+          ? "liquidated"
+          : c.by === "stopLoss" || c.by === "takeProfit"
+            ? KIND_LABEL[c.by]
+            : "closed";
   return (
     <Fragment>
       <tr className={c ? "expandable" : ""} onClick={() => c && setOpen(!open)}>
@@ -221,7 +434,7 @@ function HistoryRow({ record }: { record: PositionRecord }) {
           {net === null ? "" : `${net >= 0n ? "+" : "−"}${pct(net >= 0n ? net : -net, posted).toFixed(2)}%`}
         </td>
         <td>
-          <span className={`chip ${c?.by === "liquidation" ? "bad" : record.status === "failed" ? "warn" : c ? "good" : ""}`}>{outcome}</span>
+          <span className={`chip ${c?.by === "liquidation" ? "bad" : c?.by === "stopLoss" || record.status === "failed" ? "warn" : c ? "good" : ""}`}>{outcome}</span>
         </td>
         <td className="text muted">{c ? (open ? "▾" : "▸") : ""}</td>
       </tr>
@@ -277,7 +490,8 @@ function HistoryRow({ record }: { record: PositionRecord }) {
               <dl>
                 <dt>Closed</dt>
                 <dd className="text">
-                  {new Date(Number(c.closeTime) * 1000).toLocaleString()} {c.by === "liquidation" ? "by the keeper" : "by you"}
+                  {new Date(Number(c.closeTime) * 1000).toLocaleString()}{" "}
+                  {c.by === "liquidation" ? "by the keeper" : c.by === "trader" ? "by you" : `by the keeper, executing your ${KIND_LABEL[c.by]}`}
                 </dd>
                 <dt>Held</dt>
                 <dd>{((Number(c.closeTime) - Number(o.openTime)) / 3600).toFixed(1)} h</dd>

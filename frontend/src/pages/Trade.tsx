@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { circuitNow, closeFeeOf, liquidationPrice, openFeeOf, positionPnl } from "@core/math";
 import { fmt6, parse6 } from "../lib/bytes";
@@ -10,7 +10,9 @@ import { PriceMovedError, openPosition } from "../lib/trading";
 import { usePositionKey } from "../lib/positionKey";
 import { usePositions } from "../lib/usePositions";
 import { balanceOf, proverLabel, useWallet } from "../lib/wallet";
-import { CandleChart } from "../components/CandleChart";
+import { CandleChart, type Level } from "../components/CandleChart";
+import { liveOrders, ordersOf } from "../lib/orders";
+import { contractModule } from "../lib/contracts";
 import { TxProgress, useTxProgress } from "../components/TxProgress";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { ProverLine, ProverSetup, WhyDocker } from "../components/ProverSetup";
@@ -135,6 +137,8 @@ export default function TradePage() {
     }
   }
 
+  const levels = useOrderLevels(positions.open, ledger);
+
   const side = isLong ? "long" : "short";
   const signed = (v: bigint) => `${v >= 0n ? "+" : "−"}${fmt6(v >= 0n ? v : -v)}`;
 
@@ -213,7 +217,7 @@ export default function TradePage() {
             </div>
           )}
           {marketError && <p className="muted" style={{ fontSize: 13 }}>Live market data unavailable: {marketError}</p>}
-          <CandleChart candles={candles} oracle={oracle} />
+          <CandleChart candles={candles} oracle={oracle} levels={levels} />
         </section>
 
         <section className="card">
@@ -256,6 +260,7 @@ export default function TradePage() {
                     <th>Collateral</th>
                     <th>Entry</th>
                     <th>PnL now</th>
+                    <th>SL / TP</th>
                     <th>Fees to close</th>
                     <th>You receive</th>
                     <th></th>
@@ -299,7 +304,11 @@ export default function TradePage() {
             </div>
             <div>
               <b>The keeper</b>
-              <p>Decrypts its note: size, side, collateral, entry and payout key — enough to liquidate, never the owner secret, so it cannot close for you.</p>
+              <p>
+                Decrypts its note: size, side, collateral, entry and payout key — enough to liquidate, never the owner secret, so it
+                cannot close for you. It also reads your stop loss and take profit levels, to execute them; the public sees only
+                that an order was placed.
+              </p>
             </div>
             <div>
               <b>At close</b>
@@ -413,6 +422,7 @@ export default function TradePage() {
                 Open a <b className={side}>{side}</b> of <b>{fmt6(plan.size)} pUSDC</b> at <b>${fmt6(ledger.markPrice)}</b>,
                 posting <b>{fmt6(coin ?? 0n)} pUSDC</b>. If the price changes while proving, nothing opens and you are asked
                 again.
+
                 {deviates && market !== null && (
                   <span className="warn-text">
                     {" "}
@@ -444,7 +454,7 @@ export default function TradePage() {
           {opened && (
             <div className="banner ok">
               Position opened ({opened.slice(0, 12)}…). Its opening is on chain, encrypted to your password: with the password
-              and this wallet you can close it from any computer.
+              and this wallet you can close it from any computer. Set a stop loss or take profit with the buttons in its row.
             </div>
           )}
         </section>
@@ -452,4 +462,29 @@ export default function TradePage() {
     </div>
     </>
   );
+}
+
+/** Lines on the chart for the open positions' live orders. */
+function useOrderLevels(open: { commitment: string }[], ledger: any): Level[] {
+  const [levels, setLevels] = useState<Level[]>([]);
+  const version = ledger ? `${open.map((r) => r.commitment).join(",")}:${ledger.orderNotes.size()}:${ledger.cancelledOrders.size()}` : "";
+  useEffect(() => {
+    if (!ledger) return;
+    let live = true;
+    void contractModule("zkperp").then(async (module) => {
+      const out: Level[] = [];
+      for (const r of open as any[]) {
+        const l = liveOrders(await ordersOf(module, ledger, r));
+        const side = r.opening.isLong ? "long" : "short";
+        if (l.stopLoss) out.push({ price: Number(l.stopLoss.order.price) / 1e6, title: `SL ${side}`, tone: "bad" });
+        if (l.takeProfit) out.push({ price: Number(l.takeProfit.order.price) / 1e6, title: `TP ${side}`, tone: "good" });
+      }
+      if (live) setLevels(out);
+    }, () => {});
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [version]);
+  return levels;
 }
