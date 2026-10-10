@@ -5,13 +5,13 @@ import { defineConfig, createLogger } from "vite";
 import react from "@vitejs/plugin-react";
 import wasm from "vite-plugin-wasm";
 
-// compact-runtime's sourcemaps point at files it does not ship; harmless noise.
+// compact-runtime's sourcemaps, and the compiled contract's, point at files
+// that are not shipped; harmless noise. Vite reports them through warnOnce.
 const logger = createLogger();
-const warn = logger.warn;
-logger.warn = (msg, options) => {
-  if (msg.includes("points to missing source files")) return;
-  warn(msg, options);
-};
+const noise = (msg: string) => msg.includes("points to missing source files");
+const { warn, warnOnce } = logger;
+logger.warn = (msg, options) => noise(msg) || warn(msg, options);
+logger.warnOnce = (msg, options) => noise(msg) || warnOnce(msg, options);
 
 export default defineConfig({
   customLogger: logger,
@@ -44,6 +44,7 @@ export default defineConfig({
     proxy: {
       "/svc/relayer": { target: "http://127.0.0.1:3010", rewrite: (p) => p.replace(/^\/svc\/relayer/, "") },
       "/svc/treasury": { target: "http://127.0.0.1:3011", rewrite: (p) => p.replace(/^\/svc\/treasury/, "") },
+      "/svc/keeper": { target: "http://127.0.0.1:3012", rewrite: (p) => p.replace(/^\/svc\/keeper/, "") },
     },
   },
 });

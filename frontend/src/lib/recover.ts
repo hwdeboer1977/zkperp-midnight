@@ -11,6 +11,10 @@
  *     and the rebuilt commitment must be in the tree. If it is not, the
  *     position was opened from another wallet and is skipped; this wallet
  *     could not be paid by its close anyway.
+ *   · A limit order's note (`kind: "limit"`) becomes a position once the
+ *     keeper fills it: its fields, at the entry price and open time the fill
+ *     published in `limitFills`. Until then it is retried on every poll; the
+ *     waiting order itself is limits.ts's.
  *   · `settleClosed` marks records closed whose nullifier has appeared, so a
  *     position closed on another device stops showing as open here.
  *
@@ -50,16 +54,22 @@ export async function recoverPositions(
   for (const note of ledger.notes as Iterable<Uint8Array>) {
     const id = `${payTo}:${hex(note)}`;
     if (seen.has(id)) continue;
-    seen.add(id);
     const record = await recordFromNote(module, ledger, key, contract, note, contractAddress, networkId, payTo);
+    // A waiting limit order may fill later: look again next poll.
+    if (record === WAITING) continue;
+    seen.add(id);
     if (record && (await mergePosition(record, existing.get(record.commitment)))) changed += 1;
   }
   return changed;
 }
 
+/** A limit order's note whose order has not filled yet, nor been cancelled. */
+const WAITING = "waiting" as const;
+
 /**
  * The record a note describes, if it opens under `key` and its position is
- * this wallet's (its rebuilt commitment is in the tree); null otherwise.
+ * this wallet's (its rebuilt commitment is in the tree); null otherwise, or
+ * WAITING for a limit order that may still fill.
  */
 async function recordFromNote(
   module: Module,
@@ -70,25 +80,32 @@ async function recordFromNote(
   contractAddress: string,
   networkId: string,
   payTo: string
-): Promise<PositionRecord | null> {
+): Promise<PositionRecord | null | typeof WAITING> {
   const o = await openNote(key, contract, note);
   if (!o) return null;
   const s = await secretsOf(key, o.seed);
+  let { entryPrice, openTime } = o;
+  if (o.kind === "limit") {
+    const nullifier = module.pureCircuits.limitNullifier(s.salt);
+    if (!ledger.limitFills.member(nullifier)) return ledger.limitDone.member(nullifier) ? null : WAITING;
+    ({ entryPrice, openTime } = ledger.limitFills.lookup(nullifier));
+  }
   const record: PositionRecord = {
     status: "open",
     contractAddress,
     networkId,
     commitment: "",
     // The open time is the closest thing to a creation time the note has.
-    createdAt: new Date(Number(o.openTime) * 1000).toISOString(),
+    createdAt: new Date(Number(openTime) * 1000).toISOString(),
+    ...(o.kind === "limit" ? { via: "limit" as const } : {}),
     opening: {
       ownerSecret: hex(s.ownerSecret),
       isLong: o.isLong,
       size: o.size.toString(),
       collateral: o.collateral.toString(),
       openFee: o.openFee.toString(),
-      entryPrice: o.entryPrice.toString(),
-      openTime: o.openTime.toString(),
+      entryPrice: entryPrice.toString(),
+      openTime: openTime.toString(),
       collateralNonce: hex(s.collateralNonce),
       salt: hex(s.salt),
       payTo,
@@ -117,7 +134,7 @@ export async function recoverableCommitments(
   const found = new Set<string>();
   for (const note of ledger.notes as Iterable<Uint8Array>) {
     const record = await recordFromNote(module, ledger, key, contract, note, contractAddress, networkId, payTo);
-    if (record) found.add(record.commitment);
+    if (record && record !== WAITING) found.add(record.commitment);
   }
   return found;
 }

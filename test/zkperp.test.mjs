@@ -29,6 +29,9 @@ import { Contract, ledger, pureCircuits } from "../contracts/managed/zkperp/cont
 import { JUBJUB_ORDER as JUBJUB_ORDER_TS, belowField, decodeLiquidatorPlaintext, randomScalar } from "../dist/core/liquidatorNote.js";
 import { deriveOrder, findOwnOrderNote, firesAbove, openOrderNote, orderReached, sealOrderNote } from "../dist/core/orders.js";
 import { cancelOrder, executeOrderCall, orderFires, placeOrder, positionOf, watchedOrders, watchedPositions } from "../dist/core/perp.js";
+import { decodeLimitPlaintext, filledPosition, limitExpired, limitReached, openLimitNote, sealLimitNote } from "../dist/core/limits.js";
+import { executeLimitCall, limitFillOf, limitFires, limitOf, watchedLimits } from "../dist/core/perp.js";
+import { orderPlaintext } from "../dist/core/orders.js";
 import * as m from "../dist/core/math.js";
 
 let failures = 0;
@@ -1519,6 +1522,259 @@ console.log("\n  core/perp.ts order functions against the circuit\n");
     refused = /not in the tree/.test(error.message);
   }
   expect("executeOrderCall refuses an order that was never placed", refused);
+}
+
+// ── Limit orders ────────────────────────────────────────────────────────────
+
+console.log("\n  limit orders\n");
+
+{
+  const LIMIT_SECRET = bytes32(0x1d);
+  const LIMIT_SALT = belowField(bytes32(0x5a));
+  const LIMIT_COLLATERAL = 2_345_678_901n; // distinctive
+  const LIMIT_SIZE = 23_456_789_012n; //      ~10x
+  const LIMIT_FEE = openFeeOf(LIMIT_SIZE);
+  const BUY_AT = 2_876_543_210n; //           a long's limit, below the $3,000 mark
+  const limitCoin = coin(LIMIT_COLLATERAL + LIMIT_FEE);
+  limitCoin.nonce = belowField(limitCoin.nonce);
+  const longLimit = {
+    owner: pureCircuits.ownerKey(LIMIT_SECRET),
+    isLong: true,
+    size: LIMIT_SIZE,
+    collateral: LIMIT_COLLATERAL,
+    openFee: LIMIT_FEE,
+    price: BUY_AT,
+    expiry: 0n,
+    collateralNonce: limitCoin.nonce,
+    salt: LIMIT_SALT,
+    payTo: TRADER,
+    payToEnc: TRADER_ENC,
+  };
+  const limitHash = pureCircuits.limitCommitment(longLimit);
+  const keeperNote = sealLimitNote(pureCircuits, LIQUIDATOR_KEY, longLimit, EPHEMERAL);
+  const place = (state, overrides = {}) => {
+    const o = { coin: limitCoin, order: longLimit, secret: LIMIT_SECRET, note: keeperNote, caller: TRADER, time: T0, ...overrides };
+    const x = o.order;
+    return callAt(o.time, o.caller, state, "placeLimitOrder", o.coin, x.size, x.isLong, x.openFee, x.price, x.expiry, o.secret, x.salt, x.payToEnc, NOTE, o.note);
+  };
+  const priced = (state, price, time = T0) => {
+    const r = callAt(time, DEPLOYER, state, "setPrice", price, time, ADMIN_SECRET);
+    if (!r.ok) throw new Error(r.error);
+    return r.state;
+  };
+  const fill = (state, overrides = {}) => {
+    const o = { order: longLimit, openTime: T1, time: T1, caller: KEEPER, ephemeral: EPHEMERAL, payTo: TRADER.bytes, enc: TRADER_ENC, ...overrides };
+    o.path ??= ledger(state).limitOrders.findPathForLeaf(pureCircuits.limitCommitment(o.order));
+    return callAt(o.time, o.caller, state, "executeLimitOrder", o.order, o.path, o.openTime, o.ephemeral, ...halves(o.payTo), ...halves(o.enc));
+  };
+  const cancel = (state, overrides = {}) => {
+    const o = { order: longLimit, secret: LIMIT_SECRET, coin: { ...limitCoin, mt_index: 0n }, caller: TRADER, time: T1, ...overrides };
+    o.path ??= ledger(state).limitOrders.findPathForLeaf(pureCircuits.limitCommitment(o.order));
+    return callAt(o.time, o.caller, state, "cancelLimitOrder", o.order, o.secret, o.path, o.coin);
+  };
+
+  // Placing.
+  const wrongToken = place(pooled, { coin: { ...limitCoin, color: OTHER_TOKEN } });
+  expect("a limit order's collateral must be pUSDC", !wrongToken.ok && /must be pUSDC/.test(wrongToken.error), why(wrongToken));
+  const zero = place(pooled, { order: { ...longLimit, price: 0n } });
+  expect("a limit at a zero price is refused", !zero.ok && /positive/.test(zero.error), why(zero));
+  const tooBig = place(pooled, { order: { ...longLimit, size: LIMIT_COLLATERAL * 21n, openFee: openFeeOf(LIMIT_COLLATERAL * 21n) } });
+  expect("the leverage cap applies when it is placed", !tooBig.ok && /fee exceeds|leverage above/.test(tooBig.error), why(tooBig));
+  const cheap = place(pooled, { order: { ...longLimit, openFee: LIMIT_FEE - 1n } });
+  expect("and the opening fee is pinned", !cheap.ok && /fee understated/.test(cheap.error), why(cheap));
+
+  const placed = place(pooled);
+  expect("the trader places a long limit order", placed.ok, why(placed));
+  if (!placed.ok) throw new Error("cannot continue the limit order tests");
+  const l0 = ledger(placed.state);
+  expect("its commitment is in the limit orders tree", l0.limitOrders.findPathForLeaf(limitHash) !== undefined);
+  expect("its notes are stored", l0.limitNotes.size() === 1n && l0.notes.size() === ledger(pooled).notes.size() + 1n);
+  expect("the contract holds the coin", toContract(placed).some((o) => o.coinInfo.value === LIMIT_COLLATERAL + LIMIT_FEE));
+  expect("no position is open yet, and no slot is taken", l0.openPositions === ledger(pooled).openPositions && l0.freeSlots === ledger(pooled).freeSlots);
+
+  const limitHaystack = [placed.state.toString(), render(placed.transcript)].join("\n").toLowerCase();
+  const visible = (needles) => needles.some((s) => limitHaystack.includes(s.toLowerCase()));
+  expect("control: the token type is visible", visible([hex(USDC)]));
+  expect("its limit price is not on chain", !visible(encodings(BUY_AT)));
+  expect("nor its size, collateral or coin value", !visible([...encodings(LIMIT_SIZE), ...encodings(LIMIT_COLLATERAL), ...encodings(LIMIT_COLLATERAL + LIMIT_FEE)]));
+  expect("nor its owner secret, salt or coin nonce", !visible([hex(LIMIT_SECRET), hex(LIMIT_SALT), hex(limitCoin.nonce)]));
+
+  const [note] = [...l0.limitNotes];
+  const seen = openLimitNote(pureCircuits, note, LIQUIDATOR_SECRET);
+  expect("the keeper's secret opens its note to the whole order", hex(pureCircuits.limitCommitment(seen)) === hex(limitHash));
+  let otherKey = true;
+  try {
+    openLimitNote(pureCircuits, note, LIQUIDATOR_SECRET - 1n);
+    otherKey = false;
+  } catch {}
+  expect("another secret does not", otherKey);
+  expect("a trigger order's note is not a limit note", (() => { try { decodeLimitPlaintext(orderPlaintext(SALT, { position: bytes32(1), price: 1n, above: true, salt: SALT })); return false; } catch { return true; } })());
+
+  // Filling.
+  const t1 = (state) => priced(state, ledger(state).markPrice, T1);
+  const notYet = fill(t1(placed.state));
+  expect("a long limit does not fill above its price", !notYet.ok && /not been reached/.test(notYet.error), why(notYet));
+  const reached = priced(placed.state, BUY_AT - 7_000_000n, T1);
+  expect("(limitReached agrees)", limitReached(longLimit, BUY_AT) && limitReached(longLimit, BUY_AT - 1n) && !limitReached(longLimit, BUY_AT + 1n));
+  const stale = fill(placed.state, { time: T0 + MAX_PRICE_AGE + 100n, openTime: T0 + MAX_PRICE_AGE + 100n });
+  expect("nor on a stale price", !stale.ok && /stale/.test(stale.error), why(stale));
+  const future = fill(reached, { openTime: T1 + 1n });
+  expect("its open time may not be in the future", !future.ok && /in the future/.test(future.error), why(future));
+  const backdated = fill(reached, { openTime: T1 - CLOCK_SLACK });
+  expect("nor trail the block by the slack", !backdated.ok && /too far in the past/.test(backdated.error), why(backdated));
+  const badPay = fill(reached, { payTo: THIEF.bytes });
+  expect("the payout key halves must be the order's", !badPay.ok && /payout key halves/.test(badPay.error), why(badPay));
+  const badEnc = fill(reached, { enc: bytes32(0x77) });
+  expect("and the encryption key halves", !badEnc.ok && /encryption key halves/.test(badEnc.error), why(badEnc));
+  const forged = fill(reached, { order: { ...longLimit, size: LIMIT_SIZE * 2n }, path: ledger(reached).limitOrders.findPathForLeaf(limitHash) });
+  expect("the keeper cannot change the order", !forged.ok && /different limit order/.test(forged.error), why(forged));
+  const never = fill(reached, { order: { ...longLimit, price: BUY_AT + 1n }, path: undefined });
+  expect("nor fill one that was never placed", !never.ok, why(never));
+
+  const filled = fill(reached);
+  expect("the keeper fills it once the mark is at or below the limit", filled.ok, why(filled));
+  if (!filled.ok) throw new Error("cannot continue the limit order tests");
+  const l1 = ledger(filled.state);
+  const nullifier = pureCircuits.limitNullifier(LIMIT_SALT);
+  const entry = BUY_AT - 7_000_000n;
+  const opened1 = filledPosition(longLimit, { entryPrice: entry, openTime: T1 });
+  const filledHash = pureCircuits.positionCommitment(opened1);
+  expect("it opens the position at the mark, below the limit", l1.positions.findPathForLeaf(filledHash) !== undefined);
+  expect("one slot taken, one position opened", l1.freeSlots === ledger(reached).freeSlots - 1n && l1.openPositions === ledger(reached).openPositions + 1n);
+  expect("no coin moves", filled.zswap.outputs.length === 0 && filled.zswap.inputs.length === 0);
+  const f = l1.limitFills.lookup(nullifier);
+  expect("the fill's entry and time are published under its nullifier", f.entryPrice === entry && f.openTime === T1);
+  const liqNotes = [...l1.liquidatorNotes].filter((n) => !ledger(reached).liquidatorNotes.member(n));
+  const asSeen = liqNotes.length === 1 && decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(liqNotes[0], LIQUIDATOR_SECRET));
+  expect(
+    "and writes the position's liquidator note, so it can be liquidated",
+    asSeen && hex(pureCircuits.positionCommitment(asSeen.position)) === hex(filledHash) && hex(asSeen.payToEnc) === hex(TRADER_ENC)
+  );
+  expect("the keeper now watches the position", watchedPositions({ module: { pureCircuits } }, l1, LIQUIDATOR_SECRET).some((w) => w.commitment === hex(filledHash)));
+  const twice = fill(filled.state);
+  expect("it fills once", !twice.ok && /already filled/.test(twice.error), why(twice));
+  const late = cancel(filled.state);
+  expect("and cannot be cancelled once filled", !late.ok && /already filled/.test(late.error), why(late));
+  const fillHaystack = render(filled.transcript).toLowerCase();
+  expect("the fill does not publish the limit price or size", ![...encodings(BUY_AT), ...encodings(LIMIT_SIZE)].some((s) => fillHaystack.includes(s)));
+
+  // The filled position is an ordinary one: its owner closes it with the order's coin.
+  const later = priced(filled.state, entry, T1 + HELD);
+  const closeTime = T1 + HELD;
+  const closed = callAt(
+    closeTime, TRADER, later, "closePosition",
+    opened1, LIMIT_SECRET, ledger(later).positions.findPathForLeaf(filledHash), { ...limitCoin, mt_index: 0n },
+    0n, closeFeeOf(LIMIT_SIZE), borrowFeeOf(LIMIT_SIZE, HELD), closeTime, capOf(ledger(later).poolValue)
+  );
+  expect("the owner closes the filled position, spending the order's coin", closed.ok, why(closed));
+  if (closed.ok) {
+    expect(
+      "and gets the collateral back less the closing and borrow fees",
+      paidTo(closed, TRADER) === LIMIT_COLLATERAL - closeFeeOf(LIMIT_SIZE) - borrowFeeOf(LIMIT_SIZE, HELD)
+    );
+  }
+
+  // Cancelling.
+  const stranger = cancel(placed.state, { secret: bytes32(0x4b), caller: KEEPER });
+  expect("only the owner cancels", !stranger.ok && /not the owner/.test(stranger.error), why(stranger));
+  const otherCoin = cancel(placed.state, { coin: { ...limitCoin, value: limitCoin.value + 1n, mt_index: 0n } });
+  expect("a cancel must name the order's coin", !otherCoin.ok && /value does not match/.test(otherCoin.error), why(otherCoin));
+  const cancelled = cancel(placed.state);
+  expect("the owner cancels a waiting order", cancelled.ok, why(cancelled));
+  if (cancelled.ok) {
+    expect("the whole coin goes back to payTo", paidTo(cancelled, TRADER) === LIMIT_COLLATERAL + LIMIT_FEE, `${paidTo(cancelled, TRADER)}`);
+    expect("nothing to the treasury", paidTo(cancelled, TREASURY) === 0n);
+    const gone = fill(priced(cancelled.state, BUY_AT, T1));
+    expect("a cancelled order cannot fill", !gone.ok && /already filled or was cancelled/.test(gone.error), why(gone));
+    expect("and is not watched", watchedLimits({ module: { pureCircuits } }, ledger(cancelled.state), LIQUIDATOR_SECRET).length === 0);
+    expect("no fill is published for it", !ledger(cancelled.state).limitFills.member(nullifier));
+  }
+
+  // A short.
+  const SELL_AT = 3_123_456_789n;
+  const shortCoin2 = coin(LIMIT_COLLATERAL + LIMIT_FEE);
+  shortCoin2.nonce = belowField(shortCoin2.nonce);
+  const shortLimit = { ...longLimit, isLong: false, price: SELL_AT, collateralNonce: shortCoin2.nonce, salt: belowField(bytes32(0x5b)) };
+  const shortPlaced = place(pooled, { coin: shortCoin2, order: shortLimit, note: sealLimitNote(pureCircuits, LIQUIDATOR_KEY, shortLimit, EPHEMERAL) });
+  expect("the trader places a short limit order", shortPlaced.ok, why(shortPlaced));
+  if (shortPlaced.ok) {
+    const below = fill(priced(shortPlaced.state, SELL_AT - 1n, T1), { order: shortLimit });
+    expect("a short limit does not fill below its price", !below.ok && /not been reached/.test(below.error), why(below));
+    const atLevel = priced(shortPlaced.state, SELL_AT, T1);
+    const shortFilled = fill(atLevel, { order: shortLimit });
+    expect("it fills at its price", shortFilled.ok, why(shortFilled));
+    if (shortFilled.ok) {
+      const p = filledPosition(shortLimit, { entryPrice: SELL_AT, openTime: T1 });
+      expect("as a short", ledger(shortFilled.state).positions.findPathForLeaf(pureCircuits.positionCommitment(p)) !== undefined);
+    }
+  }
+
+  // A full pool: the order waits.
+  {
+    let full = placed.state;
+    for (let i = 0; ledger(full).freeSlots > 0n; i++) {
+      const r = openCall(TRADER, full, coin(MIN_COLLATERAL), MIN_COLLATERAL, true, bytes32(0x60 + i), belowField(bytes32(0x70 + i)));
+      if (!r.ok) throw new Error(r.error);
+      full = r.state;
+    }
+    const noRoom = fill(priced(full, BUY_AT, T1));
+    expect("a full pool makes the order wait", !noRoom.ok && /no room/.test(noRoom.error), why(noRoom));
+  }
+
+  // core/perp.ts: the keeper's view and the call it submits.
+  const keeperView = { module: { pureCircuits } };
+  const [w] = watchedLimits(keeperView, ledger(reached), LIQUIDATOR_SECRET);
+  expect("watchedLimits finds the waiting order", w !== undefined && w.commitment === hex(limitHash));
+  expect("limitFires: at the reached price, not at the old one", limitFires(ledger(reached), w) && !limitFires(ledger(placed.state), w));
+  const c = executeLimitCall(pureCircuits, ledger(reached), w, T1, EPHEMERAL);
+  const run = callAt(T1, KEEPER, reached, "executeLimitOrder", ...c.args);
+  expect("the circuit accepts executeLimitCall's arguments", run.ok, why(run));
+  expect("and opens the position it predicted", run.ok && ledger(run.state).positions.findPathForLeaf(Uint8Array.from(Buffer.from(c.commitment, "hex"))) !== undefined);
+  const record = {
+    status: "waiting", contractAddress: "", networkId: "", commitment: hex(limitHash), createdAt: "",
+    order: {
+      ownerSecret: hex(LIMIT_SECRET), isLong: true, size: String(LIMIT_SIZE), collateral: String(LIMIT_COLLATERAL),
+      openFee: String(LIMIT_FEE), price: String(BUY_AT), expiry: "0", collateralNonce: hex(limitCoin.nonce), salt: hex(LIMIT_SALT),
+      payTo: hex(TRADER.bytes), payToEnc: hex(TRADER_ENC),
+    },
+  };
+  const handle = { module: { pureCircuits } };
+  expect("limitOf rebuilds the order from its record", hex(pureCircuits.limitCommitment(limitOf(handle, record))) === hex(limitHash));
+  expect("limitFillOf: nothing while it waits", limitFillOf(handle, ledger(reached), record) === null);
+  const rec = run.ok && limitFillOf(handle, ledger(run.state), record);
+  expect(
+    "limitFillOf: the filled position's record, ready to close",
+    rec && rec.status === "open" && rec.commitment === c.commitment && rec.opening.entryPrice === String(entry) && rec.opening.openTime === String(T1)
+  );
+  expect("which positionOf rebuilds", rec && hex(pureCircuits.positionCommitment(positionOf(handle, rec))) === c.commitment);
+
+  // Expiry.
+  const EXPIRY = T1 + 60n;
+  const expCoin = coin(LIMIT_COLLATERAL + LIMIT_FEE);
+  expCoin.nonce = belowField(expCoin.nonce);
+  const expiring = { ...longLimit, expiry: EXPIRY, collateralNonce: expCoin.nonce, salt: belowField(bytes32(0x5c)) };
+  const expPlaced = place(pooled, { coin: expCoin, order: expiring, note: sealLimitNote(pureCircuits, LIQUIDATOR_KEY, expiring, EPHEMERAL) });
+  expect("the trader places a limit order with an expiry", expPlaced.ok, why(expPlaced));
+  if (expPlaced.ok) {
+    const expHaystack = [expPlaced.state.toString(), render(expPlaced.transcript)].join("\n").toLowerCase();
+    expect("its expiry is not on chain", !encodings(EXPIRY).some((e) => expHaystack.includes(e.toLowerCase())));
+    const [expNote] = [...ledger(expPlaced.state).limitNotes];
+    expect("the keeper's note carries the expiry", openLimitNote(pureCircuits, expNote, LIQUIDATOR_SECRET).expiry === EXPIRY);
+    const atLimit = priced(expPlaced.state, BUY_AT, T1);
+    const inTime = fill(atLimit, { order: expiring, time: EXPIRY - 1n, openTime: EXPIRY - 1n });
+    expect("it fills before its expiry", inTime.ok, why(inTime));
+    const tooLate = fill(atLimit, { order: expiring, time: EXPIRY, openTime: EXPIRY });
+    expect("and not from its expiry on", !tooLate.ok && /expired/.test(tooLate.error), why(tooLate));
+    if (inTime.ok) {
+      const fillHay = render(inTime.transcript).toLowerCase();
+      expect("a fill does not publish the expiry", !encodings(EXPIRY).some((e) => fillHay.includes(e.toLowerCase())));
+    }
+    const expCancel = cancel(atLimit, { order: expiring, coin: { ...expCoin, mt_index: 0n }, time: EXPIRY + 1000n });
+    expect("an expired order is cancelled, its whole coin back", expCancel.ok && paidTo(expCancel, TRADER) === LIMIT_COLLATERAL + LIMIT_FEE, why(expCancel));
+    const [we] = watchedLimits(keeperView, ledger(atLimit), LIQUIDATOR_SECRET);
+    expect("limitFires: reached before the expiry, not after", limitFires(ledger(atLimit), we, EXPIRY - 1n) && !limitFires(ledger(atLimit), we, EXPIRY));
+    expect("(limitExpired agrees; 0 never expires)", limitExpired(expiring, EXPIRY) && !limitExpired(expiring, EXPIRY - 1n) && !limitExpired(longLimit, 1n << 62n));
+  }
 }
 
 // ── Fees beyond the collateral ──────────────────────────────────────────────

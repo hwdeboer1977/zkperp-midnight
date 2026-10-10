@@ -3,7 +3,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { fmt6, parse6 } from "../lib/bytes";
 import { contractModule } from "../lib/contracts";
-import { useLedger, useNow } from "../lib/hooks";
+import { useConfig, useLedger, useNow } from "../lib/hooks";
 import { backupFile, type PositionRecord } from "../lib/positions";
 import { usePositionKey } from "../lib/positionKey";
 import { usePositions } from "../lib/usePositions";
@@ -14,6 +14,10 @@ import { proverLabel, useWallet } from "../lib/wallet";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
 import { Stat } from "../components/Market";
+import { LimitOrdersTable } from "../components/LimitOrders";
+import { KeeperLine } from "../components/Keeper";
+import { limitReached } from "@core/limits";
+import { isExpired, useLimitOrders } from "../lib/limits";
 
 type Quote = Awaited<ReturnType<typeof quoteClose>>;
 
@@ -341,6 +345,7 @@ function OpenCard({ record, ledger, onClosed }: { record: PositionRecord; ledger
           {o.isLong ? "LONG" : "SHORT"} {leverageOf(o)}×
         </span>
         <span className="chip accent">private</span>
+        {record.via === "limit" && <span className="chip plain" title="Opened by the keeper filling your limit order">limit</span>}
         <span className="muted pos-age">opened {new Date(record.createdAt).toLocaleString()}</span>
       </div>
       <div className="pos-grid">
@@ -419,7 +424,7 @@ function HistoryRow({ record }: { record: PositionRecord }) {
       <tr className={c ? "expandable" : ""} onClick={() => c && setOpen(!open)}>
         <td className="text">{new Date(record.createdAt).toLocaleString()}</td>
         <td className={`text ${o.isLong ? "long" : "short"}`}>
-          {o.isLong ? "Long" : "Short"} <small className="muted">{leverageOf(o)}×</small>
+          {o.isLong ? "Long" : "Short"} <small className="muted">{leverageOf(o)}×{record.via === "limit" && " · limit"}</small>
         </td>
         <td>{fmt6(BigInt(o.size))}</td>
         <td>
@@ -585,6 +590,8 @@ export default function PortfolioPage() {
   const { ledger } = useLedger();
   const key = usePositionKey();
   const { open, history, pending, syncError, reload, localOnly } = usePositions();
+  const config = useConfig();
+  const limits = useLimitOrders(key, ledger, config?.contracts.zkperp);
 
   const atRisk = open.reduce((sum, r) => sum + BigInt(r.opening.collateral), 0n);
   const unrealised =
@@ -627,6 +634,10 @@ export default function PortfolioPage() {
       )}
       {!w.api && <NeedsWallet what="close positions" />}
       <PositionKeyPanel />
+      <KeeperLine
+        active={!!w.api && (open.length > 0 || !!limits?.some((o) => o.status === "waiting"))}
+        waiting={!!ledger && !!limits?.some((o) => o.status === "waiting" && !isExpired(o, Date.now() / 1000) && limitReached(o, ledger.markPrice))}
+      />
       {syncError && <div className="banner bad">Could not read your positions from the chain: {syncError}</div>}
       {pending.length > 0 && (
         <div className="banner warn">
@@ -651,6 +662,17 @@ export default function PortfolioPage() {
           </div>
         )}
       </section>
+      {limits && limits.length > 0 && (
+        <section className="card">
+          <div className="card-head">
+            <h2>Limit orders</h2>
+            <span className="muted">
+              {limits.filter((o) => o.status === "waiting").length} waiting · a filled order shows as a position above
+            </span>
+          </div>
+          <LimitOrdersTable orders={limits} ledger={ledger} done />
+        </section>
+      )}
       {history.length > 0 && (
         <section className="card">
           <div className="card-head">

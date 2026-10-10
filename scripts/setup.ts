@@ -35,6 +35,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import chalk from "chalk";
+import { inspect } from "util";
 import { createHash } from "crypto";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, isLocal, stackFile, walletSeed } from "../core/network.js";
@@ -209,6 +210,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(chalk.red(`\n✗ ${error instanceof Error ? error.stack ?? error.message : String(error)}`));
+  // A submission error names nothing itself; the node's reason is in its
+  // causes ("1010: … would exhaust the block limits"), which inspect prints.
+  console.error(chalk.red(`\n✗ ${error?.cause ? inspect(error, { depth: 8 }) : error instanceof Error ? error.stack ?? error.message : String(error)}`));
   process.exit(1);
 });

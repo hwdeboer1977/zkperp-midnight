@@ -29,6 +29,13 @@
  * entryPrice, openTime (8 each, big-endian) ‖ zero padding to 100. Every note
  * has the same length, so a note says nothing about the position.
  *
+ * A limit order's note (`placeLimitOrder`) is the same, with version 2: its
+ * entryPrice is the limit price and its openTime when it was placed, and the
+ * 8 bytes after openTime hold its expiry (0 for none; zero padding in a
+ * position's note). The
+ * secrets derive from its seed as a position's do, and become the filled
+ * position's.
+ *
  * WebCrypto only, so this runs unchanged in the browser and in Node ≥ 20.
  */
 
@@ -36,7 +43,7 @@ export const NOTE_BYTES = 128;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
 const PLAIN_BYTES = NOTE_BYTES - IV_BYTES - TAG_BYTES;
-const VERSION = 1;
+const VERSION = { position: 1, limit: 2 } as const;
 
 import { belowField } from "./liquidatorNote.js";
 
@@ -46,6 +53,8 @@ const buf = (b: Uint8Array) => b as unknown as BufferSource;
 
 /** The fields of a position that a note must restore; the rest derive from `seed`. */
 export interface NoteOpening {
+  /** A position's opening, or a limit order's (see the layout above). Position if left out. */
+  kind?: "position" | "limit";
   seed: Uint8Array;
   isLong: boolean;
   size: bigint;
@@ -53,6 +62,8 @@ export interface NoteOpening {
   openFee: bigint;
   entryPrice: bigint;
   openTime: bigint;
+  /** A limit order's expiry, seconds since the epoch; 0n (or left out) for none. */
+  expiry?: bigint;
 }
 
 export interface PositionSecrets {
@@ -98,10 +109,10 @@ export async function sealNote(key: PositionKey, contractAddress: Uint8Array, o:
   if (o.seed.length !== 32) throw new Error("a note seed is 32 bytes");
   const plain = new Uint8Array(PLAIN_BYTES);
   const view = new DataView(plain.buffer);
-  plain[0] = VERSION;
+  plain[0] = VERSION[o.kind ?? "position"];
   plain.set(o.seed, 1);
   plain[33] = o.isLong ? 1 : 0;
-  [o.size, o.collateral, o.openFee, o.entryPrice, o.openTime].forEach((v, i) => view.setBigUint64(34 + 8 * i, v));
+  [o.size, o.collateral, o.openFee, o.entryPrice, o.openTime, o.expiry ?? 0n].forEach((v, i) => view.setBigUint64(34 + 8 * i, v));
   const iv = globalThis.crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const sealed = new Uint8Array(
     await subtle.encrypt({ name: "AES-GCM", iv, additionalData: buf(contractAddress) }, key.note, buf(plain))
@@ -127,8 +138,9 @@ export async function openNote(key: PositionKey, contractAddress: Uint8Array, no
   } catch {
     return null;
   }
-  if (plain[0] !== VERSION) return null;
+  const kind = plain[0] === VERSION.position ? "position" : plain[0] === VERSION.limit ? "limit" : null;
+  if (!kind) return null;
   const view = new DataView(plain.buffer);
-  const [size, collateral, openFee, entryPrice, openTime] = [0, 1, 2, 3, 4].map((i) => view.getBigUint64(34 + 8 * i));
-  return { seed: plain.slice(1, 33), isLong: plain[33] === 1, size, collateral, openFee, entryPrice, openTime };
+  const [size, collateral, openFee, entryPrice, openTime, expiry] = [0, 1, 2, 3, 4, 5].map((i) => view.getBigUint64(34 + 8 * i));
+  return { kind, seed: plain.slice(1, 33), isLong: plain[33] === 1, size, collateral, openFee, entryPrice, openTime, expiry };
 }

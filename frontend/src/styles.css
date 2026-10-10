@@ -183,6 +183,9 @@ label.check input { flex: none; width: auto; }
 .toggle button { border: none; background: transparent; color: var(--muted); font-weight: 650; padding: 10px; }
 .toggle button.on.long { background: var(--good-soft); color: var(--good); }
 .toggle button.on.short { background: var(--bad-soft); color: var(--bad); }
+.mode-tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--border); margin-bottom: -6px; }
+.mode-tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); font-weight: 650; padding: 2px 0 8px; margin-bottom: -1px; }
+.mode-tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
 .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: -2px; }
 .summary { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 0; font-size: 13px; padding: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; }
 .summary dt { color: var(--muted); }
@@ -417,3 +420,18 @@ tr.details .pos-orders { margin: 0; padding: 12px 16px; border-top: 0; }
 .order-btn.tp { color: var(--good); border-color: var(--good); background: var(--good-soft); }
 .order-btn.on { outline: 2px solid currentColor; outline-offset: 1px; }
 td .order-btn { padding: 2px 6px; }
+
+/* The keeper at work, and its actions for this trader as they land. */
+.keeper-line { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-2); padding: 10px 12px; margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); }
+.keeper-line.bad { color: var(--bad); border-color: rgb(244 86 106 / 0.3); background: var(--bad-soft); }
+.spinner { width: 12px; height: 12px; flex: none; border-radius: 50%; border: 2px solid var(--accent-soft); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.notices { position: fixed; right: 16px; bottom: 16px; z-index: 50; display: flex; flex-direction: column; gap: 10px; width: min(380px, calc(100vw - 32px)); }
+.notice { position: relative; display: flex; flex-direction: column; gap: 4px; padding: 12px 36px 12px 14px; border-radius: var(--radius); font-size: 13px; line-height: 1.5; background: var(--surface-3); border: 1px solid var(--border); box-shadow: 0 8px 24px rgb(0 0 0 / 0.35); }
+.notice.good { border-color: var(--good); }
+.notice.bad { border-color: var(--bad); }
+.notice.warn { border-color: var(--warn); }
+.notice.good b { color: var(--good); }
+.notice.bad b { color: var(--bad); }
+.notice.warn b { color: var(--warn); }
+.notice button { position: absolute; top: 6px; right: 6px; padding: 2px 8px; }

@@ -10,6 +10,7 @@ import { allPositions, deletePosition, type PositionRecord } from "./positions";
 import { lockPositionKey, usePositionKey } from "./positionKey";
 import { recoverPositions, recoverableCommitments, settleClosed } from "./recover";
 import type { PositionKey } from "@core/notes";
+import { watchPositions } from "./notices";
 
 /** Fired when records are removed outside the hook, so every page reloads them. */
 const CHANGED = "zkperp:positions-changed";
@@ -100,6 +101,7 @@ export function usePositions() {
   }, [ledger, config, key, w.coinPublicKey, reload]);
 
   const mine = config ? records.filter((r) => r.contractAddress === config.contracts.zkperp) : [];
+  useEffect(() => watchPositions(mine), [records, config]); // eslint-disable-line react-hooks/exhaustive-deps
   return {
     open: mine.filter((r) => r.status === "open"),
     history: mine.filter((r) => r.status !== "open").sort((a, b) => b.createdAt.localeCompare(a.createdAt)),

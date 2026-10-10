@@ -19,10 +19,10 @@ export async function contractModule(name: ContractName): Promise<any> {
 }
 
 /** A compiled contract bound to its ZK assets. Neither contract has witnesses. */
-export async function loadCompiledContract(name: ContractName) {
+export async function loadCompiledContract(name: ContractName, Contract?: any) {
   const module = await contractModule(name);
   const compiledContract = pipe(
-    CompiledContract.make(name, module.Contract),
+    CompiledContract.make(name, Contract ?? module.Contract),
     CompiledContract.withVacantWitnesses,
     CompiledContract.withCompiledFileAssets(managedPath(name))
   );

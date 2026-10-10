@@ -233,6 +233,28 @@ A trigger order closes a position once the mark price reaches a level: a long's 
 
 Tests: `test/zkperp.test.mjs` ("trigger orders"), and `npm run stoploss` on the devnet, with `--keeper` to have the keeper service execute.
 
+### 6. Limit orders (built 2026-10-09, devnet)
+
+A limit order is an open that waits for its price: a long opens once the mark price is at or below its limit, a short at or above. The trader is offline when it fills, so the collateral waits in the contract and the keeper opens the position.
+
+- **Placing** (`placeLimitOrder`) takes the collateral coin, as an open does, and checks the same fee, leverage and collateral bounds. It commits to every field the position will have except its entry price and open time: owner key, side, size, collateral, opening fee, limit, coin nonce, salt, `payTo` and the trader's encryption key. The keeper's note is sealed by the trader, as for trigger orders.
+- **Filling** (`executeLimitOrder`, the keeper, no owner secret) proves the order is in the `limitOrders` tree and not yet filled or cancelled, and that the mark price has reached the limit. It then opens the position at the mark price, never worse than the limit, with the order's coin as its collateral (no coin moves), takes a pool slot and writes the position's liquidator note. The keeper names the open time within `clockSlack`, as a trader would. The payout and encryption key halves must match the order, so the keeper cannot redirect anything.
+- **Cancelling** (`cancelLimitOrder`, owner only) returns the whole coin to `payTo`.
+- A fill or cancel publishes the order's nullifier, from its salt in a domain of its own, so it links neither to the order's commitment nor to the position's nullifier. A fill also publishes its entry price and open time under that nullifier (`limitFills`). Both are public anyway, and the trader needs them to rebuild the position.
+
+**Who sees what:**
+
+- **The public** sees that a limit order was placed (a pUSDC coin received, of unknown value), and later that one filled or was cancelled (the circuit name). A fill happens at the mark of the moment, which says some order's level was near there; it does not say which order, which side or what size. Neither placing nor filling publishes the limit or the size (tested).
+- **The keeper** sees every order's side, size, collateral and limit, as it sees every position.
+
+**Expiry** (2026-10-10): an order may carry one. `executeLimitOrder` checks it against the fill's open time, which is public and pinned to the block's time, so the expiry is never published, neither at placing nor at a fill (tested). Past it the order no longer fills; the owner cancels it to get the coin back. The keeper sees it, with the rest of the order.
+
+**Limits, for now:** no execution fee (decided 2026-10-10: none for limit orders, stop losses or take profits), no SL/TP attached at placing (set them once it fills). The trader's own note, written at placing, is a position note (section on notes) with version 2: the limit in the entry-price slot, the placing time in the open-time slot, the expiry in the 8 bytes after it. The frontend finds waiting orders from it, and once filled rebuilds the position from it and `limitFills`, so a limit order needs no browser storage. The CLI still writes random bytes there and keeps `.zkperp/limits.json`.
+
+Proving keys: `placeLimitOrder` 10.0 MB and `cancelLimitOrder` 19.5 MB, both within what 1AM carried; `executeLimitOrder` 21.6 MB, proven by the keeper.
+
+Tests: `test/zkperp.test.mjs` ("limit orders"), and `npm run limit` on the devnet, with `--keeper` to have the keeper service fill.
+
 ### Proof size, and 1AM's limit
 
 The first version of the liquidator note made `openPosition`'s proving key 81 MB. 1AM refused to prove it: **"Payload too large or too deeply nested"**. 1AM receives the key through the extension's messaging channel, which has a size limit.

@@ -10,6 +10,7 @@ import TradePage from "./pages/Trade";
 import PortfolioPage from "./pages/Portfolio";
 import LiquidityPage from "./pages/Liquidity";
 import FaucetPage from "./pages/Faucet";
+import { Notices } from "./components/Keeper";
 
 function PriceTicker() {
   const { ledger } = useLedger();
@@ -77,6 +78,7 @@ export default function App() {
           <Route path="/faucet" element={<FaucetPage />} />
         </Routes>
       </main>
+      <Notices />
     </>
   );
 }

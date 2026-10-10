@@ -14,7 +14,7 @@ export interface AppConfig {
   oracle: { feed: string; description: string };
   params: Record<string, string>;
   zkVersion: string;
-  services: { relayer: string; treasury: string };
+  services: { relayer: string; treasury: string; keeper?: string };
 }
 
 let loaded: Promise<AppConfig> | undefined;

@@ -31,6 +31,8 @@ export interface PositionRecord {
     payTo: string;
   };
   createdAt: string;
+  /** Opened by the keeper filling the trader's limit order, not by the trader. */
+  via?: "limit";
   txHash?: string;
   closeTxHash?: string;
   /** How a closed position ended, once known. Amounts in pUSDC's smallest unit. */
@@ -61,4 +63,41 @@ export interface PositionClosing {
    * the block's, so the borrow fee (and what was received) is an estimate.
    */
   exact: boolean;
+}
+
+/**
+ * A trader's record of one limit order: the only copy of its fields until it
+ * fills, and of the coin it holds until then. See core/limitRecords.ts.
+ */
+export interface LimitRecord {
+  /**
+   * pending   — written, placement not yet confirmed.
+   * waiting   — placed; the keeper fills it once the price is reached.
+   * filled    — the position is open; `position` is its record.
+   * cancelled — the coin went back to `payTo`.
+   * failed    — the placement never landed.
+   */
+  status: "pending" | "waiting" | "filled" | "cancelled" | "failed";
+  contractAddress: string;
+  networkId: string;
+  /** hex: `limitCommitment`. */
+  commitment: string;
+  order: {
+    ownerSecret: string;
+    isLong: boolean;
+    size: string;
+    collateral: string;
+    openFee: string;
+    price: string;
+    /** Seconds since the epoch after which it no longer fills; "0" or left out for never. */
+    expiry?: string;
+    collateralNonce: string;
+    salt: string;
+    payTo: string;
+    payToEnc: string;
+  };
+  createdAt: string;
+  txHash?: string;
+  cancelTxHash?: string;
+  position?: PositionRecord;
 }

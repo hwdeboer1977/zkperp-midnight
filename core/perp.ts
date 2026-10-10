@@ -20,6 +20,8 @@ import { withContractScopedTransaction } from "@midnight-ntwrk/midnight-js-contr
 import { confirmOpen, markClosed, markFailed, recordPending, type PositionRecord } from "./positions.js";
 import { NOTE_BYTES } from "./notes.js";
 import { belowField, decodeLiquidatorPlaintext, randomScalar, type LiquidatorView } from "./liquidatorNote.js";
+import { recordLimitPending, updateLimit, type LimitRecord } from "./limitRecords.js";
+import { filledPosition, limitExpired, limitReached, openLimitNote, sealLimitNote, type LimitOrder } from "./limits.js";
 import { deriveOrder, firesAbove, openOrderNote, orderReached, sealOrderNote, type OrderView, type TriggerOrder } from "./orders.js";
 import {
   borrowFeeOf,
@@ -553,4 +555,203 @@ export async function executeOrder(
     }
   );
   return { txHash: tx.public.txHash, profit, pnl, exit, settled };
+}
+
+// ── Limit orders ─────────────────────────────────────────────────────────────
+
+/** The circuit's `LimitOrder` struct, rebuilt from a saved record. */
+export function limitOf(perp: ContractHandle, record: LimitRecord): LimitOrder {
+  const o = record.order;
+  return {
+    owner: perp.module.pureCircuits.ownerKey(bytes(o.ownerSecret)) as bigint,
+    isLong: o.isLong,
+    size: BigInt(o.size),
+    collateral: BigInt(o.collateral),
+    openFee: BigInt(o.openFee),
+    price: BigInt(o.price),
+    expiry: BigInt(o.expiry ?? "0"),
+    collateralNonce: bytes(o.collateralNonce),
+    salt: bytes(o.salt),
+    payTo: { bytes: bytes(o.payTo) },
+    payToEnc: bytes(o.payToEnc),
+  };
+}
+
+export interface LimitPlaced {
+  record: LimitRecord;
+  txHash: string;
+}
+
+/**
+ * Places a limit order for the wallet behind `perp.providers`: a long that
+ * opens once the mark price is at or below `price`, a short at or above. Posts
+ * a coin of `coinValue` now; the opening fee comes out of it when the
+ * position opens, as for `openPosition`. Past `expiry` (seconds since the
+ * epoch; 0n for never) it no longer fills. Saved BEFORE submitting, as
+ * positions are; see limitRecords.ts.
+ */
+export async function placeLimitOrder(
+  perp: ContractHandle,
+  usdc: Uint8Array,
+  coinValue: bigint,
+  size: bigint,
+  isLong: boolean,
+  price: bigint,
+  networkId: string,
+  expiry = 0n
+): Promise<LimitPlaced> {
+  const ledger = await readLedger(perp);
+  const openFee = openFeeOf(size, BigInt(ledger.openFeeBps));
+  const ownerSecret = new Uint8Array(randomBytes(32));
+  const record: LimitRecord = {
+    status: "pending",
+    contractAddress: perp.address,
+    networkId,
+    commitment: "",
+    createdAt: new Date().toISOString(),
+    order: {
+      ownerSecret: hex(ownerSecret),
+      isLong,
+      size: size.toString(),
+      collateral: (coinValue - openFee).toString(),
+      openFee: openFee.toString(),
+      price: price.toString(),
+      expiry: expiry.toString(),
+      collateralNonce: hex(belowField(randomBytes(32))),
+      salt: hex(belowField(randomBytes(32))),
+      payTo: walletCoinKey(perp),
+      payToEnc: hex(walletEncKey(perp)),
+    },
+  };
+  const order = limitOf(perp, record);
+  record.commitment = hex(perp.module.pureCircuits.limitCommitment(order));
+  const keeperNote = sealLimitNote(perp.module.pureCircuits, ledger.liquidator, order, randomScalar());
+
+  const { status: _status, createdAt: _createdAt, ...pending } = record;
+  recordLimitPending(pending);
+  try {
+    const tx = await perp.deployed.callTx.placeLimitOrder(
+      { nonce: order.collateralNonce, color: usdc, value: coinValue },
+      size,
+      isLong,
+      openFee,
+      price,
+      expiry,
+      ownerSecret,
+      order.salt,
+      order.payToEnc,
+      // As for openPosition: the CLI keeps its own record, so random bytes.
+      new Uint8Array(randomBytes(NOTE_BYTES)),
+      keeperNote
+    );
+    const txHash: string = tx.public.txHash;
+    updateLimit(record.commitment, { status: "waiting", txHash });
+    return { record: { ...record, status: "waiting", txHash }, txHash };
+  } catch (error) {
+    updateLimit(record.commitment, { status: "failed" });
+    throw error;
+  }
+}
+
+/**
+ * The position `record`'s order opened, once filled: its record, ready for
+ * `closePosition` and `placeOrder`. Null while the order waits or once it is
+ * cancelled. Pure; the caller saves it, with `updateLimit`.
+ */
+export function limitFillOf(perp: ContractHandle, ledger: any, record: LimitRecord): PositionRecord | null {
+  const nullifier = perp.module.pureCircuits.limitNullifier(bytes(record.order.salt));
+  if (!ledger.limitFills.member(nullifier)) return null;
+  const fill = ledger.limitFills.lookup(nullifier);
+  const p = filledPosition(limitOf(perp, record), fill);
+  const o = record.order;
+  const position: PositionRecord = {
+    status: ledger.closed.member(perp.module.pureCircuits.positionNullifier(p.salt)) ? "closed" : "open",
+    contractAddress: record.contractAddress,
+    networkId: record.networkId,
+    commitment: hex(perp.module.pureCircuits.positionCommitment(p)),
+    createdAt: new Date().toISOString(),
+    opening: {
+      ownerSecret: o.ownerSecret,
+      isLong: o.isLong,
+      size: o.size,
+      collateral: o.collateral,
+      openFee: o.openFee,
+      entryPrice: fill.entryPrice.toString(),
+      openTime: fill.openTime.toString(),
+      collateralNonce: o.collateralNonce,
+      salt: o.salt,
+      payTo: o.payTo,
+    },
+  };
+  return position;
+}
+
+/** Cancels the trader's waiting limit order; its coin goes back to `payTo`. */
+export async function cancelLimitOrder(perp: ContractHandle, record: LimitRecord, usdc: Uint8Array): Promise<string> {
+  if (record.status !== "waiting") throw new Error(`limit order ${record.commitment.slice(0, 12)}… is ${record.status}`);
+  const order = limitOf(perp, record);
+  const ledger = await readLedger(perp);
+  const path = ledger.limitOrders.findPathForLeaf(bytes(record.commitment));
+  if (!path) throw new Error("the limit order's commitment is not in the tree");
+  const coin = { nonce: order.collateralNonce, color: usdc, value: order.collateral + order.openFee };
+  const mt_index = await collateralIndex(perp, coin);
+  const tx = await perp.deployed.callTx.cancelLimitOrder(order, bytes(record.order.ownerSecret), path, { ...coin, mt_index });
+  const txHash: string = tx.public.txHash;
+  updateLimit(record.commitment, { status: "cancelled", cancelTxHash: txHash });
+  return txHash;
+}
+
+/** A waiting limit order the keeper can fill: its note opened, in the tree, not yet filled or cancelled. */
+export interface WatchedLimit {
+  order: LimitOrder;
+  commitment: string;
+}
+
+export function watchedLimits(perp: ContractHandle, ledger: any, secret: bigint): WatchedLimit[] {
+  const out: WatchedLimit[] = [];
+  for (const note of ledger.limitNotes as Iterable<any>) {
+    let order: LimitOrder;
+    try {
+      order = openLimitNote(perp.module.pureCircuits, note, secret);
+    } catch {
+      continue;
+    }
+    const commitment = perp.module.pureCircuits.limitCommitment(order) as Uint8Array;
+    if (!ledger.limitOrders.findPathForLeaf(commitment)) continue;
+    if (ledger.limitDone.member(perp.module.pureCircuits.limitNullifier(order.salt))) continue;
+    out.push({ order, commitment: hex(commitment) });
+  }
+  return out;
+}
+
+/** Whether `w` fills at the ledger's mark price: reached, and not expired at `now`. */
+export const limitFires = (ledger: any, w: WatchedLimit, now = circuitNow()) =>
+  limitReached(w.order, ledger.markPrice) && !limitExpired(w.order, now);
+
+/**
+ * The arguments `executeLimitOrder` passes the circuit for `w` at `openTime`,
+ * and the position it opens at the ledger's mark price. Pure, so the tests can
+ * check it against the circuit.
+ */
+export function executeLimitCall(pureCircuits: any, ledger: any, w: WatchedLimit, openTime: bigint, ephemeral: bigint) {
+  const path = ledger.limitOrders.findPathForLeaf(bytes(w.commitment));
+  if (!path) throw new Error("the limit order's commitment is not in the tree");
+  const position = filledPosition(w.order, { entryPrice: ledger.markPrice, openTime });
+  const args = [w.order, path, openTime, ephemeral, ...halvesOf(w.order.payTo.bytes), ...halvesOf(w.order.payToEnc)];
+  return { args, position, commitment: hex(pureCircuits.positionCommitment(position)) };
+}
+
+export interface LimitFilled {
+  txHash: string;
+  /** hex: the opened position's commitment. */
+  commitment: string;
+  entryPrice: bigint;
+}
+
+/** Fills `w` at the current mark price, from the keeper's wallet behind `perp.providers`. */
+export async function executeLimitOrder(perp: ContractHandle, w: WatchedLimit): Promise<LimitFilled> {
+  const ledger = await readLedger(perp);
+  const { args, position, commitment } = executeLimitCall(perp.module.pureCircuits, ledger, w, circuitNow(), randomScalar());
+  const tx = await perp.deployed.callTx.executeLimitOrder(...args);
+  return { txHash: tx.public.txHash, commitment, entryPrice: position.entryPrice };
 }

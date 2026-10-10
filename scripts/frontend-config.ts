@@ -73,7 +73,7 @@ function main() {
     zkVersion: fingerprint("zkperp"),
     // Same-origin paths; the dev server proxies them to the services (see
     // frontend/vite.config.ts), so the browser needs no CORS.
-    services: { relayer: "/svc/relayer", treasury: "/svc/treasury" },
+    services: { relayer: "/svc/relayer", treasury: "/svc/treasury", keeper: "/svc/keeper" },
   };
   fs.writeFileSync(path.join(FRONTEND, "public", "config.json"), JSON.stringify(config, null, 2) + "\n");
   console.log(chalk.green(`frontend configured for zkperp ${stack.contracts.zkperp.slice(0, 12)}… on ${stack.network.networkId}`));

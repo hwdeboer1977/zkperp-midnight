@@ -171,7 +171,13 @@ const KIND: Record<string, { ico: string; cls: string; label: string; detail?: s
   addLiquidity: { ico: "+", cls: "", label: "Liquidity added" },
   removeLiquidity: { ico: "−", cls: "", label: "Liquidity removed" },
   depositFees: { ico: "↧", cls: "", label: "Fee epoch paid to LPs" },
-  deploy: { ico: "★", cls: "", label: "Contract deployed" },
+  placeOrder: { ico: "◇", cls: "", label: "Order placed", detail: "a stop loss or take profit; level hidden" },
+  cancelOrder: { ico: "×", cls: "", label: "Order cancelled" },
+  executeOrder: { ico: "✓", cls: "close", label: "Order executed", detail: "by the keeper; which position stays hidden" },
+  placeLimitOrder: { ico: "◇", cls: "", label: "Limit order placed", detail: "side, size and level hidden" },
+  cancelLimitOrder: { ico: "×", cls: "", label: "Limit order cancelled" },
+  executeLimitOrder: { ico: "◆", cls: "open", label: "Limit order filled", detail: "by the keeper; size and side hidden" },
+  deploy: { ico: "★", cls: "", label: "zkperp deployed" },
 };
 
 function ago(ms: number, now: number): string {
@@ -190,7 +196,10 @@ export function ActivityFeed({ actions, now, limit = 9 }: { actions: Action[] | 
   return (
     <ul className="feed">
       {recent.map((a) => {
-        const k = KIND[a.entryPoint] ?? { ico: "·", cls: "", label: a.entryPoint };
+        const k =
+          a.entryPoint === "update"
+            ? { ico: "⚙", cls: "", label: a.circuits?.length ? `Circuit added: ${a.circuits.join(", ")}` : "Contract updated", detail: "its verifier key, by the deployer's maintenance key" }
+            : (KIND[a.entryPoint] ?? { ico: "·", cls: "", label: a.entryPoint });
         return (
           <li key={a.hash} title={`transaction ${a.hash}`}>
             <span className={`ico ${k.cls}`}>{k.ico}</span>

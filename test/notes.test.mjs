@@ -53,6 +53,13 @@ expect(
 
 const long = await openNote(key, CONTRACT, await sealNote(key, CONTRACT, { ...opening, isLong: true }));
 expect("direction survives both ways", long?.isLong === true);
+expect("a note left without a kind opens as a position's", back?.kind === "position");
+
+const limit = await openNote(key, CONTRACT, await sealNote(key, CONTRACT, { ...opening, kind: "limit" }));
+expect(
+  "a limit order's note opens as one, with every field",
+  limit?.kind === "limit" && ["size", "collateral", "openFee", "entryPrice", "openTime"].every((f) => limit[f] === opening[f])
+);
 
 // The same root, re-derived, is what another device does.
 const again = await positionKey(ROOT);

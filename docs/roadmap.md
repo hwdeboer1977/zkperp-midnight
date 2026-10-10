@@ -137,6 +137,28 @@ Tasks:
 - [ ] `npm run setup:preview` with the per-role keys from step 2; start three relayers and three keepers.
 - [ ] Re-run the preview checks: open, close, liquidation (with `npm run price:preview`, which in 2-of-3 needs two signers), a take profit and a stop loss, recovery on a second browser.
 
+### Circuit count and the deploy limit (noted 2026-10-09)
+
+A deploy with all 13 circuits (after limit orders) is refused: "1010: Invalid Transaction: Transaction would exhaust the block limits". midnight-polisZK hit the same ceiling at about 12. Since 2026-10-09 the deploy carries 7 circuits and setup inserts the rest afterwards, one maintenance transaction each (`DEFERRED` in `core/session.ts`). The limit applies to one transaction, so more circuits no longer block a deploy.
+
+Expected count after steps 3 and 4:
+
+| | Circuits |
+|---|---|
+| Today, with limit orders | 13 |
+| Step 3: `setPrice` becomes a signer submission (same circuit), plus a rotation circuit | +1 |
+| Step 4: three notes in `openPosition` and the fee to the caller in `liquidatePosition` (no new circuits), plus key rotation | +1, or 0 if one rotation circuit serves signers and keepers |
+| Step 6, if `executeOrder` merges into `closePosition` | −1 |
+| **Total** | **about 14–15** |
+
+Tasks:
+
+- [ ] Add each new circuit to `DEFERRED`, and deploy on the devnet as soon as the circuits exist: that is the test. Each insert adds about 15 s to setup.
+- [ ] Watch for a limit not yet seen: total contract state size (each verifier key adds about 2 KB, so 15 keys is about 30 KB; no cap known, none tested). Check that preview and preprod accept the deploy and the inserts as the devnet does.
+- [ ] Keep the trader's circuits within 1AM's proving-key limit (37 MB carried, 81 MB refused). Three keeper notes add about 0.1–0.3 MB each to `openPosition` (11 MB). `closePosition` (38.8 MB) is already just above 37 MB, so the fee-to-caller change in close and liquidate must not grow it.
+- [ ] Limit orders need three keepers too: `executeLimitOrder` writes the new position's keeper notes in the circuit, so three (keeper-proven, 21.6 MB today). The trigger-order and limit notes the trader seals outside the circuit become three each, at no proof cost.
+- [ ] Rotation of oracle signers and keepers goes through the contract's own circuits, signed by two of three, never through the maintenance key. Freezing the maintenance authority before preprod (step 9) then leaves rotation working.
+
 ## 5. A second market
 
 **Contract change:** none, as a separate deployment.
@@ -179,7 +201,7 @@ Design:
 - **Merge it into `closePosition`:** the circuit accepts either the owner secret or a met trigger. A separate circuit's name would tell the public that a close was a TP/SL; one entry point hides it.
 - **Payout:** unchanged. It goes to the payout key bound at open, so a keeper can trigger a close but cannot redirect the money, as with liquidation.
 - **Fill price:** the oracle price at execution, not the trigger level. The oracle moves only on a 0.5% move or the hourly heartbeat, so a stop loss can fill past its level, the same gap risk as liquidation. Filling at the trigger would make the pool pay for every gap.
-- **Fee:** a small execution fee from the position to the keeper that executes, like the liquidation fee in step 4.
+- **Fee:** none (decided 2026-10-10): no execution fee for stop losses and take profits.
 - **Change or cancel:** one transaction (nullify the order, commit a new one), about 11 s and a little DUST.
 - **Conflicts:** an execution reads the exact mark price, so it can collide with a price update; the keeper retries.
 
@@ -196,16 +218,18 @@ Open questions:
 Tasks:
 
 - [x] Contract: order commitment and note; cancel. Executed by its own circuit, `executeOrder`, for now.
-- [ ] Contract: merge execution into `closePosition`; execution fee to the keeper.
+- [ ] Contract: merge execution into `closePosition`. (No execution fee, by decision 2026-10-10.)
 - [x] Keeper: decrypt orders, watch the oracle, execute, retry on the next tick.
 - [x] Frontend: a red "Set SL" and a green "Set TP" button on each open position (Trade page row, Portfolio card), with the PnL at the level; move (place the new order, then cancel the old) and cancel; lines on the candle chart; history shows "take profit" or "stop loss". Orders are set on open positions only: inputs in the order ticket as well were tried and dropped, because two places to set them was confusing.
 - [x] Tests: a stop loss and take profit fire only beyond the level; a keeper cannot place, move or fire an unmet order; the payout reaches the opener; a cancelled order cannot fire; the level is not published.
-- [ ] Tests: the execution fee reaches the keeper; `/check` fuzzing of the merged close circuit (both branches are evaluated in the proof).
+- [ ] Tests: `/check` fuzzing of the merged close circuit (both branches are evaluated in the proof).
 - [ ] Re-measure the close circuit's proving-key size when merging: it is already 38.8 MB, just above the 37 MB 1AM proved, so the trigger branch must stay small (no `slice`). As its own circuit, `executeOrder` is 76.7 MB, which only the keeper proves.
 
 ## 7. Limit orders
 
 **Contract change:** yes. A later contract version, after 3 + 4 + 6.
+
+**Status 2026-10-09:** built in the contract (`placeLimitOrder`, `executeLimitOrder`, `cancelLimitOrder`), the core code (`core/limits.ts`, `core/perp.ts`), the keeper and the tests, and run on the devnet (`npm run limit`); deployed on preview 2026-10-10 (zkperp `a0595104…`). Frontend built 2026-10-10 (Market/Limit in the ticket, open orders on the Trade page, the chart and Portfolio, cancel, recovery from the trader's note); a limit order placed from the browser on preview was filled there by the keeper. Expiry added 2026-10-10 (contract, notes, keeper, frontend, tests; devnet `npm run limit` passed), not yet on preview. No execution fee: decided 2026-10-10, none for limit orders, stop losses or take profits. The fill takes no separate opening fee: as with `openPosition`, the fee stays in the escrowed coin and leaves at close. Proving keys: placing 10.0 MB and cancelling 19.5 MB (both fit 1AM), filling 21.6 MB (the keeper only).
 
 Harder than step 6: opening spends the trader's collateral, and a keeper cannot spend someone else's shielded coin. So the collateral waits in the contract.
 
@@ -215,8 +239,8 @@ Design:
 - **Fill:** when the price crosses, a keeper proves it and turns the escrow into a position at the oracle price, which is at or better than the limit. The fill writes the position commitment and its liquidator notes, like an open, and takes the opening fee.
 - **Cancel:** the owner takes the escrow back, paid to the payout key bound at placing.
 - **No free slot at fill:** the fill is refused and the order waits.
-- **Fee:** an execution fee to the filling keeper.
-- **Expiry:** optional; an expired order can only be cancelled.
+- **Fee:** none (decided 2026-10-10). The keeper's costs are the protocol's.
+- **Expiry:** optional; an expired order can only be cancelled. Checked against the fill's open time, so the expiry stays private.
 
 Privacy:
 
@@ -230,10 +254,12 @@ Costs:
 
 Tasks:
 
-- [ ] Contract: escrow, order commitment and note, `fillOrder`, cancel, expiry.
-- [ ] Keeper: watch orders, fill, retry when the slot or price moved.
-- [ ] Frontend: Market/Limit switch in the order ticket; open orders in Portfolio and on the chart; cancel.
-- [ ] Tests: fills only at or better than the limit; cancel returns the escrow; a filled or cancelled order cannot be reused; capacity refusals; `/check` fuzzing.
+- [x] Contract: escrow, order commitment and note, fill (`executeLimitOrder`), cancel. The fill publishes its entry price and open time under the order's nullifier (`limitFills`), both public anyway, so the trader can rebuild the position.
+- [x] Contract: expiry (2026-10-10). No execution fee, by decision.
+- [x] Keeper: watch orders, fill, retry when the slot or price moved.
+- [x] Frontend: Market/Limit switch in the order ticket; open orders in Portfolio and on the chart; cancel; recovering waiting and filled orders from the trader's note (2026-10-10; to try in the browser on preview).
+- [x] Tests: fills only at or better than the limit, long and short; cancel returns the escrow; a filled or cancelled order cannot be reused; a full pool makes the order wait; the keeper cannot alter the order or the payout keys; the level and size are not published.
+- [ ] Tests: `/check` fuzzing.
 
 ## 8. Load test with 10 trading agents
 
@@ -289,6 +315,7 @@ Before deploying:
 Deploy and run:
 
 - [ ] `npm run setup:preprod`; seed the pool with liquidity.
+- [ ] Freeze the contract's maintenance authority once every verifier key is on chain. Every deploy gets one, held by the deployer's signing key in `midnight-level-db`, and setup uses it to insert the deferred circuits' keys (`DEFERRED` in `core/session.ts`: a deploy with all 13 circuits is refused, "Transaction would exhaust the block limits"). Whoever holds that key can insert, replace or remove verifier keys, for example swap a circuit for one with other payout rules. After setup, replace the authority with `submitReplaceAuthorityTx`: an empty one, so the circuits can never change, or a multi-signer committee if upgrades should stay possible. Add a check anyone can run that shows the authority, so users can see the rules are frozen. Decide which before launch; preview keeps its authority, for testing.
 - [ ] Three relayers and three keepers on separate machines, run by their operators (steps 3 and 4), plus the treasury.
 - [ ] Health checks and alerts: oracle age near `maxPriceAge`, a keeper or relayer down, a treasury epoch overdue, DUST running low on any service wallet.
 - [ ] Host the frontend at a public HTTPS address, with preprod's config. Check that it reaches a trader's local proof server from there (CORS was checked; Chrome may ask the trader to allow local network access).

@@ -215,7 +215,8 @@ function contractCoinCommitment(coin: { nonce: Uint8Array; color: Uint8Array; va
   ).padEnd(64, "0");
 }
 
-async function collateralIndex(perp: ContractHandle, coin: { nonce: Uint8Array; color: Uint8Array; value: bigint }): Promise<bigint> {
+/** The contract's Merkle index of the coin it holds for `coin`; waits for the indexer to show it. */
+export async function collateralIndex(perp: ContractHandle, coin: { nonce: Uint8Array; color: Uint8Array; value: bigint }): Promise<bigint> {
   const target = contractCoinCommitment(coin, perp.address);
   const deadline = Date.now() + 120_000;
   for (;;) {

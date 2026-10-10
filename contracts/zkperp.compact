@@ -158,6 +158,33 @@ import CompactStandardLibrary;
 // got an order, and later that an order closed some position; executing
 // through its own circuit tells that the close was not the trader's own.
 //
+// ── Limit orders ───────────────────────────────────────────────────────────
+//
+// A limit order is an open that waits for its price: a long that opens once
+// the mark price is at or below the limit, a short at or above. The trader is
+// offline when it fills, so placing it posts the collateral coin now, as an
+// open would, and commits to every field the position will have except its
+// entry price and open time. The keeper fills it with `executeLimitOrder`,
+// which opens the position at the mark price — never worse than the limit —
+// with the coin already held as its collateral, and writes its liquidator note
+// as `openPosition` does. Until then the owner may cancel, which returns the
+// coin to `payTo`.
+//
+// An order may carry an expiry: past it, it no longer fills, and the owner
+// cancels it to get the coin back. The check compares the expiry with the
+// fill's open time, which is public and pinned to the block's time, so the
+// expiry itself stays private.
+//
+// Leverage, fees and the collateral floor are checked when the order is
+// placed; the pool's room (a free slot) when it fills, so a full pool makes
+// the order wait.
+//
+// ⚠️ The public sees that a limit order was placed (not its side, size or
+// level) and later that one filled or was cancelled, through each one's own
+// circuit; a fill at the mark of the moment says the level was near there.
+// The keeper sees every order's level, as for trigger orders, and names the
+// fill's open time within `clockSlack`, as a trader names their own.
+//
 // Not yet here: funding.
 
 // ── Configuration, frozen at deploy ────────────────────────────────────────
@@ -333,6 +360,49 @@ export ledger cancelledOrders: Set<Bytes<32>>;
 // `orderPlaintext` in core/orders.ts.
 export ledger orderNotes: Set<LiquidatorNote>;
 
+// ── Limit orders ───────────────────────────────────────────────────────────
+
+// Everything a limit order commits to: the position it will open, less the
+// entry price and open time. Never stored; only its hash is.
+export struct LimitOrder {
+  owner: Field;
+  isLong: Boolean;
+  size: Uint<64>;
+  // Net of the opening fee, as in `Position`.
+  collateral: Uint<64>;
+  openFee: Uint<64>;
+  // A long fills at or below it, a short at or above. 6 decimals.
+  price: Uint<64>;
+  // Seconds since the epoch after which it no longer fills; 0 for never.
+  expiry: Uint<64>;
+  collateralNonce: Bytes<32>;
+  // Becomes the position's salt. Below the field size.
+  salt: Bytes<32>;
+  payTo: ZswapCoinPublicKey;
+  // The trader's encryption key, which the fill's liquidator note carries.
+  payToEnc: Bytes<32>;
+}
+
+// Commitments to every limit order ever placed; a Merkle tree, so a fill or a
+// cancel proves membership without naming the leaf.
+export ledger limitOrders: HistoricMerkleTree<20, Bytes<32>>;
+
+// Nullifiers of filled and cancelled limit orders; see `limitNullifier`.
+export ledger limitDone: Set<Bytes<32>>;
+
+// For each fill, by nullifier: the entry price and open time. Both are public
+// anyway (the mark price and the transaction's time); the trader needs them
+// to rebuild the position's commitment.
+export struct LimitFill {
+  entryPrice: Uint<64>;
+  openTime: Uint<64>;
+}
+export ledger limitFills: Map<Bytes<32>, LimitFill>;
+
+// One note per limit order for the keeper, in the liquidator note's format:
+// see `limitPlaintext` in core/limits.ts.
+export ledger limitNotes: Set<LiquidatorNote>;
+
 constructor(
   usdcToken: Bytes<32>,
   adminCommitment: Bytes<32>,
@@ -413,6 +483,17 @@ export pure circuit orderCommitment(o: TriggerOrder): Bytes<32> {
 // and the keeper know, so it cannot be matched to the order's commitment.
 export pure circuit orderNullifier(salt: Bytes<32>): Bytes<32> {
   return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:order:nullifier"), salt]);
+}
+
+export pure circuit limitCommitment(o: LimitOrder): Bytes<32> {
+  return persistentHash<LimitOrder>(o);
+}
+
+// Published when a limit order fills or is cancelled. From the salt, in its
+// own domain, so it links neither to the order's commitment nor to the
+// position's nullifier, which the same salt derives.
+export pure circuit limitNullifier(salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:limit:nullifier"), salt]);
 }
 
 // ── The liquidator's note ──────────────────────────────────────────────────
@@ -710,17 +791,7 @@ export circuit openPosition(
   assert(blockTimeLt((t + clockSlack) as Uint<64>), "open time is too far in the past");
   freshPrice();
 
-  // Fee and leverage bounds, checked in the proof against private values. A
-  // failed assert aborts proving, so a reader learns only that they held.
-  assert(coin.value <= 18446744073709551615, "collateral too large");
-  const gross = coin.value as Uint<64>;
-  assert(openFee * 10000 >= size * openFeeBps, "opening fee understated");
-  assert(openFee * 10000 < size * openFeeBps + 10000, "opening fee overstated");
-  assert(openFee < gross, "the opening fee exceeds the collateral");
-  const collateral = (gross - openFee) as Uint<64>;
-  assert(collateral >= minCollateral, "collateral below the minimum");
-  assert(size >= collateral, "size below collateral: leverage under 1x");
-  assert(size <= collateral * maxLeverage, "leverage above the maximum");
+  const collateral = sizing(coin.value, size, openFee);
 
   // One slot of maxPayout, the same for every position, so it tells nobody
   // anything about this one. A check and a decrement, not a read of the
@@ -759,6 +830,23 @@ export circuit openPosition(
     ephemeral
   )));
   openPositions.increment(1);
+}
+
+// The position's collateral, net of the opening fee, from a coin of `value`;
+// checks the fee and the leverage bounds. In the proof, against private
+// values: a failed assert aborts proving, so a reader learns only that they
+// held.
+circuit sizing(value: Uint<128>, size: Uint<64>, openFee: Uint<64>): Uint<64> {
+  assert(value <= 18446744073709551615, "collateral too large");
+  const gross = value as Uint<64>;
+  assert(openFee * 10000 >= size * openFeeBps, "opening fee understated");
+  assert(openFee * 10000 < size * openFeeBps + 10000, "opening fee overstated");
+  assert(openFee < gross, "the opening fee exceeds the collateral");
+  const collateral = (gross - openFee) as Uint<64>;
+  assert(collateral >= minCollateral, "collateral below the minimum");
+  assert(size >= collateral, "size below collateral: leverage under 1x");
+  assert(size <= collateral * maxLeverage, "leverage above the maximum");
+  return collateral;
 }
 
 // Closes a position at the current mark price and settles: the PnL against
@@ -887,6 +975,151 @@ export circuit executeOrder(
   assert(order.above ? mark >= order.price : mark <= order.price, "the order's price has not been reached");
   retire(position, path);
   settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, capacity, false);
+}
+
+// Places a limit order; see "Limit orders" above. Takes the collateral coin
+// as `openPosition` does, and checks the same fee and leverage bounds, so a
+// fill only has to check the price and the pool's room.
+//
+// `note` is the order encrypted for the trader, like a position's note;
+// `keeperNote` the order sealed to the liquidator key by the trader (see
+// core/limits.ts). Neither is checked: a false one only stops the trader's own
+// order from being found or filled, and the trader can still cancel it.
+//
+// Not checked against the mark price: an order whose limit is already
+// reached fills on the keeper's next look, like a market order. Nor is the
+// expiry checked against the clock: one already past only stops the trader's
+// own order from filling.
+export circuit placeLimitOrder(
+  coin: ShieldedCoinInfo,
+  size: Uint<64>,
+  isLong: Boolean,
+  openFee: Uint<64>,
+  price: Uint<64>,
+  expiry: Uint<64>,
+  ownerSecret: Bytes<32>,
+  salt: Bytes<32>,
+  payToEnc: Bytes<32>,
+  note: Bytes<128>,
+  keeperNote: LiquidatorNote
+): [] {
+  assert(disclose(coin.color) == usdc, "collateral must be pUSDC");
+  assert(price > 0, "the limit price must be positive");
+  const collateral = sizing(coin.value, size, openFee);
+  receiveShielded(disclose(coin));
+  const order = LimitOrder {
+    owner: ownerKey(ownerSecret),
+    isLong: isLong,
+    size: size,
+    collateral: collateral,
+    openFee: openFee,
+    price: price,
+    expiry: expiry,
+    collateralNonce: coin.nonce,
+    salt: salt,
+    payTo: ownPublicKey(),
+    payToEnc: payToEnc
+  };
+  limitOrders.insert(disclose(limitCommitment(order)));
+  notes.insert(disclose(note));
+  limitNotes.insert(disclose(keeperNote));
+}
+
+// Fills a limit order whose price is reached, without the owner secret: the
+// keeper knows the order from its note. Opens the position at the mark price
+// with the order's coin as its collateral, as `openPosition` would have, and
+// writes its liquidator note. `openTime`, `ephemeral` and the key halves are
+// as in `openPosition`; the halves must match the order's keys.
+export circuit executeLimitOrder(
+  order: LimitOrder,
+  path: MerkleTreePath<20, Bytes<32>>,
+  openTime: Uint<64>,
+  ephemeral: Field,
+  payToLo: Bytes<16>,
+  payToHi: Bytes<16>,
+  encLo: Bytes<16>,
+  encHi: Bytes<16>
+): [] {
+  const nullifier = spendLimit(order, path);
+  const t = disclose(openTime);
+  assert(blockTimeGte(t), "open time is in the future");
+  assert(blockTimeLt((t + clockSlack) as Uint<64>), "open time is too far in the past");
+  freshPrice();
+  // Read once, outside the condition, as in `executeOrder`: the direction
+  // stays private.
+  const mark = markPrice;
+  assert(order.isLong ? mark <= order.price : mark >= order.price, "the limit price has not been reached");
+  assert(order.expiry == 0 || t < order.expiry, "the limit order has expired");
+
+  assert(!freeSlots.lessThan(1), "the pool has no room for another position");
+  freeSlots.decrement(1);
+
+  const position = Position {
+    owner: order.owner,
+    isLong: order.isLong,
+    size: order.size,
+    collateral: order.collateral,
+    openFee: order.openFee,
+    entryPrice: mark,
+    openTime: t,
+    collateralNonce: order.collateralNonce,
+    salt: order.salt,
+    payTo: order.payTo
+  };
+  positions.insert(disclose(positionCommitment(position)));
+  limitFills.insert(nullifier, LimitFill { entryPrice: mark, openTime: t });
+  assert(ephemeral != 0, "the ephemeral scalar must not be zero");
+  assert(
+    persistentHash<Vector<2, Bytes<16>>>([payToLo, payToHi]) == persistentHash<Bytes<32>>(order.payTo.bytes),
+    "the payout key halves do not match"
+  );
+  assert(
+    persistentHash<Vector<2, Bytes<16>>>([encLo, encHi]) == persistentHash<Bytes<32>>(order.payToEnc),
+    "the encryption key halves do not match"
+  );
+  liquidatorNotes.insert(disclose(sealLiquidatorNote(
+    liquidatorPlaintext(position, payToLo, payToHi, encLo, encHi),
+    liquidator,
+    ephemeral
+  )));
+  openPositions.increment(1);
+}
+
+// Cancels a limit order that has not filled, owner only, and returns its
+// coin to `payTo`. `collateral` names the coin as a close does.
+export circuit cancelLimitOrder(
+  order: LimitOrder,
+  ownerSecret: Bytes<32>,
+  path: MerkleTreePath<20, Bytes<32>>,
+  collateral: QualifiedShieldedCoinInfo
+): [] {
+  assert(order.owner == ownerKey(ownerSecret), "not the owner of this order");
+  spendLimit(order, path);
+  assert(collateral.nonce == order.collateralNonce, "not this order's collateral coin");
+  assert(disclose(collateral.color) == usdc, "collateral must be pUSDC");
+  assert(
+    collateral.value == (order.collateral + order.openFee) as Uint<128>,
+    "collateral coin value does not match"
+  );
+  sendShielded(
+    disclose(collateral),
+    left<ZswapCoinPublicKey, ContractAddress>(disclose(order.payTo)),
+    disclose(collateral.value)
+  );
+}
+
+// Proves `order` is in `limitOrders` without naming its leaf, and spends its
+// nullifier, so it fills or cancels once. Returns the nullifier.
+circuit spendLimit(order: LimitOrder, path: MerkleTreePath<20, Bytes<32>>): Bytes<32> {
+  assert(path.leaf == limitCommitment(order), "path is for a different limit order");
+  assert(
+    limitOrders.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(path))),
+    "no such limit order"
+  );
+  const nullifier = disclose(limitNullifier(order.salt));
+  assert(!limitDone.member(nullifier), "the limit order already filled or was cancelled");
+  limitDone.insert(nullifier);
+  return nullifier;
 }
 
 // Proves `position` is in `positions` without naming its leaf, and spends its

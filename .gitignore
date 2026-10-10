@@ -16,4 +16,3 @@ frontend/public/zk/
 frontend/public/config.json
 coverage/
 bench/captures/
-bench/

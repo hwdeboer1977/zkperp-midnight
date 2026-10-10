@@ -12,6 +12,10 @@ import { usePositions } from "../lib/usePositions";
 import { balanceOf, proverLabel, useWallet } from "../lib/wallet";
 import { CandleChart, type Level } from "../components/CandleChart";
 import { liveOrders, ordersOf } from "../lib/orders";
+import { EXPIRIES, checkLimit, isExpired, placeLimitOrder, useLimitOrders, type OwnLimit } from "../lib/limits";
+import { LimitOrdersTable } from "../components/LimitOrders";
+import { KeeperLine } from "../components/Keeper";
+import { limitReached } from "@core/limits";
 import { contractModule } from "../lib/contracts";
 import { TxProgress, useTxProgress } from "../components/TxProgress";
 import { PositionKeyPanel } from "../components/PositionKey";
@@ -46,6 +50,11 @@ export default function TradePage() {
   const positions = usePositions();
   const relayer = useService<any>(config ? `${config.services.relayer}/health` : undefined, 15_000);
   const [isLong, setLong] = useState(true);
+  // Market opens now at the mark price; limit posts the coin now and waits for its price.
+  const [mode, setMode] = useState<"market" | "limit">("market");
+  const [limitText, setLimitText] = useState("");
+  const [expiryIndex, setExpiryIndex] = useState(0);
+  const expiryChoice = EXPIRIES[expiryIndex]!;
   const [coinText, setCoin] = useState("1000");
   const [leverage, setLeverage] = useState(5);
   const [confirming, setConfirming] = useState(false);
@@ -54,8 +63,17 @@ export default function TradePage() {
   const [failure, setFailure] = useState<string | null>(null);
   const [moved, setMoved] = useState<PriceMovedError | null>(null);
   const [opened, setOpened] = useState<string | null>(null);
+  const [placed, setPlaced] = useState<string | null>(null);
+  const limits = useLimitOrders(key, ledger, config?.contracts.zkperp);
+  const waiting = limits?.filter((o) => o.status === "waiting") ?? [];
+  // Waiting and still able to fill.
+  const fillable = waiting.filter((o) => !isExpired(o, now));
 
   const coin = parse6(coinText);
+  const limitPrice = mode === "limit" ? parse6(limitText) : undefined;
+  const limitCheck = mode === "limit" && ledger ? checkLimit(isLong, limitPrice, ledger.markPrice) : null;
+  // The price the position is planned at: the mark now, or the limit, which a fill only betters.
+  const entry: bigint | undefined = mode === "limit" ? (limitCheck?.error ? undefined : limitPrice) : ledger?.markPrice;
   const plan = useMemo(() => {
     if (!ledger || !coin) return null;
     const feeBps = BigInt(ledger.openFeeBps);
@@ -64,13 +82,14 @@ export default function TradePage() {
     const net = coin - fee;
     const capMove = size > 0n ? Number((ledger.maxPayout * 10_000n) / size) / 100 : 0;
     const t = circuitNow();
+    const at = entry ?? ledger.markPrice;
     const liq =
       size > 0n
-        ? liquidationPrice({ isLong, size, collateral: net, entryPrice: ledger.markPrice, openTime: t }, ledger, t)
+        ? liquidationPrice({ isLong, size, collateral: net, entryPrice: at, openTime: t }, ledger, t)
         : 0n;
-    const liqMove = liq > 0n ? (Math.abs(Number(ledger.markPrice - liq)) / Number(ledger.markPrice)) * 100 : 0;
+    const liqMove = liq > 0n ? (Math.abs(Number(at - liq)) / Number(at)) * 100 : 0;
     return { size, fee, net, capMove, liq, liqMove, closeFee: closeFeeOf(size, BigInt(ledger.closeFeeBps)) };
-  }, [ledger, coin, leverage, isLong]);
+  }, [ledger, coin, leverage, isLong, entry]);
 
   const maxLeverage = ledger ? Number(ledger.maxLeverage) : 20;
   const pusdc = config ? balanceOf(w.shieldedBalances, config.usdcToken) : 0n;
@@ -80,15 +99,17 @@ export default function TradePage() {
   const nearStale = !!ledger && !stale && maxAge - age < TRADE_SECONDS;
   const problem = !ledger
     ? "Reading zkperp…"
-    : stale
-      ? "Trading is paused until the oracle publishes a fresh price."
+    : stale && mode === "market"
+      ? "Trading is paused until the oracle publishes a fresh price. A limit order can still be placed."
+      : limitCheck?.error
+        ? limitCheck.error
       : !coin || !plan
         ? "Enter the collateral to post."
         : plan.net < ledger.minCollateral
           ? `Collateral after the fee must be at least ${fmt6(ledger.minCollateral)} pUSDC.`
           : coin > pusdc
             ? `Your wallet holds ${fmt6(pusdc)} pUSDC. Get more from the faucet.`
-            : ledger.freeSlots < 1n
+            : ledger.freeSlots < 1n && mode === "market"
               ? "The pool has no room for another position right now."
               : null;
 
@@ -119,6 +140,7 @@ export default function TradePage() {
     setConfirming(false);
     setMoved(null);
     setOpened(null);
+    setPlaced(null);
     setFailure(null);
     progress.start();
     try {
@@ -137,7 +159,31 @@ export default function TradePage() {
     }
   }
 
-  const levels = useOrderLevels(positions.open, ledger);
+  async function submitLimit() {
+    if (!coin || !plan || !key || !limitPrice) return;
+    setBusy(true);
+    setConfirming(false);
+    setMoved(null);
+    setOpened(null);
+    setPlaced(null);
+    setFailure(null);
+    progress.start();
+    try {
+      const perp = await w.contract("zkperp");
+      const expiry = expiryChoice.seconds ? circuitNow() + BigInt(expiryChoice.seconds) : 0n;
+      const txHash = await placeLimitOrder(perp, key, coin, plan.size, isLong, limitPrice, expiry);
+      progress.done();
+      setPlaced(txHash);
+      void w.refresh();
+    } catch (e: any) {
+      progress.fail();
+      setFailure(e?.message ?? String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const levels = [...useOrderLevels(positions.open, ledger), ...limitLevels(fillable)];
 
   const side = isLong ? "long" : "short";
   const signed = (v: bigint) => `${v >= 0n ? "+" : "−"}${fmt6(v >= 0n ? v : -v)}`;
@@ -220,6 +266,10 @@ export default function TradePage() {
           <CandleChart candles={candles} oracle={oracle} levels={levels} />
         </section>
 
+        <KeeperLine
+          active={!!w.api && (positions.open.length > 0 || waiting.length > 0)}
+          waiting={!!ledger && fillable.some((o) => limitReached(o, ledger.markPrice))}
+        />
         <section className="card">
           <div className="card-head">
             <h2>Your private positions</h2>
@@ -276,6 +326,16 @@ export default function TradePage() {
           )}
         </section>
 
+        {waiting.length > 0 && (
+          <section className="card">
+            <div className="card-head">
+              <h2>Your limit orders</h2>
+              <span className="muted">filled by the keeper when the price gets there</span>
+            </div>
+            <LimitOrdersTable orders={waiting} ledger={ledger} />
+          </section>
+        )}
+
         <details className="card inspector">
           <summary>
             <h2>Privacy inspector</h2>
@@ -306,8 +366,8 @@ export default function TradePage() {
               <b>The keeper</b>
               <p>
                 Decrypts its note: size, side, collateral, entry and payout key — enough to liquidate, never the owner secret, so it
-                cannot close for you. It also reads your stop loss and take profit levels, to execute them; the public sees only
-                that an order was placed.
+                cannot close for you. It also reads your stop loss and take profit levels, and your limit orders' level, size and
+                side, to execute them; the public sees only that an order was placed, and later that it filled or was cancelled.
               </p>
             </div>
             <div>
@@ -322,6 +382,17 @@ export default function TradePage() {
         {!w.api && <NeedsWallet what="trade" />}
         {w.api && <PositionKeyPanel compact />}
         <section className="card trade">
+          <div className="mode-tabs">
+            <button className={mode === "market" ? "on" : ""} onClick={() => (setMode("market"), setConfirming(false))}>
+              Market
+            </button>
+            <button
+              className={mode === "limit" ? "on" : ""}
+              onClick={() => (setMode("limit"), setConfirming(false), !limitText && ledger && setLimitText(fmt6(ledger.markPrice).replace(/,/g, "")))}
+            >
+              Limit
+            </button>
+          </div>
           <div className="toggle">
             <button className={isLong ? "on long" : ""} onClick={() => (setLong(true), setConfirming(false))}>
               Long
@@ -330,6 +401,38 @@ export default function TradePage() {
               Short
             </button>
           </div>
+          {mode === "limit" && (
+            <label>
+              <span className="label-row">
+                Limit price {ledger && <small>mark ${fmt6(ledger.markPrice)}</small>}
+              </span>
+              <span className="input-unit">
+                <input value={limitText} onChange={(e) => (setLimitText(e.target.value), setConfirming(false))} inputMode="decimal" />
+                <span>USD</span>
+              </span>
+              <small className="muted">
+                {isLong ? "Opens when the execution price is at or below this." : "Opens when the execution price is at or above this."}
+              </small>
+              {limitCheck?.warning && <small className="warn-text">{limitCheck.warning}</small>}
+            </label>
+          )}
+          {mode === "limit" && (
+            <label>
+              <span className="label-row">Expires</span>
+              <span className="quick">
+                {EXPIRIES.map((e, i) => (
+                  <button key={e.seconds} type="button" className={`small ${i === expiryIndex ? "on" : ""}`} onClick={() => (setExpiryIndex(i), setConfirming(false))}>
+                    {e.label === "Until cancelled" ? "Never" : e.label}
+                  </button>
+                ))}
+              </span>
+              <small className="muted">
+                {expiryChoice.seconds
+                  ? "Past this it no longer fills; cancel it then to get the coin back. The expiry is private, like the limit."
+                  : "It waits until it fills or you cancel it."}
+              </small>
+            </label>
+          )}
           <label>
             <span className="label-row">
               Collateral {w.api && <small>wallet {fmt6(pusdc)} pUSDC</small>}
@@ -376,10 +479,19 @@ export default function TradePage() {
               <dl className="summary">
                 <dt title="Collateral after the opening fee × leverage">Position size</dt>
                 <dd className="strong">{fmt6(plan.size)} pUSDC</dd>
-                <dt title="The contract's mark price: every open executes here, whatever the live market shows">Entry (execution price)</dt>
-                <dd>${fmt6(ledger.markPrice)}</dd>
+                {mode === "market" ? (
+                  <>
+                    <dt title="The contract's mark price: every open executes here, whatever the live market shows">Entry (execution price)</dt>
+                    <dd>${fmt6(ledger.markPrice)}</dd>
+                  </>
+                ) : (
+                  <>
+                    <dt title="The fill is at the execution price of that moment: the limit or better">Entry (limit)</dt>
+                    <dd>{entry ? `${isLong ? "≤" : "≥"} $${fmt6(entry)}` : "—"}</dd>
+                  </>
+                )}
                 <dt>Opening fee ({Number(ledger.openFeeBps) / 100}%)</dt>
-                <dd>{fmt6(plan.fee)}</dd>
+                <dd>{fmt6(plan.fee)}{mode === "limit" && " at fill"}</dd>
                 <dt>Collateral after fee</dt>
                 <dd>{fmt6(plan.net)}</dd>
                 <dt>Closing fee</dt>
@@ -388,7 +500,7 @@ export default function TradePage() {
                 <dd>{fmt6((plan.size * BigInt(ledger.borrowRate) * 3600n) / 1_000_000_000_000n, 4)} / hour</dd>
               </dl>
               <dl className="summary risk">
-                <dt title={`The keeper may liquidate once equity falls below ${Number(ledger.maintenanceBps) / 100}% of size; a ${Number(ledger.liquidationFeeBps) / 100}% liquidation fee comes out of what is left`}>
+                <dt title={`The keeper may liquidate once equity falls below ${Number(ledger.maintenanceBps) / 100}% of size; a ${Number(ledger.liquidationFeeBps) / 100}% liquidation fee comes out of what is left${mode === "limit" ? ". For a fill exactly at the limit" : ""}`}>
                   Liquidation price
                 </dt>
                 <dd className="strong liq">
@@ -404,7 +516,7 @@ export default function TradePage() {
             </>
           )}
 
-          {nearStale && !busy && (
+          {nearStale && !busy && mode === "market" && (
             <div className="warn">
               The oracle price expires in {Math.max(0, maxAge - age)}s. A trade takes about a minute to prove and land; it fails
               if the price expires first, and costs nothing but time.
@@ -413,10 +525,29 @@ export default function TradePage() {
 
           {w.api && !confirming && !busy && (
             <button className={`primary ${side}`} disabled={!!problem || !key} onClick={() => setConfirming(true)}>
-              {`Open ${side}${plan && plan.size > 0n ? ` · ${fmt6(plan.size, 0)} pUSDC` : ""}`}
+              {`${mode === "market" ? "Open" : "Place limit"} ${side}${plan && plan.size > 0n ? ` · ${fmt6(plan.size, 0)} pUSDC` : ""}`}
             </button>
           )}
-          {w.api && confirming && plan && ledger && (
+          {w.api && confirming && plan && ledger && mode === "limit" && entry && (
+            <div className="confirm">
+              <p>
+                Place a <b className={side}>{side}</b> of <b>{fmt6(plan.size)} pUSDC</b> that opens once the execution price is{" "}
+                {isLong ? "at or below" : "at or above"} <b>${fmt6(entry)}</b>, posting <b>{fmt6(coin ?? 0n)} pUSDC</b> now. The
+                keeper fills it at the price of that moment; you can cancel it until then and get the whole coin back. A fill
+                waits while the pool is full.{" "}
+                {expiryChoice.seconds ? `It expires in ${expiryChoice.label}, unfilled.` : "It does not expire."}
+              </p>
+              <div className="row" style={{ margin: 0 }}>
+                <button className="ghost" onClick={() => setConfirming(false)}>
+                  Back
+                </button>
+                <button className={`primary ${side}`} style={{ flex: 1 }} disabled={!!problem || !key} onClick={() => void submitLimit()}>
+                  Confirm and prove
+                </button>
+              </div>
+            </div>
+          )}
+          {w.api && confirming && plan && ledger && mode === "market" && (
             <div className="confirm">
               <p>
                 Open a <b className={side}>{side}</b> of <b>{fmt6(plan.size)} pUSDC</b> at <b>${fmt6(ledger.markPrice)}</b>,
@@ -442,13 +573,19 @@ export default function TradePage() {
           )}
           {w.api && !key && <p className="muted" style={{ margin: 0 }}>Unlock your position key above to trade.</p>}
           {problem && w.api && <p className="muted" style={{ margin: 0 }}>{problem}</p>}
-          <TxProgress progress={progress} prepare="Prepare the opening and its encrypted note" />
+          <TxProgress progress={progress} prepare={mode === "market" ? "Prepare the opening and its encrypted note" : "Prepare the order and its encrypted notes"} />
           <ProverLine />
           {failure && <p className="bad" style={{ margin: 0 }}>Failed: {failure}</p>}
           {moved && (
             <div className="banner warn">
               The price moved from ${fmt6(moved.provenAt)} to ${fmt6(moved.now)} while proving. Nothing was opened.{" "}
               <button onClick={() => submit(moved.now)}>Open at ${fmt6(moved.now)}</button>
+            </div>
+          )}
+          {placed && (
+            <div className="banner ok">
+              Limit order placed ({placed.slice(0, 12)}…). The keeper opens it when the price gets there; it then shows under your
+              positions. Like a position, it is encrypted to your password and can be found and cancelled from any computer.
             </div>
           )}
           {opened && (
@@ -462,6 +599,11 @@ export default function TradePage() {
     </div>
     </>
   );
+}
+
+/** Lines on the chart for the waiting limit orders. */
+function limitLevels(waiting: OwnLimit[]): Level[] {
+  return waiting.map((o) => ({ price: Number(o.price) / 1e6, title: `Limit ${o.isLong ? "long" : "short"}`, tone: "muted" as const }));
 }
 
 /** Lines on the chart for the open positions' live orders. */
