@@ -13,8 +13,23 @@ This file records the next steps agreed on 2026-10-08, after the first `preview`
 | 7 | Limit orders, with escrowed collateral | **Yes** | Large |
 | 8 | Load test with 10 trading agents | No | Medium |
 | 9 | Launch on preprod instead of preview | No, a fresh deployment | Medium |
+| 10 | Add collateral (then increase size), after wave 2 | **Yes** | Small–Medium |
+| 11 | Bracket orders: TP/SL attached to a limit order, after wave 2 | No, frontend first | Small |
+| 12 | Partial close, after wave 2 | **Yes** | Medium |
+| 13 | Funding rate and per-side open interest caps, after wave 2 | Design note first | Large |
 
-Steps 3, 4 and 6 change the contract, so they ship together in **one** redeployment. Step 7 is a later contract version of its own. Step 1 comes first, so those changes land on a safety net. Step 8 then tests the new version under load, and step 9 launches it on preprod.
+Steps 3, 4 and 6 change the contract, so they ship together in **one** redeployment. Step 7 is a later contract version of its own. Step 1 comes first, so those changes land on a safety net. Step 8 then tests the new version under load, and step 9 launches it on preprod. Steps 10–13 were added on 2026-10-11, after limit orders, stop loss and take profit were in place. They come **after wave 2 of the buildathon**: for wave 2 the orders (market, limit, stop loss, take profit) stay as they are.
+
+## Next buildathon wave: scope
+
+Decided 2026-10-11. In this order:
+
+1. **Step 1b, `/check` fuzzing** (with the property tests of 1a where cheap), over the circuits as they are today, `executeOrder` and `executeLimitOrder` included. It is the safety net for the contract changes below.
+2. **Step 2, per-role keys.** Independent oracle signers and keepers each need their own secret.
+3. **Steps 3 + 4, the 2-of-3 oracle and three keepers**, in one contract version and one redeployment. The orders' internals change, not their behaviour: each TP/SL and limit note is sealed to three keeper keys, and `executeLimitOrder` writes three liquidator notes, so the order tests run again. Test early on the devnet: the deploy ceiling (about 14–15 circuits, the new ones in `DEFERRED`), and 1AM's 37 MB proving-key limit (`closePosition` is 38.8 MB already; the fee-to-caller change must not grow it).
+4. **Step 5, a second market (BTC-USD)**, deployed from the finished contract: its own pool, three relayers on the BTC/USD feed, three keepers, and a market selector in the frontend.
+
+Out of this wave: the order features stay as they are. Step 6's merge of `executeOrder` into `closePosition` waits, as do steps 10–13.
 
 ## 1. More tests
 
@@ -48,8 +63,17 @@ Proofs evaluate **every** branch of an `if`; only the taken branch's effects are
 
 `/check` validates a circuit's inputs against its constraints without the expensive proof, so it catches this class cheaply.
 
-- [ ] Fuzz `openPosition`, `closePosition` and `liquidatePosition` with random valid inputs, especially edge cases: flat price, a profit at the cap, a profit above the cap, a wipe-out, maximum leverage, minimum collateral, a borrow fee larger than the equity left.
-- [ ] Same for `addLiquidity` and `removeLiquidity` at share-price and capacity boundaries.
+- [x] Fuzz `openPosition`, `closePosition` and `liquidatePosition` with random valid inputs, especially edge cases: flat price, a profit at the cap, a profit above the cap, a wipe-out, maximum leverage, minimum collateral, a borrow fee larger than the equity left.
+- [x] Same for `addLiquidity` and `removeLiquidity` at share-price and capacity boundaries.
+- [x] Also every other circuit: `setPrice`, `depositFees`, `placeOrder`, `cancelOrder`, `executeOrder`, `placeLimitOrder`, `executeLimitOrder`, `cancelLimitOrder`.
+
+`npm run test:fuzz -- [cases] [seed]` (2026-10-11, `test/check.fuzz.mjs`). Each case deploys locally with random parameters and walks a random life through every circuit, biased to the edges; each call the runtime accepts is built into the transaction the SDK would prove and sent to `/check`. Two controls run first: an honest call passes, a forged input is refused. About 0.25 s per call; 200 cases (about 2,000 calls) take under ten minutes. First run: every accepted call passed `/check`.
+
+What the fuzzer found in the runtime's refusals:
+
+- [x] **A close in profit is refused when the pool is full.** `settle` calls `repool` before `freeSlots.increment(1)`, so when every slot is taken and the profit moves the pool below a slot boundary, `repool` finds no free slot to retire and asserts "that liquidity is reserved for open positions", although the closing position's own slot is about to free. A trader cannot close a winning position, and a take profit cannot execute, until another position frees a slot or an LP deposits. Reproduced: a pool of 1 slot plus 1,000 units, one long, a 10% rise. Fixed 2026-10-11: `settle` frees the slot before `repool`; regression test "a full pool" in `test/zkperp.test.mjs`. Ships with the steps 3 + 4 redeployment; `preview` still runs the old contract.
+- [ ] A position whose loss would add more than 65,535 slots to the pool cannot be closed or liquidated ("the pool changes by too many slots at once"). Unreachable with real parameters (at a `maxPayout` of 100,000 pUSDC it takes a loss above 6.5 billion pUSDC), but worth bounding at open, or splitting the step.
+- [ ] Each new circuit joins the fuzzer as it lands: `addCollateral` (step 10) and the partial close (step 12).
 - [ ] Run it in CI against a proof server container.
 
 ### 1c. Frontend unit tests
@@ -326,6 +350,51 @@ Launch:
 - [ ] The preview checks again on preprod: open, close, TP/SL, liquidation, recovery on a second browser.
 - [ ] A short trader guide: Docker proof server, 1AM set to Local, the password, what is private and what is not (linking `docs/privacy.md`).
 - [ ] Keep preview running until preprod is stable, then retire it (close positions, let LPs withdraw).
+
+## 10. Add collateral
+
+**Contract change:** yes.
+
+Lets a trader top up a position near liquidation instead of closing it. A new circuit consumes the position (its nullifier), takes a new coin, and re-creates the position with the larger collateral and a fresh liquidator note written in the circuit, as the open does. Size, side, entry price and open time carry over, so the borrow fee keeps accruing from the original open.
+
+- [ ] Contract: `addCollateral`; the leverage and collateral checks as on open; new liquidator note(s), three once step 4 lands.
+- [ ] The position's commitment changes, so its SL/TP orders no longer match: the frontend re-places them after the top-up (and cancels the old ones, returning nothing, as they hold no coin).
+- [ ] Frontend: "Add collateral" on each open position, showing the new liquidation price.
+- [ ] Tests: the liquidation price moves away; a liquidated or closed position cannot be topped up; only the owner can; the old commitment cannot be closed afterwards.
+- [ ] Measure the circuit's proving-key size against 1AM's limit (37 MB carried).
+- [ ] `/check` fuzzing (step 1b): tiny and huge top-ups, a top-up on a position already below maintenance, top-ups that bring leverage to exactly 1×, a borrow fee larger than the equity left at the time of the top-up.
+- [ ] Property test (step 1a): a top-up then close settles the same as an open with the larger collateral, less nothing; the liquidation price only moves away from the mark.
+- [ ] Later: increase size, the same mechanics plus the opening fee on the added size and the leverage bound.
+
+## 11. Bracket orders
+
+**Contract change:** none, done in the frontend first.
+
+A limit order with a take profit and stop loss attached: set once, walk away. The frontend keeps the chosen levels with the limit order (in the trader's note) and places the TP/SL orders as soon as it sees the fill. The trader must come online after the fill for that; until then the position is unprotected, which the UI says.
+
+- [ ] Frontend: TP/SL inputs on the Limit ticket; place them on fill; show them as pending on the order.
+- [ ] Property test of the frontend's checks: random limit levels and TP/SL levels never yield a TP/SL that would fire at once on fill, nor one on the wrong side of the limit.
+- [ ] Later, if the gap matters: let the keeper place them at fill (the trader pre-seals the order notes), or have `executeLimitOrder` commit them, at a proving cost to measure.
+
+## 12. Partial close
+
+**Contract change:** yes.
+
+Close part of a position: settle a fraction of size and collateral, and re-create the rest as a new position (new commitment, new liquidator note, SL/TP to re-place as in step 10).
+
+- [ ] Its own circuit, not a branch of `closePosition`, which is already 38.8 MB, just above the 37 MB 1AM proved.
+- [ ] `/check` fuzzing: proofs evaluate every branch, so the split's arithmetic must stay valid in untaken branches (rounding of fees and PnL on both parts in the pool's favour).
+- [ ] Tests: the two parts' settlement plus the remainder equals a full close, within rounding; the remainder's liquidation price is unchanged.
+- [ ] Property test (step 1a): random sizes, fractions and prices; the two parts conserve value, and splitting never pays more than one full close.
+
+## 13. Funding rate and per-side open interest caps
+
+**Contract change:** yes, but write the design first.
+
+The contract notes "Not yet here: funding." Funding, and caps on long or short exposure, both need the long/short split, and today no position's side is public: the slot counter reserves the same for either. Publishing open interest per side would reveal each open's side. The borrow fee already prices the pool's risk.
+
+- [ ] A design note in `docs/`: what funding buys over the borrow fee for a pool-as-counterparty market; options that keep sides private (e.g. a skew the oracle relays from a reference market, or a ZK-aggregated total revealed only per epoch); what each leaks.
+- [ ] Decide whether to build it before preprod; likely not.
 
 ## Running it 24/7: who proves what
 

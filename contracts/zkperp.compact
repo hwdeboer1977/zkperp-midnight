@@ -1294,10 +1294,13 @@ circuit settle(
     const paid = sendShielded(pool, payTo, profitAmt as Uint<128>);
     pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   }
+  // This position's slot frees first: a profit can move the pool below a slot
+  // boundary, and in a full pool `repool` then retires the slot just freed.
+  // The other way round, a winning close in a full pool was refused.
+  freeSlots.increment(1);
   if (disclose(lossAmt > 0 || profitAmt > 0)) {
     repool((poolValue + lossAmt - profitAmt) as Uint<64>, capacity);
   }
-  freeSlots.increment(1);
   closedPositions.increment(1);
 }
 

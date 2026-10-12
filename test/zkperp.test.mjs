@@ -1925,5 +1925,45 @@ if (afterLoss) {
   expect("a small redemption rounds down", exact.ok && !over.ok, `${why(exact)} / ${why(over)}`);
 }
 
+// ── A full pool ─────────────────────────────────────────────────────────────
+
+console.log("\n  a full pool\n");
+
+{
+  // One slot, just: a profit of any size moves the pool below the boundary,
+  // so the close must free its own slot before the pool retires one. Found by
+  // the /check fuzzer (test/check.fuzz.mjs), whose runtime refused this close.
+  const POOL = MAX_PAYOUT + 1_000n;
+  const funded = call(LP, genesis, "addLiquidity", coin(POOL), POOL);
+  const size = 10_000_000_000n;
+  const c = coin(1_000_000_000n);
+  c.nonce = belowField(c.nonce);
+  const secret = bytes32(0x51);
+  const salt = belowField(bytes32(0x52));
+  const opened = openCall(TRADER, funded.state, c, size, true, secret, salt);
+  const full = opened.ok && ledger(opened.state);
+  expect("(the pool is full: one slot, taken)", full && full.slotCapacity === 1n && full.freeSlots === 0n, why(opened));
+
+  const risen = call(DEPLOYER, opened.state, "setPrice", 3_300_000_000n, T0, ADMIN_SECRET).state;
+  const p = {
+    owner: pureCircuits.ownerKey(secret), isLong: true, size, collateral: c.value, openFee: openFeeOf(size),
+    entryPrice: PRICE, openTime: T0, collateralNonce: c.nonce, salt, payTo: TRADER,
+  };
+  const pnl = m.positionPnl(true, size, PRICE, 3_300_000_000n, MAX_PAYOUT).pnl;
+  // The fees come out of the collateral, so the pool pays the whole profit.
+  const capacity = capOf(POOL - pnl);
+  const won = callAt(
+    T0, TRADER, risen, "closePosition", p, secret, ledger(risen).positions.findPathForLeaf(pureCircuits.positionCommitment(p)),
+    held(c, size), pnl, closeFeeOf(size), 0n, T0, capacity
+  );
+  expect("a winning close in a full pool is accepted", won.ok, why(won));
+  if (won.ok) {
+    const l = ledger(won.state);
+    expect("the trader is paid the profit", paidTo(won, TRADER) === c.value - closeFeeOf(size) + pnl, `${paidTo(won, TRADER)}`);
+    expect("the pool drops below one slot, none free, none reserved", l.slotCapacity === 0n && l.freeSlots === 0n, `${l.slotCapacity}/${l.freeSlots}`);
+    expect("the reservation still fits the pool", l.poolValue > reservedOf(l));
+  }
+}
+
 console.log(failures ? `\n${failures} failure(s)\n` : "\nall passed\n");
 process.exit(failures ? 1 : 0);

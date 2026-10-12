@@ -16,3 +16,5 @@ frontend/public/zk/
 frontend/public/config.json
 coverage/
 bench/captures/
+# Written by npm run test:fuzz on a failure: holds the failing inputs.
+check-fuzz-failures-*.json
