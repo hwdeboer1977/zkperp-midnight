@@ -16,7 +16,9 @@ export default function PublicPage() {
   const config = useConfig();
   const { ledger, error } = useLedger();
   const now = useNow(5000);
-  const relayer = useService<any>(config ? `${config.services.relayer}/health` : undefined);
+  // The oracle's three signers, each its own relayer.
+  const signerUrl = (n: number) => config?.services.signers?.[n] && `${config.services.signers[n]}/health`;
+  const signerHealth = [useService<any>(signerUrl(0)), useService<any>(signerUrl(1)), useService<any>(signerUrl(2))];
   const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs` : undefined, 30_000);
   const { actions, prices } = useActivity();
 
@@ -30,6 +32,8 @@ export default function PublicPage() {
   const maxAge = Number(ledger.maxPriceAge);
   const slotsUsed = Number(ledger.slotCapacity - ledger.freeSlots);
   const slots = Number(ledger.slotCapacity);
+  const signersUp = signerHealth.filter((h) => h && !h.lastError).length;
+  const signedBy = [...ledger.priceSigners].map((s: bigint) => Number(s) + 1).join(" + ");
   const liquidations = actions?.filter((a) => a.entryPoint === "liquidatePosition").length;
 
   return (
@@ -65,7 +69,7 @@ export default function PublicPage() {
         <Stat
           label="Mark price · ETH-USD"
           value={`$${fmt6(ledger.markPrice)}`}
-          sub={`${Math.floor(age / 60)} of ${Math.floor(maxAge / 60)} min max age${relayer ? ` · relayer ${relayer.lastError ? "erroring" : "up"}` : " · relayer unreachable"}`}
+          sub={`${Math.floor(age / 60)} of ${Math.floor(maxAge / 60)} min max age · signed by signers ${signedBy} · ${signersUp} of 3 signers up`}
           meter={{ value: age / maxAge, tone: age >= maxAge ? "bad" : age > maxAge * 0.75 ? "warn" : undefined }}
         />
       </section>
@@ -141,7 +145,11 @@ export default function PublicPage() {
           <ul>
             <li>Pool liquidity and zLP supply, so every LP deposit and withdrawal</li>
             <li>Reserved liquidity: open positions × the payout cap ({fmt6(ledger.maxPayout, 0)} pUSDC)</li>
-            <li>The mark price and when the oracle saw it</li>
+            <li>The mark price, when the oracle saw it, and its Chainlink round (now {String(ledger.priceRound)})</li>
+            <li>
+              Which two of the three oracle signers signed each price: the proof checks their signatures, and no price moves
+              without two. For this demo one operator runs all three signers.
+            </li>
             <li>That a position opened, closed or was liquidated, and when</li>
             <li>At a close, the PnL — it is the pool's change</li>
             <li>Each fee epoch's deposit to LPs</li>

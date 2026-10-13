@@ -23,6 +23,7 @@
     "stoploss": "npm run build && node dist/scripts/stoploss.js",
     "limit": "npm run build && node dist/scripts/limit.js",
     "probe:race": "npm run build && node dist/scripts/probe-race.js",
+    "oracle:race": "npm run build && node dist/scripts/oracle-race.js",
     "setup:local": "npm run build && ZKPERP_NETWORK=local node dist/scripts/setup.js",
     "setup:preview": "npm run build && ZKPERP_NETWORK=preview node dist/scripts/setup.js",
     "relayer": "npm run build && ZKPERP_NETWORK=local node dist/services/oracle/relayer.js",

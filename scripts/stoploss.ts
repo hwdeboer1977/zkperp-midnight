@@ -24,7 +24,7 @@
 
 import chalk from "chalk";
 import fs from "fs";
-import { createHash } from "crypto";
+import { oracleSecrets } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
@@ -82,7 +82,7 @@ async function main() {
   const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
 
   const devSeed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  const oracle = oracleSecrets(devSeed);
   const secret = liquidatorSecret(devSeed);
 
   step("Wallets");
@@ -108,7 +108,7 @@ async function main() {
     info(`zkperp ${perpAddress} at $${fmt(p0)}`);
 
     step("The trader opens three 5x longs");
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
     const before = await balance(trader, usdc);
     const first = await timed("opened the first", () => openPosition(traderPerp, usdc, COIN, SIZE, true, LOCAL.networkId));
     const second = await timed("opened the second", () => openPosition(traderPerp, usdc, COIN, SIZE, true, LOCAL.networkId));
@@ -214,7 +214,7 @@ async function main() {
 
     step(`The admin drops the price ${Number(DROP_BPS) / 100}%`);
     const low = (p0 * (10_000n - DROP_BPS)) / 10_000n;
-    await submitPrice(devPerp, low, adminSecret);
+    await submitPrice(devPerp, low, oracle);
     now = await ordersNow();
     const firing = now.of(first.record);
     const tpLow = now.of(third.record);
@@ -237,7 +237,7 @@ async function main() {
 
     step(`The admin raises the price ${Number(RISE_BPS) / 100}% above the start`);
     const high = (p0 * (10_000n + RISE_BPS)) / 10_000n;
-    await submitPrice(devPerp, high, adminSecret);
+    await submitPrice(devPerp, high, oracle);
     now = await ordersNow();
     const tpFiring = now.of(third.record);
     info(`price $${fmt(now.ledger.markPrice)}`);
@@ -248,7 +248,7 @@ async function main() {
     await settle(tpFiring, third.record, "take profit");
 
     step("Restoring the price");
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
     info(`price $${fmt(p0)}`);
   } finally {
     for (const w of wallets) await w.facade.stop();

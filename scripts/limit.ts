@@ -21,7 +21,7 @@
 
 import chalk from "chalk";
 import fs from "fs";
-import { createHash } from "crypto";
+import { oracleSecrets } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
@@ -76,7 +76,7 @@ async function main() {
   const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
 
   const devSeed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  const oracle = oracleSecrets(devSeed);
   const secret = liquidatorSecret(devSeed);
 
   step("Wallets");
@@ -100,7 +100,7 @@ async function main() {
     const usdc: Uint8Array = l0.usdc;
     const p0: bigint = l0.markPrice;
     info(`zkperp ${perpAddress} at $${fmt(p0)}`);
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
 
     step("The trader places three limit orders");
     const before = await balance(trader, usdc);
@@ -174,7 +174,7 @@ async function main() {
 
     step(`The admin drops the price ${Number(MOVE_BPS) / 100}%`);
     const low = (p0 * (10_000n - MOVE_BPS)) / 10_000n;
-    await submitPrice(devPerp, low, adminSecret);
+    await submitPrice(devPerp, low, oracle);
     now = await limitsNow();
     check("the short does not fill below its limit", !limitFires(now.ledger, now.of(short.record)!));
     step(BY_SERVICE ? "The keeper service fills the long" : "The keeper fills the long");
@@ -182,7 +182,7 @@ async function main() {
 
     step(`The admin raises the price ${Number(MOVE_BPS) / 100}% above the start`);
     const high = (p0 * (10_000n + MOVE_BPS)) / 10_000n;
-    await submitPrice(devPerp, high, adminSecret);
+    await submitPrice(devPerp, high, oracle);
     step(BY_SERVICE ? "The keeper service fills the short" : "The keeper fills the short");
     const shortPosition = await filled(short.record, "short");
 
@@ -194,7 +194,7 @@ async function main() {
     check("the short, sold at the top, closes flat at an unchanged price", c2.pnl === 0n);
 
     step("Restoring the price");
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
     info(`price $${fmt(p0)}`);
   } finally {
     for (const w of wallets) await w.facade.stop();

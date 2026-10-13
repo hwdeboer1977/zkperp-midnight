@@ -13,7 +13,8 @@ import CompactStandardLibrary;
 // counterparty to every position, long or short. When a position closes in
 // profit the pool pays the profit; when it closes at a loss the pool keeps
 // the collateral lost.
-// Prices come from an oracle (here: a mock, set by the admin).
+// Prices come from an oracle: Chainlink rounds, signed by two of three
+// signers; see "Oracle" below.
 //
 // Pool and positions live in ONE contract because they have to: a Midnight
 // contract can neither call another nor read another's ledger, so a pool in a
@@ -192,9 +193,6 @@ import CompactStandardLibrary;
 // The only token accepted as liquidity or collateral: pUSDC's `tokenId`.
 export sealed ledger usdc: Bytes<32>;
 
-// Hash of the admin's secret; see `adminKey`. Controls the mock oracle only.
-export sealed ledger admin: Bytes<32>;
-
 // Largest size / collateral a position may open at, on the collateral net
 // of the opening fee.
 export sealed ledger maxLeverage: Uint<8>;
@@ -238,6 +236,32 @@ export sealed ledger liquidationFeeBps: Uint<16>;
 export sealed ledger liquidator: JubjubPoint;
 
 // ── Oracle ─────────────────────────────────────────────────────────────────
+//
+// Three signers each read the same Chainlink round and sign the report
+// (market, roundId, price, updatedAt) with Schnorr over Jubjub; see
+// `verifySignature`. They share signatures off-chain, and whoever holds two
+// first submits them with `setPrice`. The proof shows that two DIFFERENT stored
+// signers signed exactly this report; the signatures stay private.
+//
+// One transaction per round and no state between rounds: votes on chain would
+// all read and write one pending round, so signers sending at once would
+// invalidate each other.
+//
+// ⚠️ The proof says two of these keys signed, not who holds them. Signers run
+// by one operator give liveness, not independence.
+
+// The signers' public keys. Any two of them replace a key; see `rotateSigner`.
+export ledger signers: Vector<3, JubjubPoint>;
+
+// Counts rotations. Each rotation message names it, so none can be replayed.
+export ledger signerEpoch: Uint<64>;
+
+// The Chainlink round of `markPrice`. Rounds only move forward, so no report
+// lands twice.
+export ledger priceRound: Uint<128>;
+
+// Which two signers signed the current price, by slot: public, for liveness.
+export ledger priceSigners: Vector<2, Uint<8>>;
 
 // Price of the traded asset in USD, 6 decimals: 3000_000000 is $3,000.
 export ledger markPrice: Uint<64>;
@@ -405,9 +429,10 @@ export ledger limitNotes: Set<LiquidatorNote>;
 
 constructor(
   usdcToken: Bytes<32>,
-  adminCommitment: Bytes<32>,
+  signerKeys: Vector<3, JubjubPoint>,
   initialPrice: Uint<64>,
   initialPriceTime: Uint<64>,
+  initialRound: Uint<128>,
   leverageCap: Uint<8>,
   collateralFloor: Uint<64>,
   payoutCap: Uint<64>,
@@ -422,10 +447,14 @@ constructor(
   liquidatorKey: JubjubPoint
 ) {
   usdc = disclose(usdcToken);
-  admin = disclose(adminCommitment);
+  const keys = disclose(signerKeys);
+  assert(validSigner(keys[0]) && validSigner(keys[1]) && validSigner(keys[2]), "a signer key is the identity");
+  assert(keys[0] != keys[1] && keys[0] != keys[2] && keys[1] != keys[2], "the signer keys must differ");
+  signers = keys;
   assert(disclose(initialPrice) > 0, "price must be positive");
   markPrice = disclose(initialPrice);
   priceTime = disclose(initialPriceTime);
+  priceRound = disclose(initialRound);
   assert(disclose(leverageCap) >= 1, "leverage cap must be at least 1x");
   maxLeverage = disclose(leverageCap);
   minCollateral = disclose(collateralFloor);
@@ -447,12 +476,6 @@ constructor(
   liquidationFeeBps = disclose(liquidationFee);
   liquidator = disclose(liquidatorKey);
   lpToken = default<Bytes<32>>;
-}
-
-// Domain-separated, so an admin secret and a position owner secret can never
-// be confused even if someone reuses one.
-export pure circuit adminKey(secret: Bytes<32>): Bytes<32> {
-  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "zkperp:admin"), secret]);
 }
 
 // A field element rather than the 32-byte hash: the liquidator's note then
@@ -580,22 +603,150 @@ export pure circuit openLiquidatorNote(note: LiquidatorNote, secret: Field): Vec
   ];
 }
 
-// ── Mock oracle ────────────────────────────────────────────────────────────
-
-// Sets the mark price, observed by the oracle at `updatedAt` (seconds since
-// the epoch). Authorised by a secret, not by `ownPublicKey()`: the caller
-// supplies that key themselves, so checking it proves nothing.
+// ── Oracle signatures ──────────────────────────────────────────────────────
 //
-// The time may not be in the future, nor older than the current price's, so a
-// relayer cannot replay an older round to move the price back.
-export circuit setPrice(price: Uint<64>, updatedAt: Uint<64>, secret: Bytes<32>): [] {
-  assert(admin == disclose(adminKey(secret)), "not the admin");
-  assert(disclose(price) > 0, "price must be positive");
+// Schnorr over Jubjub. For secret scalar x, key P = x·G, nonce k, R = k·G:
+//   h = transientHash(R, P, message), c = h mod 2^128, s = k + c·x mod ord(G)
+// and the check is s·G == R + c·P. `ecMul` refuses scalars at or above the
+// Jubjub order, and the hash is a full field element, so the challenge is its
+// low 128 bits: the signature carries both 128-bit halves of h, and the
+// circuit checks that they rebuild it. (Casting the hash down instead would
+// fail on most hashes; `slice` would cost megabytes of proving key.)
+//
+// transientHash is not promised to stay the same across compiler versions:
+// signers compute messages and challenges with this contract's own build.
+
+export struct Signature {
+  nonce: JubjubPoint;
+  s: Field;
+  challengeLo: Uint<128>;
+  challengeHi: Uint<128>;
+}
+
+struct Challenge {
+  nonce: JubjubPoint;
+  key: JubjubPoint;
+  message: Field;
+}
+
+struct PriceReport {
+  domain: Bytes<32>;
+  market: Bytes<32>;
+  round: Uint<128>;
+  price: Uint<64>;
+  updatedAt: Uint<64>;
+}
+
+struct Rotation {
+  domain: Bytes<32>;
+  market: Bytes<32>;
+  epoch: Uint<64>;
+  slot: Uint<8>;
+  key: JubjubPoint;
+}
+
+// A signer's public key for secret scalar `secret`.
+export pure circuit signerPublicKey(secret: Field): JubjubPoint {
+  return ecMulGenerator(secret);
+}
+
+// What signers sign for a price. `market` is the contract's address, so a
+// report for one market cannot be replayed on another.
+export pure circuit priceMessage(market: Bytes<32>, round: Uint<128>, price: Uint<64>, updatedAt: Uint<64>): Field {
+  return transientHash<PriceReport>(PriceReport {
+    domain: pad(32, "zkperp:oracle:price"), market: market, round: round, price: price, updatedAt: updatedAt
+  });
+}
+
+// What signers sign to put `key` in `slot`, at rotation number `epoch`.
+export pure circuit rotationMessage(market: Bytes<32>, epoch: Uint<64>, slot: Uint<8>, key: JubjubPoint): Field {
+  return transientHash<Rotation>(Rotation {
+    domain: pad(32, "zkperp:oracle:rotate"), market: market, epoch: epoch, slot: slot, key: key
+  });
+}
+
+export pure circuit signatureChallenge(nonce: JubjubPoint, key: JubjubPoint, message: Field): Field {
+  return transientHash<Challenge>(Challenge { nonce: nonce, key: key, message: message });
+}
+
+// The identity would accept any signature: s·G == R + c·O for R = s·G.
+pure circuit validSigner(key: JubjubPoint): Boolean {
+  return key != ecMulGenerator(0);
+}
+
+circuit verifySignature(key: JubjubPoint, message: Field, sig: Signature): [] {
+  const h = signatureChallenge(sig.nonce, key, message);
+  assert((sig.challengeLo as Field) + (sig.challengeHi as Field) * 340282366920938463463374607431768211456 == h,
+    "the signature does not match the message and signer");
+  assert(ecMulGenerator(sig.s) == ecAdd(sig.nonce, ecMul(key, sig.challengeLo as Field)), "invalid signature");
+}
+
+circuit signerAt(slot: Uint<8>): JubjubPoint {
+  const keys = signers;
+  return slot == 0 ? keys[0] : (slot == 1 ? keys[1] : keys[2]);
+}
+
+// Two signatures, by the signers in slots `first` < `second`, on `message`.
+circuit signedByTwo(message: Field, first: Uint<8>, second: Uint<8>, a: Signature, b: Signature): [] {
+  assert(first < second && second < 3, "two different signer slots, in order");
+  verifySignature(signerAt(first), message, a);
+  verifySignature(signerAt(second), message, b);
+}
+
+// Sets the mark price from a Chainlink round, signed by two of the three
+// signers. Anyone may submit it; the signatures are the authority, not the
+// caller's key, which the caller supplies themselves.
+//
+// The time may not be in the future, nor older than the current price's, and
+// the round must be newer than the current one, so no report replays.
+export circuit setPrice(
+  round: Uint<128>,
+  price: Uint<64>,
+  updatedAt: Uint<64>,
+  first: Uint<8>,
+  second: Uint<8>,
+  a: Signature,
+  b: Signature
+): [] {
+  const r = disclose(round);
+  const p = disclose(price);
   const t = disclose(updatedAt);
+  const i = disclose(first);
+  const j = disclose(second);
+  signedByTwo(priceMessage(kernel.self().bytes, r, p, t), i, j, a, b);
+  assert(p > 0, "price must be positive");
   assert(blockTimeGte(t), "the price time is in the future");
   assert(t >= priceTime, "the price time is older than the current price's");
-  markPrice = disclose(price);
+  assert(r > priceRound, "the round is not newer than the current price's");
+  markPrice = p;
   priceTime = t;
+  priceRound = r;
+  priceSigners = [i, j];
+}
+
+// Puts `key` in signer slot `slot`, signed by the signers in two slots: to
+// replace a lost or leaked key, or to refresh one's own.
+export circuit rotateSigner(
+  slot: Uint<8>,
+  key: JubjubPoint,
+  first: Uint<8>,
+  second: Uint<8>,
+  a: Signature,
+  b: Signature
+): [] {
+  const n = disclose(slot);
+  const k = disclose(key);
+  const i = disclose(first);
+  const j = disclose(second);
+  assert(n < 3, "no such signer slot");
+  const epoch = signerEpoch;
+  signedByTwo(rotationMessage(kernel.self().bytes, epoch, n, k), i, j, a, b);
+  assert(validSigner(k), "the new key is the identity");
+  const keys = signers;
+  assert((n == 0 || keys[0] != k) && (n == 1 || keys[1] != k) && (n == 2 || keys[2] != k),
+    "the new key is already a signer");
+  signers = [n == 0 ? k : keys[0], n == 1 ? k : keys[1], n == 2 ? k : keys[2]];
+  signerEpoch = (epoch + 1) as Uint<64>;
 }
 
 // Every open and close prices against `markPrice` and calls this first. It

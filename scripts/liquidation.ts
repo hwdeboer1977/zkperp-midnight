@@ -18,7 +18,7 @@
 import chalk from "chalk";
 import fs from "fs";
 import path from "path";
-import { createHash } from "crypto";
+import { oracleSecrets } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
@@ -63,7 +63,7 @@ async function main() {
   const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
 
   const devSeed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  const oracle = oracleSecrets(devSeed);
   const secret = liquidatorSecret(devSeed);
 
   step("Wallets");
@@ -90,7 +90,7 @@ async function main() {
 
     step("The trader opens a 19x long");
     // A fresh price, so the open is not refused as stale.
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
     const before = await balance(trader, usdc);
     const opened = await openPosition(traderPerp, usdc, COIN, SIZE, true, LOCAL.networkId);
     const o = opened.record.opening;
@@ -112,7 +112,7 @@ async function main() {
 
     step(`The admin drops the price ${Number(DROP_BPS) / 100}%`);
     const low = (p0 * (10_000n - DROP_BPS)) / 10_000n;
-    await submitPrice(devPerp, low, adminSecret);
+    await submitPrice(devPerp, low, oracle);
     ledger = await readLedger(keeperPerp);
     info(`price $${fmt(ledger.markPrice)}`);
     check("now it is below maintenance", canLiquidate(ledger, watched));
@@ -157,7 +157,7 @@ async function main() {
     check("a close after the liquidation is refused", refused);
 
     step("Restoring the price");
-    await submitPrice(devPerp, p0, adminSecret);
+    await submitPrice(devPerp, p0, oracle);
     info(`price $${fmt(p0)}`);
   } finally {
     for (const w of wallets) await w.facade.stop();

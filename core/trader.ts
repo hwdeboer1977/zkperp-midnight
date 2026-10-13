@@ -18,7 +18,7 @@ import { createHash } from "crypto";
 import { MidnightBech32m, UnshieldedAddress } from "@midnight-ntwrk/wallet-sdk-address-format";
 import { nativeToken } from "@midnight-ntwrk/ledger-v8";
 import { scalarFrom } from "./liquidatorNote.js";
-import type { NetworkConfig } from "./network.js";
+import { activeNetwork, type NetworkConfig } from "./network.js";
 import { buildWallet, currentState, waitForSync, type BuiltWallet } from "./wallet.js";
 
 const NIGHT = nativeToken().raw;
@@ -31,8 +31,11 @@ const NIGHT = nativeToken().raw;
 const NIGHT_FOR_TRADER = BigInt(process.env.NIGHT_PER_WALLET ?? 100_000_000);
 const nightText = (n: bigint) => `${n / 1_000_000n}.${(n % 1_000_000n).toString().padStart(6, "0")}`;
 
-function seedFor(role: "trader" | "treasury" | "keeper", devSeed: string): string {
-  const variable = `${role.toUpperCase()}_SEED`;
+function seedFor(role: "trader" | "treasury" | "keeper" | `oracle-${number}`, devSeed: string): string {
+  // Per network first (ORACLE_1_SEED_PREVIEW), as for WALLET_SEED_PREVIEW.
+  const base = `${role.toUpperCase().replace("-", "_")}_SEED`;
+  const scoped = `${base}_${activeNetwork().key.toUpperCase()}`;
+  const variable = process.env[scoped]?.trim() ? scoped : base;
   const explicit = process.env[variable]?.trim();
   if (explicit) {
     if (!/^[0-9a-fA-F]{64}$/.test(explicit)) throw new Error(`${variable} must be 64 hex characters`);
@@ -49,6 +52,13 @@ export const treasurySeed = (devSeed: string) => seedFor("treasury", devSeed);
 
 /** KEEPER_SEED, or one derived from the dev seed: the wallet that submits liquidations. */
 export const keeperSeed = (devSeed: string) => seedFor("keeper", devSeed);
+
+/**
+ * ORACLE_<slot+1>_SEED, or one derived from the dev seed: the wallet oracle
+ * signer `slot` pays its fees from. It only pays; the signer's authority is
+ * its signing key (see core/oracle.ts).
+ */
+export const oracleWalletSeed = (devSeed: string, slot: number) => seedFor(`oracle-${slot + 1}`, devSeed);
 
 /**
  * The liquidator's secret scalar: LIQUIDATOR_SECRET (hex), or one derived from

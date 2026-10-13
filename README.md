@@ -6,7 +6,7 @@ Private perpetuals on [Midnight](https://midnight.network): go leveraged long or
 
 > ⚠️ **pUSDC is a mock token. Anyone can mint any amount of it.** It exists so the devnet can hand out collateral without a faucet, and it has none of the supply control a real stablecoin needs. zkperp itself only accepts the one token it was deployed with; swapping pUSDC for a real shielded stablecoin changes nothing in zkperp's contract.
 >
-> The price oracle is also a mock: the admin sets the mark price. Each price carries the time the oracle observed it (for Chainlink, the round's `updatedAt`), and every open and close refuses a price older than `maxPriceAge`, which should sit just above the feed's heartbeat. A price update cannot carry an older time than the current one, so an old round can't be replayed.
+> The price comes from Chainlink, relayed by three oracle signers: each signs the round (`roundId`, price, `updatedAt`), and a price update must carry signatures from two of the three, which the proof checks without publishing them. The ledger records which two signed. Each price carries the time the oracle observed it (the round's `updatedAt`), and every open and close refuses a price older than `maxPriceAge`, which should sit just above the feed's heartbeat. Rounds only move forward, so an old round can't be replayed. Any two signers can replace a key. The proof shows two of the three keys signed, not that independent parties hold them: for now one operator runs all three.
 
 ## How it works
 
@@ -107,7 +107,7 @@ The privacy claims are tested, not just asserted:
 contracts/           Compact sources: zkperp, pusdc, and test-only probes in probe/
 core/                shared TypeScript: wallets, providers, contract calls, fee and PnL
                      maths, position records, the Chainlink reader, the privacy search
-services/oracle/     the price relayer: Chainlink ETH/USD → setPrice, on each new round
+services/oracle/     the oracle signer: Chainlink ETH/USD → setPrice, signed by 2 of 3 relayers
 services/treasury/   the fee-epoch job: pays the LPs' share of fees into the pool
 scripts/             dev tooling: the devnet demo, the race tests, the probes, local setup
 test/                circuit tests, run locally without a chain
@@ -147,8 +147,10 @@ npm run probe:race      # which ledger operations conflict (npm run compile:prob
 The services and the frontend run against the same devnet, with the real Chainlink feed. Put an Ethereum mainnet RPC URL in `.env` as `EVM_RPC_URL`; reading the feed needs no key or gas.
 
 ```sh
-npm run setup:local     # fresh zkperp priced by Chainlink, a funded pool, trader, treasury and keeper wallets
-npm run relayer         # terminal 1: submits each new Chainlink round   (health: :3010/health)
+npm run setup:local     # fresh zkperp priced by Chainlink, a funded pool, trader, treasury, keeper and oracle wallets
+npm run relayer -- --signer 1   # terminals 1–3: the oracle's three signers; any two set each new
+npm run relayer -- --signer 2   # Chainlink round   (health: :3020/health, :3021, :3022)
+npm run relayer -- --signer 3
 npm run treasury        # terminal 2: runs fee epochs, ≥5 closes and ≥1 hour apart   (:3011/health, /epochs)
 npm run keeper          # terminal 3: liquidates positions below maintenance margin
 ```
@@ -165,7 +167,7 @@ Set the wallet to the **Undeployed** network. Every trade is proven by a proof s
 
 After `npm run frontend:config` (or a recompile), restart the dev server: a running one keeps serving the old circuit files' list and answers new ones with HTML, which the wallet reports as "Proof server check failed (400): bad input".
 
-`setup:local` writes `.zkperp/local-stack.json` with the addresses, endpoints and the treasury's keys. Don't run `npm run demo` or `npm run race` while the relayer runs: they set mock prices of their own.
+`setup:local` writes `.zkperp/local-stack.json` with the addresses, endpoints and the treasury's keys. Don't run `npm run demo` or `npm run race` while the relayers run: they set mock prices of their own.
 
 ### The preview testnet
 
@@ -173,7 +175,7 @@ The same stack runs on Midnight's public `preview` network; the scripts and serv
 
 1. Put a fresh, secret 64-hex `WALLET_SEED_PREVIEW` in `.env` (per network, so it does not replace the devnet's seed). This is the **operator** wallet: it deploys, submits prices, adds the first liquidity and funds the treasury and keeper. Traders, you included, use their own 1AM accounts in the browser; keep the two apart, since the operator wallet's transactions are public. On the devnet the dev seed is public; here it controls the oracle, the liquidator key and every derived wallet, and the scripts refuse to run without it.
 2. Run `npm run setup:preview`. The first run stops with the dev wallet's address: get tNIGHT for it at <https://midnight-tmnight-preview.nethermind.dev/>, then run it again. It registers the NIGHT for DUST, funds the trader, treasury and keeper wallets with `NIGHT_PER_WALLET` (default 100 NIGHT each), deploys pUSDC and zkperp, adds liquidity, and writes `.zkperp/preview-stack.json`.
-3. Run `npm run relayer:preview`, `npm run treasury:preview` and `npm run keeper:preview`, each in its own terminal.
+3. Run `npm run relayer:preview -- --signer 1` (and `--signer 2`, `--signer 3`), `npm run treasury:preview` and `npm run keeper:preview`, each in its own terminal. Give each signer its own key in `.env` (`ORACLE_SIGNER_1..3`, hex scalars); unset, they derive from the operator seed.
 4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the local proof server did not answer and 1AM's hosted prover, which sees your positions, is in use.
 
 The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`, `stoploss`, `limit`) refuse to run against `preview`.

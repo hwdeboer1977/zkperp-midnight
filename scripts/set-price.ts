@@ -15,7 +15,7 @@
 
 import "dotenv/config";
 import chalk from "chalk";
-import { createHash } from "crypto";
+import { oracleSecrets } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync } from "../core/wallet.js";
@@ -39,7 +39,7 @@ async function main() {
   if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
 
   const seed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${seed}`).digest();
+  const oracle = oracleSecrets(seed);
   console.log(chalk.gray("syncing the operator wallet…"));
   const wallet = await buildWallet({ kind: "seed", value: seed }, network);
   try {
@@ -47,7 +47,7 @@ async function main() {
     const perp = await handle(wallet, seed, "zkperp", perpAddress);
     const before = await readLedger(perp);
     console.log(chalk.gray(`zkperp ${perpAddress.slice(0, 12)}… on ${network.name}: ${fmt(before.markPrice)} → ${fmt(price)}`));
-    const txHash = await submitPrice(perp, price, adminSecret);
+    const txHash = await submitPrice(perp, price, oracle);
     console.log(chalk.green(`set ${fmt(price)} in ${txHash}`));
     console.log(chalk.gray("restart the relayer when done; it resumes at the next Chainlink round"));
   } finally {

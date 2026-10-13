@@ -42,7 +42,11 @@ export default defineConfig({
     fs: { allow: [".", "../core"] },
     // The services, same-origin so the browser needs no CORS.
     proxy: {
-      "/svc/relayer": { target: "http://127.0.0.1:3010", rewrite: (p) => p.replace(/^\/svc\/relayer/, "") },
+      // The oracle's three signers; "relayer" is signer 1, for the Trade page.
+      "/svc/relayer": { target: "http://127.0.0.1:3020", rewrite: (p) => p.replace(/^\/svc\/relayer/, "") },
+      "/svc/signer/1": { target: "http://127.0.0.1:3020", rewrite: (p) => p.replace(/^\/svc\/signer\/1/, "") },
+      "/svc/signer/2": { target: "http://127.0.0.1:3021", rewrite: (p) => p.replace(/^\/svc\/signer\/2/, "") },
+      "/svc/signer/3": { target: "http://127.0.0.1:3022", rewrite: (p) => p.replace(/^\/svc\/signer\/3/, "") },
       "/svc/treasury": { target: "http://127.0.0.1:3011", rewrite: (p) => p.replace(/^\/svc\/treasury/, "") },
       "/svc/keeper": { target: "http://127.0.0.1:3012", rewrite: (p) => p.replace(/^\/svc\/keeper/, "") },
     },

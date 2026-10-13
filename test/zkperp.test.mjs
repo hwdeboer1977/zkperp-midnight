@@ -33,6 +33,7 @@ import { decodeLimitPlaintext, filledPosition, limitExpired, limitReached, openL
 import { executeLimitCall, limitFillOf, limitFires, limitOf, watchedLimits } from "../dist/core/perp.js";
 import { orderPlaintext } from "../dist/core/orders.js";
 import * as m from "../dist/core/math.js";
+import { oracleSecrets, rotationMessage, sign, signedPriceArgs, signerKeys, signPrice } from "../dist/core/oracle.js";
 
 let failures = 0;
 const expect = (name, cond, detail = "") => {
@@ -51,7 +52,6 @@ const halves = (b) => [b.slice(0, 16), b.slice(16, 32)];
 
 const USDC = bytes32(0xc0);
 const OTHER_TOKEN = bytes32(0xee);
-const ADMIN_SECRET = bytes32(0xad);
 const DEPLOYER = key(0x10);
 const LP = key(0x20);
 const TRADER = key(0x30);
@@ -78,6 +78,10 @@ const LIQUIDATION_FEE_BPS = 50n;
 const JUBJUB_ORDER = 6554484396890773809930967563523245729705921265872317281365359162392183254199n;
 if (JUBJUB_ORDER !== JUBJUB_ORDER_TS) throw new Error("core/liquidatorNote.ts has another Jubjub order");
 const LIQUIDATOR_SECRET = JUBJUB_ORDER - 0x1234_5678_9abcn;
+// The oracle's three signers, and the Chainlink round the deploy starts at.
+const SIGNERS = oracleSecrets("ab".repeat(32));
+const SIGNER_KEYS = signerKeys(pureCircuits, SIGNERS);
+const ROUND0 = 110680464442257320000n;
 const LIQUIDATOR_KEY = pureCircuits.liquidatorPublicKey(LIQUIDATOR_SECRET);
 const EPHEMERAL = JUBJUB_ORDER - 0xfeed_beefn;
 const TRADER_ENC = bytes32(0x3e);
@@ -103,9 +107,10 @@ const deploy = () =>
   contract.initialState(
     createConstructorContext({}, hex(DEPLOYER.bytes)),
     USDC,
-    pureCircuits.adminKey(ADMIN_SECRET),
+    SIGNER_KEYS,
     PRICE,
     PRICE_TIME,
+    ROUND0,
     MAX_LEVERAGE,
     MIN_COLLATERAL,
     MAX_PAYOUT,
@@ -157,6 +162,10 @@ function callAt(time, caller, state, circuit, ...args) {
   }
 }
 const call = (...args) => callAt(T0, ...args);
+
+/** setPrice's arguments: the round after `state`'s, signed by the signers in `slots`. */
+const signed = (state, price, updatedAt, slots = [0, 1]) =>
+  signedPriceArgs(pureCircuits, ADDRESS, { round: ledger(state).priceRound + 1n, price, updatedAt }, new Map(slots.map((i) => [i, SIGNERS[i]])));
 const why = (r) => (r.ok ? "accepted" : r.error);
 
 let nonceByte = 0;
@@ -181,7 +190,8 @@ const genesis = deploy().data;
 {
   const l = ledger(genesis);
   expect("pUSDC is the configured token", hex(l.usdc) === hex(USDC));
-  expect("the admin is stored as a hash, not the secret", hex(l.admin) !== hex(ADMIN_SECRET));
+  expect("the three signer keys are stored", [...l.signers].every((k, i) => k.x === SIGNER_KEYS[i].x && k.y === SIGNER_KEYS[i].y));
+  expect("the price starts at the deploy's round", l.priceRound === ROUND0);
   expect("the mark price is the initial price", l.markPrice === PRICE);
   expect("the pool starts empty", l.poolValue === 0n && l.lpSupply === 0n);
   expect("the fees and treasury are as configured", l.openFeeBps === OPEN_FEE_BPS && l.borrowRate === BORROW_RATE && hex(l.treasury.bytes) === hex(TREASURY.bytes));
@@ -189,18 +199,97 @@ const genesis = deploy().data;
 
 // ── Oracle ──────────────────────────────────────────────────────────────────
 {
-  const wrong = call(TRADER, genesis, "setPrice", 1n, T0, bytes32(0x01));
-  expect("a stranger cannot set the price", !wrong.ok && /not the admin/.test(wrong.error), why(wrong));
-  const right = call(TRADER, genesis, "setPrice", 3_100_000_000n, T0, ADMIN_SECRET);
-  expect(
-    "the admin secret sets the price and its time, whoever submits it",
-    right.ok && ledger(right.state).markPrice === 3_100_000_000n && ledger(right.state).priceTime === T0,
-    why(right)
-  );
-  const future = call(TRADER, genesis, "setPrice", 3_100_000_000n, T0 + 1n, ADMIN_SECRET);
+  const P = 3_100_000_000n;
+  const report = (price = P, updatedAt = T0, round = ROUND0 + 1n) => ({ round, price, updatedAt });
+  const sig = (slot, r = report()) => signPrice(pureCircuits, ADDRESS, r, SIGNERS[slot]);
+  const submit = (state, r, i, j, a, b) => call(TRADER, state, "setPrice", r.round, r.price, r.updatedAt, BigInt(i), BigInt(j), a, b);
+
+  for (const [i, j] of [[0, 1], [0, 2], [1, 2]]) {
+    const ok = submit(genesis, report(), i, j, sig(i), sig(j));
+    const l = ok.ok && ledger(ok.state);
+    expect(
+      `signers ${i + 1} and ${j + 1} set the price, its time and round, whoever submits`,
+      ok.ok && l.markPrice === P && l.priceTime === T0 && l.priceRound === ROUND0 + 1n,
+      why(ok)
+    );
+    expect(`the price records that signers ${i + 1} and ${j + 1} signed it`, ok.ok && l.priceSigners[0] === BigInt(i) && l.priceSigners[1] === BigInt(j));
+  }
+  const a = sig(0);
+  const good = submit(genesis, report(), 0, 1, a, sig(1));
+  const published = JSON.stringify(good.transcript, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+  expect("the signatures are not in the public transcript", !published.includes(a.s.toString()) && !published.includes(a.nonce.x.toString()));
+
+  const once = submit(genesis, report(), 0, 0, sig(0), sig(0));
+  expect("one signer twice is not a quorum", !once.ok && /two different signer slots/.test(once.error), why(once));
+  const reversed = submit(genesis, report(), 1, 0, sig(1), sig(0));
+  expect("signer slots must come in order", !reversed.ok && /two different signer slots/.test(reversed.error), why(reversed));
+  const slot3 = submit(genesis, report(), 1, 3, sig(1), sig(2));
+  expect("there is no fourth signer", !slot3.ok && /two different signer slots/.test(slot3.error), why(slot3));
+  const mislabelled = submit(genesis, report(), 0, 1, sig(0), sig(2));
+  expect("a signature under another signer's slot is refused", !mislabelled.ok && /does not match/.test(mislabelled.error), why(mislabelled));
+  const outsider = sign(pureCircuits, JUBJUB_ORDER - 77n, pureCircuits.priceMessage(Buffer.from(ADDRESS, "hex"), ROUND0 + 1n, P, T0));
+  const stranger = submit(genesis, report(), 0, 1, sig(0), outsider);
+  expect("a non-signer's signature is refused", !stranger.ok && /does not match/.test(stranger.error), why(stranger));
+  const t = sig(1);
+  const tampered = submit(genesis, report(), 0, 1, sig(0), { ...t, s: (t.s + 1n) % JUBJUB_ORDER });
+  expect("a tampered signature is refused", !tampered.ok && /invalid signature/.test(tampered.error), why(tampered));
+  const otherPrice = submit(genesis, report(P + 1n), 0, 1, sig(0), sig(1));
+  expect("signatures on another price are refused", !otherPrice.ok && /does not match/.test(otherPrice.error), why(otherPrice));
+  const split = submit(genesis, report(), 0, 1, sig(0), sig(1, report(P + 1n)));
+  expect("two signers who signed different reports are no quorum", !split.ok && /does not match/.test(split.error), why(split));
+  const elsewhere = signedPriceArgs(pureCircuits, "11".repeat(32), report(), SIGNERS);
+  const replayed = call(TRADER, genesis, "setPrice", ...elsewhere);
+  expect("a report signed for another market is refused", !replayed.ok && /does not match/.test(replayed.error), why(replayed));
+
+  const again = submit(good.state, report(), 0, 2, sig(0), sig(2));
+  expect("a round cannot land twice", !again.ok && /round is not newer/.test(again.error), why(again));
+  const oldRound = submit(genesis, report(P, T0, ROUND0), 0, 1, sig(0, report(P, T0, ROUND0)), sig(1, report(P, T0, ROUND0)));
+  expect("a round older than the current price's is refused", !oldRound.ok && /round is not newer/.test(oldRound.error), why(oldRound));
+  const fr = report(P, T0 + 1n);
+  const future = submit(genesis, fr, 0, 1, sig(0, fr), sig(1, fr));
   expect("a price time in the future is refused", !future.ok && /in the future/.test(future.error), why(future));
-  const replay = call(TRADER, genesis, "setPrice", 2_900_000_000n, PRICE_TIME - 1n, ADMIN_SECRET);
-  expect("an older round cannot replace the price", !replay.ok && /older than the current/.test(replay.error), why(replay));
+  const or = report(2_900_000_000n, PRICE_TIME - 1n);
+  const older = submit(genesis, or, 0, 1, sig(0, or), sig(1, or));
+  expect("an older price time cannot replace the price", !older.ok && /older than the current/.test(older.error), why(older));
+  const zr = report(0n);
+  const zero = submit(genesis, zr, 0, 1, sig(0, zr), sig(1, zr));
+  expect("a zero price is refused", !zero.ok && /price must be positive/.test(zero.error), why(zero));
+}
+
+// ── Oracle signer rotation ──────────────────────────────────────────────────
+{
+  const NEW = JUBJUB_ORDER - 0x5151n;
+  const NEW_KEY = pureCircuits.signerPublicKey(NEW);
+  const rot = (state, slot, key, i, j, secrets = SIGNERS, epoch = ledger(state).signerEpoch) => {
+    const msg = rotationMessage(pureCircuits, ADDRESS, epoch, slot, key);
+    return call(TRADER, state, "rotateSigner", BigInt(slot), key, BigInt(i), BigInt(j), sign(pureCircuits, secrets[i], msg), sign(pureCircuits, secrets[j], msg));
+  };
+  const rotated = rot(genesis, 2, NEW_KEY, 0, 1);
+  const l = rotated.ok && ledger(rotated.state);
+  expect(
+    "two signers replace the third's key",
+    rotated.ok && l.signers[2].x === NEW_KEY.x && l.signers[0].x === SIGNER_KEYS[0].x && l.signerEpoch === 1n,
+    why(rotated)
+  );
+  const own = rot(genesis, 0, NEW_KEY, 0, 2);
+  expect("a signer may refresh its own key, with a second signer", own.ok && ledger(own.state).signers[0].x === NEW_KEY.x, why(own));
+  const alone = rot(genesis, 2, NEW_KEY, 0, 0);
+  expect("one signer cannot rotate alone", !alone.ok && /two different signer slots/.test(alone.error), why(alone));
+  const replay = rot(rotated.state, 2, NEW_KEY, 0, 1, SIGNERS, 0n);
+  expect("a rotation cannot be replayed", !replay.ok && /does not match/.test(replay.error), why(replay));
+  const dup = rot(genesis, 2, SIGNER_KEYS[0], 0, 1);
+  expect("a key already signing cannot take a second slot", !dup.ok && /already a signer/.test(dup.error), why(dup));
+  const identity = rot(genesis, 2, pureCircuits.signerPublicKey(0n), 0, 1);
+  expect("the identity cannot be a signer", !identity.ok && /identity/.test(identity.error), why(identity));
+  const noSlot = rot(genesis, 3, NEW_KEY, 0, 1);
+  expect("there is no fourth slot to fill", !noSlot.ok && /no such signer slot/.test(noSlot.error), why(noSlot));
+
+  const secrets = [SIGNERS[0], SIGNERS[1], NEW];
+  const r = { round: ROUND0 + 1n, price: 3_050_000_000n, updatedAt: T0 };
+  const viaNew = call(TRADER, rotated.state, "setPrice", ...signedPriceArgs(pureCircuits, ADDRESS, r, new Map([[0, secrets[0]], [2, NEW]])));
+  expect("the new key signs prices", viaNew.ok && ledger(viaNew.state).markPrice === r.price, why(viaNew));
+  const viaOld = call(TRADER, rotated.state, "setPrice", ...signedPriceArgs(pureCircuits, ADDRESS, r, new Map([[0, SIGNERS[0]], [2, SIGNERS[2]]])));
+  expect("the replaced key no longer does", !viaOld.ok && /does not match/.test(viaOld.error), why(viaOld));
 }
 
 // ── Trading needs a pool ────────────────────────────────────────────────────
@@ -462,7 +551,7 @@ const FEES = OPEN_FEE + CLOSE_FEE + BORROW_FEE;
 const KEEP = COLLATERAL - CLOSE_FEE - BORROW_FEE;
 const pathFor = (state) => ledger(state).positions.findPathForLeaf(commitment);
 const at = (price) => {
-  const r = call(DEPLOYER, opened.state, "setPrice", price, T0, ADMIN_SECRET);
+  const r = call(DEPLOYER, opened.state, "setPrice", ...signed(opened.state, price, T0));
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
@@ -602,7 +691,7 @@ console.log("\n  stale price\n");
   expect("an open with a stale price is refused", !staleOpen.ok && /price is stale/.test(staleOpen.error), why(staleOpen));
   const staleClose = close(opened.state, { time: STALE, closeTime: STALE, borrowFee: borrowFeeOf(SIZE, STALE - T0) });
   expect("a close with a stale price is refused", !staleClose.ok && /price is stale/.test(staleClose.error), why(staleClose));
-  const refreshed = callAt(STALE, DEPLOYER, opened.state, "setPrice", PRICE, STALE, ADMIN_SECRET);
+  const refreshed = callAt(STALE, DEPLOYER, opened.state, "setPrice", ...signed(opened.state, PRICE, STALE));
   const afterReport = close(refreshed.state, { time: STALE, closeTime: STALE, borrowFee: borrowFeeOf(SIZE, STALE - T0) });
   expect("once the oracle reports again, the close goes through", afterReport.ok, why(afterReport));
   const pool = callAt(STALE, LP, pooled, "addLiquidity", coin(1_000_000n), 1_000_000n);
@@ -809,7 +898,7 @@ console.log("\n  trigger orders\n");
     return callAt(o.time, o.caller, state, "placeOrder", o.position, o.secret, o.order, o.note);
   };
   const priced = (state, price) => {
-    const r = call(DEPLOYER, state, "setPrice", price, T0, ADMIN_SECRET);
+    const r = call(DEPLOYER, state, "setPrice", ...signed(state, price, T0));
     if (!r.ok) throw new Error(r.error);
     return r.state;
   };
@@ -1069,7 +1158,7 @@ expect("a 10x short opens", shortOpened.ok, why(shortOpened));
 }
 
 const shortAt = (price) => {
-  const r = call(DEPLOYER, shortOpened.state, "setPrice", price, T0, ADMIN_SECRET);
+  const r = call(DEPLOYER, shortOpened.state, "setPrice", ...signed(shortOpened.state, price, T0));
   if (!r.ok) throw new Error(r.error);
   return r.state;
 };
@@ -1160,7 +1249,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   };
   const opened20 = openCall(TRADER, pooled, bigCoin, bigSize, false, OWNER_SECRET, big.salt);
   expect("a 20x short opens", opened20.ok, why(opened20));
-  const crash = call(DEPLOYER, opened20.state, "setPrice", 1_200_000_000n, T0, ADMIN_SECRET).state;
+  const crash = call(DEPLOYER, opened20.state, "setPrice", ...signed(opened20.state, 1_200_000_000n, T0)).state;
   const closeBig = (pnl) => {
     const o = {
       position: big,
@@ -1500,7 +1589,7 @@ console.log("\n  core/perp.ts order functions against the circuit\n");
     }
     return c;
   };
-  const priced = (state, price) => call(DEPLOYER, state, "setPrice", price, T0, ADMIN_SECRET).state;
+  const priced = (state, price) => call(DEPLOYER, state, "setPrice", ...signed(state, price, T0)).state;
   const watched = (state, order) => watching(state).find((w) => hex(w.order.salt) === hex(order.salt));
 
   const stopState = priced(beforeCancel, STOP - 3_000_000n);
@@ -1558,7 +1647,7 @@ console.log("\n  limit orders\n");
     return callAt(o.time, o.caller, state, "placeLimitOrder", o.coin, x.size, x.isLong, x.openFee, x.price, x.expiry, o.secret, x.salt, x.payToEnc, NOTE, o.note);
   };
   const priced = (state, price, time = T0) => {
-    const r = callAt(time, DEPLOYER, state, "setPrice", price, time, ADMIN_SECRET);
+    const r = callAt(time, DEPLOYER, state, "setPrice", ...signed(state, price, time));
     if (!r.ok) throw new Error(r.error);
     return r.state;
   };
@@ -1790,7 +1879,7 @@ console.log("\n  fees beyond the collateral\n");
   expect("(the closing and borrow fees exceed the collateral)", CLOSE_FEE + borrow > COLLATERAL);
   const late = (state, pnl) => close(state, { time: T2, closeTime: T2, borrowFee: borrow, pnl });
   // Days later, the oracle has reported since.
-  const reported = (price) => callAt(T2, DEPLOYER, opened.state, "setPrice", price, T2, ADMIN_SECRET).state;
+  const reported = (price) => callAt(T2, DEPLOYER, opened.state, "setPrice", ...signed(opened.state, price, T2)).state;
 
   const idle = late(reported(PRICE), 0n);
   expect("a position whose fees exceed its collateral still closes", idle.ok, why(idle));
@@ -1944,7 +2033,7 @@ console.log("\n  a full pool\n");
   const full = opened.ok && ledger(opened.state);
   expect("(the pool is full: one slot, taken)", full && full.slotCapacity === 1n && full.freeSlots === 0n, why(opened));
 
-  const risen = call(DEPLOYER, opened.state, "setPrice", 3_300_000_000n, T0, ADMIN_SECRET).state;
+  const risen = call(DEPLOYER, opened.state, "setPrice", ...signed(opened.state, 3_300_000_000n, T0)).state;
   const p = {
     owner: pureCircuits.ownerKey(secret), isLong: true, size, collateral: c.value, openFee: openFeeOf(size),
     entryPrice: PRICE, openTime: T0, collateralNonce: c.nonce, salt, payTo: TRADER,

@@ -76,7 +76,9 @@ export function waitForBalance(wallet: BuiltWallet, usdc: Uint8Array, ok: (b: bi
  * key the deploy stored in the private state provider.
  */
 const DEFERRED: Partial<Record<ContractName, string[]>> = {
-  zkperp: ["placeOrder", "cancelOrder", "executeOrder", "placeLimitOrder", "executeLimitOrder", "cancelLimitOrder"],
+  zkperp: [
+    "placeOrder", "cancelOrder", "executeOrder", "placeLimitOrder", "executeLimitOrder", "cancelLimitOrder", "rotateSigner",
+  ],
 };
 
 /** `Base` with the circuits in `omit` left out of its initial state and its provable circuits. */

@@ -34,6 +34,7 @@ import {
   positionPnl,
   settlement,
 } from "./math.js";
+import { quorum, signedPriceArgs, type PriceReport, type SlotSignature } from "./oracle.js";
 
 export * from "./math.js";
 
@@ -50,16 +51,26 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * The oracle's update: `price` observed at `updatedAt` (seconds since the
- * epoch; for Chainlink, the round's `updatedAt`). Defaults to now, as the
- * mock oracle in the demo has no feed of its own.
+ * epoch; for Chainlink, the round's `updatedAt`), signed by the first two of
+ * `signers` (secret scalars, by slot). Defaults to now and to the round after
+ * the contract's, as the mock oracle in the demo has no feed of its own.
  */
 export async function submitPrice(
   perp: ContractHandle,
   price: bigint,
-  adminSecret: Uint8Array,
-  updatedAt: bigint = circuitNow()
+  signers: Map<number, bigint> | bigint[],
+  updatedAt: bigint = circuitNow(),
+  round?: bigint
 ): Promise<string> {
-  const tx = await perp.deployed.callTx.setPrice(price, updatedAt, adminSecret);
+  const r = round ?? (await readLedger(perp)).priceRound + 1n;
+  const args = signedPriceArgs(perp.module.pureCircuits, perp.address, { round: r, price, updatedAt }, signers);
+  const tx = await perp.deployed.callTx.setPrice(...args);
+  return tx.public.txHash;
+}
+
+/** Submits `report` with signatures the signers already made: a relayer's transmission. */
+export async function submitSignedPrice(perp: ContractHandle, report: PriceReport, sigs: SlotSignature[]): Promise<string> {
+  const tx = await perp.deployed.callTx.setPrice(report.round, report.price, report.updatedAt, ...quorum(sigs));
   return tx.public.txHash;
 }
 

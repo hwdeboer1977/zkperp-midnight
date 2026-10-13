@@ -29,7 +29,7 @@
  */
 
 import chalk from "chalk";
-import { createHash } from "crypto";
+import { oracleSecrets } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
@@ -119,7 +119,7 @@ async function main() {
   requireLocal("npm run race");
   setNetworkId(LOCAL.networkId);
   const devSeed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  const oracle = oracleSecrets(devSeed);
   const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
   const pusdcAddress = getDeployment(LOCAL.networkId, "pusdc");
   if (!perpAddress || !pusdcAddress) throw new Error("no current deployment: run npm run demo first");
@@ -158,7 +158,7 @@ async function main() {
 
     const setPrice = async (price: bigint) => {
       if (!priceNeedsUpdate(await readLedger(dev.perp), price)) return;
-      await submitPrice(dev.perp, price, adminSecret);
+      await submitPrice(dev.perp, price, oracle);
     };
     const open = async (p: Party, isLong = true) => {
       const opened = await openPosition(p.perp, usdc, COLLATERAL, SIZE, isLong, LOCAL.networkId);
@@ -193,7 +193,7 @@ async function main() {
       info("trader opened a long at $3,000");
       const [c, p] = await race(
         ["trader's close", () => close(trader, record)],
-        ["dev's setPrice($3,300)", async () => ({ txHash: await submitPrice(dev.perp, UP, adminSecret) })]
+        ["dev's setPrice($3,300)", async () => ({ txHash: await submitPrice(dev.perp, UP, oracle) })]
       );
       const after = await readLedger(dev.perp);
       info(`price now $${fmt(after.markPrice)}`);

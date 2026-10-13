@@ -19,6 +19,9 @@ export function managedPath(contractName: string): string {
  * saved by the caller — but the SDK requires a private state provider anyway.
  * Its store is encrypted with a password derived from the wallet seed, since
  * it is only as secret as the seed.
+ *
+ * LevelDB lets one process open a store at a time, so services that run side
+ * by side (the three oracle signers) each name their own: ZKPERP_LEVEL_DB.
  */
 export function makeProviders(options: {
   contractName: string;
@@ -36,6 +39,7 @@ export function makeProviders(options: {
 
   return {
     privateStateProvider: levelPrivateStateProvider({
+      midnightDbName: process.env.ZKPERP_LEVEL_DB ?? "midnight-level-db",
       privateStateStoreName: `${contractName}-state`,
       accountId: options.accountId,
       privateStoragePasswordProvider: () => `Ps1!${digest.slice(0, 28)}`,

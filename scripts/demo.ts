@@ -41,7 +41,7 @@
 
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
-import { createHash } from "crypto";
+import { oracleSecrets, signerKeys } from "../core/oracle.js";
 import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
@@ -123,7 +123,7 @@ async function main() {
   const network = LOCAL;
   setNetworkId(network.networkId);
   const devSeed = walletSeed();
-  const adminSecret = createHash("sha256").update(`zkperp-admin:${devSeed}`).digest();
+  const oracle = oracleSecrets(devSeed);
 
   step("Wallets");
   const devWallet = await buildWallet({ kind: "seed", value: devSeed }, network);
@@ -161,9 +161,10 @@ async function main() {
     const ownTreasury = (l: any) => hex(l.treasury.bytes) === treasuryKey;
     const perpAddress = await deployOrFind(info, devWallet, devSeed, "zkperp", async (module) => [
       usdc,
-      module.pureCircuits.adminKey(adminSecret),
+      signerKeys(module.pureCircuits, oracle),
       PRICE,
       circuitNow(),
+      0n,
       MAX_LEVERAGE,
       MIN_COLLATERAL,
       MAX_PAYOUT,
@@ -188,7 +189,7 @@ async function main() {
       info(`dev adds ${fmt(LIQUIDITY)} pUSDC of liquidity…`);
       await addLiquidity(devPerp, usdc, LIQUIDITY);
     }
-    await setPrice(devPerp, PRICE, adminSecret);
+    await setPrice(devPerp, PRICE, oracle);
 
     const dev: Party = {
       wallet: devWallet,
@@ -313,13 +314,13 @@ async function main() {
     ] as const) {
       section = label;
       step(`PnL, ${label}`);
-      await setPrice(devPerp, PRICE, adminSecret);
+      await setPrice(devPerp, PRICE, oracle);
       const before = await balance(trader.wallet, usdc);
       const opened = await openPosition(trader.perp, usdc, COLLATERAL, SIZE, isLong, network.networkId);
       info(`opened at $${fmt(PRICE)}: ${opened.txHash}`);
       await waitForBalance(trader.wallet, usdc, (b) => b < before);
 
-      await setPrice(devPerp, exit, adminSecret);
+      await setPrice(devPerp, exit, oracle);
       const poolBefore = (await readLedger(devPerp)).poolValue;
       const treasuryBefore = await balance(treasury, usdc);
       const closed = await closePosition(trader.perp, opened.record, usdc, treasuryEncKey);
@@ -371,7 +372,7 @@ async function main() {
         ...(s.toTrader > 0n ? ([["trader's payout from the coin", s.toTrader - s.fromPool]] as Array<[string, bigint]>) : []),
       ]);
     }
-    await setPrice(devPerp, PRICE, adminSecret);
+    await setPrice(devPerp, PRICE, oracle);
 
     // ── Fee epoch: the treasury pays the LPs their share ──────────────────
     section = "fee epoch";
@@ -506,10 +507,10 @@ async function privacy(
 }
 
 
-async function setPrice(perp: ContractHandle, price: bigint, adminSecret: Uint8Array) {
+async function setPrice(perp: ContractHandle, price: bigint, oracle: bigint[]) {
   if (!priceNeedsUpdate(await readLedger(perp), price)) return;
   info(`oracle: price → $${fmt(price)}`);
-  await submitPrice(perp, price, adminSecret);
+  await submitPrice(perp, price, oracle);
 }
 
 main().catch((error) => {

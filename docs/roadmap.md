@@ -101,28 +101,41 @@ Today every role derives from one seed (`WALLET_SEED_PREVIEW`): the deployer, th
 
 ## 3. 2-of-3 oracle
 
-**Contract change:** yes.
+**Contract change:** yes. **Decided 2026-10-13:** a threshold-signed report, aggregated off-chain, as Chainlink OCR, Chronicle and Pyth do. Signers do not vote on chain.
 
 Today `admin` is one sealed hash and `setPrice` checks one secret: one relayer down stops prices (and, after `maxPriceAge`, all trading); one leaked secret sets any price.
 
+Why not votes on chain: every signer's submission would read and write the same pending round, so submissions sent together conflict (only the first lands; the others fail as `FailFallible` and pay their fee), and a price update takes two proofs in a row. A signed report is one transaction per round, holds no state between rounds, and has nothing to race.
+
 Design:
 
-- The contract stores three signer hashes.
-- Each relayer reads the same Chainlink round and submits `(roundId, price, updatedAt)` with its own secret, proven in zero knowledge.
-- The first submission for a round is stored as pending. The second **matching** submission from a different signer sets `markPrice` and `priceTime`. A mismatch is refused.
-- The existing rules stay: `updatedAt` not in the future, not older than the current price.
-- **Rotation:** any two signers can replace a third. Today `admin` is fixed at deployment.
+- The contract stores three signer public keys (Jubjub points), instead of `admin`.
+- Each signer reads the same Chainlink round and signs the report `(market, roundId, price, updatedAt)` with Schnorr over Jubjub. `market` is the contract's own address, so a report for one market cannot be replayed on another.
+- Signers share their signatures off-chain (each relayer serves its own over HTTP). Whoever holds two first submits `setPrice(report, i, j, sig_i, sig_j)`, with `i < j`.
+- Transmission is staggered: signer *n* waits (*n* − 1) × 20 s after it sees a round, skips the round once it is on chain, and waits while a lower signer says it is transmitting it (its `/health`). Normally one transaction per round; if the first transmitter is down, the next one sends. Measured on the devnet (2026-10-13): two signers sending the same round at once, exactly one lands, and the other fails on chain (`FailFallible`) and **pays its fee**, so the stagger is about cost, not safety.
+- **What the chain proves:** the proof shows that two different stored signers signed exactly this report. The validators verify it, and without it no transaction can move the price, ours included. The signatures stay private inputs.
+- **What is public:** the price, `roundId` and `updatedAt`, and which two signers signed (`priceSigners`), for liveness on the Public page. With `roundId` published, anyone can compare every update against Chainlink's own round history.
+- The rules stay: `updatedAt` not in the future and not older than the current price; and now `roundId` strictly increasing, so no round lands twice.
+- **Rotation:** any two signers replace a key in a slot (a third signer's, or their own), with a signed rotation message that names a rotation counter, so it cannot be replayed. A new key must differ from the other two. Today `admin` is fixed at deployment.
 
-Effect on trades: none. Trades still read only `markPrice` and `priceTime`; pending submissions live in their own ledger fields, so they add no conflicts (we measured that only exact reads conflict).
+Measured on a probe (2026-10-13): verifying two signatures costs about 1.35 MB of proving key. The challenge enters `ecMul` as a 128-bit value, passed in two halves the circuit checks against the hash, because `ecMul` refuses scalars at or above the Jubjub order.
+
+Effect on trades: none. Trades still read only `markPrice` and `priceTime`; the signer keys, round and signer mask live in their own ledger fields.
+
+What the proof does not show: that the three keys are held by independent parties. For the buildathon demo, one operator runs all three, each with its own key and wallet; say so on the Public page.
 
 Tasks:
 
-- [ ] Contract: signer set, pending submission, matching rule, rotation circuit.
-- [ ] Relayer: a `--signer` option; three instances, each with its own secret and wallet.
-- [ ] Tests: two matching submissions set the price; one does not; mismatched rounds are refused; a non-signer is refused; rotation needs two signers.
-- [ ] The Public page shows signer liveness (which signers submitted the last round).
+- [x] Contract: signer keys, signed `setPrice`, `roundId` and `priceSigners`, rotation circuit (`rotateSigner`, in `DEFERRED`).
+- [x] Core: signing and key helpers (`core/oracle.ts`); scripts and the fuzzer sign with two of three dev signers.
+- [x] Relayer: a `--signer` option; serves its signature per round, fetches its peers', submits on its stagger. Three instances, each with its own secret and wallet.
+- [x] Tests: two valid signatures set the price; one signer twice, a wrong slot, a tampered signature, an outsider and a mismatched report are refused; a replayed or older round is refused; rotation needs two signers and cannot be replayed.
+- [x] Devnet: run every branch through the proof server (`/check`), and three relayers sending at once.
+- [ ] The Public page shows the round and which signers signed it. (Built; not yet checked in the browser.)
 
-Open question: will the oracle signers also be run by independent parties, like the keepers? The design is the same either way; it changes who holds the secrets in step 2.
+**Status 2026-10-13, devnet:** 14-circuit deploy accepted (`rotateSigner` deferred). Three relayers, each with its own key, wallet and LevelDB store: a real Chainlink round was transmitted by signer 1 alone while 2 and 3 waited (19 s to land). `npm run oracle:race`: three wallets sending one round at once, one landed and two failed as `FailFallible` (fees paid); a rotation, a price signed with the new key, the old key refused, and the rotation back all worked. `/check` fuzzer: 193 calls, 0 failures.
+
+**Status 2026-10-13, preview:** redeployed as zkperp `cba3a990…` (14 circuits, `rotateSigner` deferred), with the signer keys and wallets as separate secrets in `.env` (`ORACLE_SIGNER_<n>_PREVIEW`, `ORACLE_<n>_SEED_PREVIEW`). Chainlink round …892 ($2,500.67): all three signed within 2.3 s; signer 1 transmitted with signatures 1 + 2 and it landed in 20 s; signer 2's turn came while signer 1 was still sending, so it waited; no duplicate was sent. Not yet on preview: rotation, `oracle:race` (devnet only), the trader flows against the new deployment.
 
 ## 4. Three independent keepers
 
@@ -170,7 +183,7 @@ Expected count after steps 3 and 4:
 | | Circuits |
 |---|---|
 | Today, with limit orders | 13 |
-| Step 3: `setPrice` becomes a signer submission (same circuit), plus a rotation circuit | +1 |
+| Step 3: `setPrice` takes a 2-of-3 signed report (same circuit), plus a rotation circuit | +1 |
 | Step 4: three notes in `openPosition` and the fee to the caller in `liquidatePosition` (no new circuits), plus key rotation | +1, or 0 if one rotation circuit serves signers and keepers |
 | Step 6, if `executeOrder` merges into `closePosition` | −1 |
 | **Total** | **about 14–15** |
