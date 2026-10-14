@@ -15,7 +15,7 @@
  * the short flat.
  *
  * Stop the relayer first: it would put the Chainlink price back. With the
- * keeper service running (`npm run keeper`), pass `--keeper`: the script then
+ * keeper services running (`npm run keeper -- --keeper 1`, …), pass `--keeper`: the script then
  * waits for the service to fill the orders instead of filling them itself.
  */
 
@@ -26,7 +26,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
-import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { keeperSecret, keeperWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   cancelLimitOrder,
   closePosition,
@@ -77,7 +77,8 @@ async function main() {
 
   const devSeed = walletSeed();
   const oracle = oracleSecrets(devSeed);
-  const secret = liquidatorSecret(devSeed);
+  // Keeper 1 does it here; any of the three could (see npm run liquidation).
+  const secret = keeperSecret(devSeed, 0);
 
   step("Wallets");
   const wallets: BuiltWallet[] = [];
@@ -87,14 +88,14 @@ async function main() {
     await waitForSync(dev, () => {});
     const trader = await readyTrader(dev, traderSeed(devSeed), LOCAL, info);
     wallets.push(trader);
-    const keeper = await readyWallet(dev, keeperSeed(devSeed), LOCAL, info, "keeper");
+    const keeper = await readyWallet(dev, keeperWalletSeed(devSeed, 0), LOCAL, info, "keeper 1");
     wallets.push(keeper);
     const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
     wallets.push(treasury);
 
     const devPerp = await handle(dev, devSeed, "zkperp", perpAddress);
     const traderPerp = await handle(trader, traderSeed(devSeed), "zkperp", perpAddress);
-    const keeperPerp = await handle(keeper, keeperSeed(devSeed), "zkperp", perpAddress);
+    const keeperPerp = await handle(keeper, keeperWalletSeed(devSeed, 0), "zkperp", perpAddress);
     const l0 = await readLedger(devPerp);
     if (l0.limitNotes === undefined) throw new Error("this deployment predates limit orders: run npm run setup:local again");
     const usdc: Uint8Array = l0.usdc;
@@ -116,7 +117,7 @@ async function main() {
 
     const limitsNow = async () => {
       const ledger = await readLedger(keeperPerp);
-      const limits = watchedLimits(keeperPerp, ledger, secret);
+      const limits = watchedLimits(keeperPerp, ledger, 0, secret);
       const of = (r: LimitRecord) => limits.find((w) => w.commitment === r.commitment);
       return { ledger, limits, of };
     };
@@ -166,9 +167,9 @@ async function main() {
       check("at the mark of the fill, no worse than the limit", BigInt(fill.opening.entryPrice) === ledger.markPrice);
       check(
         "the keeper now watches it like any position",
-        watchedPositions(keeperPerp, after, secret).some((p) => p.commitment === fill!.commitment)
+        watchedPositions(keeperPerp, after, 0, secret).some((p) => p.commitment === fill!.commitment)
       );
-      check("the order no longer waits", !watchedLimits(keeperPerp, after, secret).some((x) => x.commitment === record.commitment));
+      check("the order no longer waits", !watchedLimits(keeperPerp, after, 0, secret).some((x) => x.commitment === record.commitment));
       return fill;
     };
 

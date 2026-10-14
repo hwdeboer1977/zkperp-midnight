@@ -87,7 +87,11 @@ export const signPrice = (pc: any, market: string, report: PriceReport, secret: 
 export const rotationMessage = (pc: any, market: string, epoch: bigint, slot: number, key: JubjubPoint): bigint =>
   pc.rotationMessage(bytes(market), epoch, BigInt(slot), key);
 
-/** Two signatures in the order `setPrice` and `rotateSigner` take them: (first, second, a, b). */
+/** The message that puts `key` in keeper slot `slot` at keeper rotation number `epoch`. */
+export const keeperRotationMessage = (pc: any, market: string, epoch: bigint, slot: number, key: JubjubPoint): bigint =>
+  pc.keeperRotationMessage(bytes(market), epoch, BigInt(slot), key);
+
+/** Two signatures in the order `setPrice`, `rotateSigner` and `rotateKeeper` take them: (first, second, a, b). */
 export function quorum(sigs: SlotSignature[]): [bigint, bigint, Signature, Signature] {
   const two = [...new Map(sigs.map((x) => [x.slot, x])).values()].sort((p, q) => p.slot - q.slot).slice(0, 2);
   if (two.length < 2) throw new Error("a quorum needs signatures from two different signers");

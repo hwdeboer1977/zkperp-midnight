@@ -78,7 +78,7 @@ export function positionPnl(
  * them: the loss to the pool, the fees to the treasury, the rest to the
  * trader; a profit from the pool, less fees the collateral could not cover.
  * A liquidation also takes `liquidationFee` out of what equity is left, to the
- * treasury; a close passes none.
+ * keeper that liquidates; a close passes none.
  */
 export function settlement(
   p: { collateral: bigint; openFee: bigint },
@@ -86,7 +86,7 @@ export function settlement(
   closeFee: bigint,
   borrowFee: bigint,
   liquidationFee = 0n
-): { toPool: bigint; toTreasury: bigint; toTrader: bigint; fromPool: bigint; equity: bigint } {
+): { toPool: bigint; toTreasury: bigint; toKeeper: bigint; toTrader: bigint; fromPool: bigint; equity: bigint } {
   const loss = pnl.profit ? 0n : pnl.pnl < p.collateral ? pnl.pnl : p.collateral;
   const afterLoss = p.collateral - loss;
   const fees = closeFee + borrowFee;
@@ -98,7 +98,8 @@ export function settlement(
   const fromPool = profit > shortfall ? profit - shortfall : 0n;
   return {
     toPool: loss,
-    toTreasury: p.openFee + feeTaken + liqTaken,
+    toTreasury: p.openFee + feeTaken,
+    toKeeper: liqTaken,
     toTrader: equity - liqTaken + fromPool,
     fromPool,
     equity,

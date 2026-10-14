@@ -48,7 +48,10 @@ export default defineConfig({
       "/svc/signer/2": { target: "http://127.0.0.1:3021", rewrite: (p) => p.replace(/^\/svc\/signer\/2/, "") },
       "/svc/signer/3": { target: "http://127.0.0.1:3022", rewrite: (p) => p.replace(/^\/svc\/signer\/3/, "") },
       "/svc/treasury": { target: "http://127.0.0.1:3011", rewrite: (p) => p.replace(/^\/svc\/treasury/, "") },
-      "/svc/keeper": { target: "http://127.0.0.1:3012", rewrite: (p) => p.replace(/^\/svc\/keeper/, "") },
+      // The three keepers.
+      "/svc/keeper/1": { target: "http://127.0.0.1:3030", rewrite: (p) => p.replace(/^\/svc\/keeper\/1/, "") },
+      "/svc/keeper/2": { target: "http://127.0.0.1:3031", rewrite: (p) => p.replace(/^\/svc\/keeper\/2/, "") },
+      "/svc/keeper/3": { target: "http://127.0.0.1:3032", rewrite: (p) => p.replace(/^\/svc\/keeper\/3/, "") },
     },
   },
 });

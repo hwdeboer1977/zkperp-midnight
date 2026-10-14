@@ -45,7 +45,7 @@ export async function ordersOf(module: { pureCircuits: any }, ledger: any, recor
   const out: OwnOrder[] = [];
   for (let index = 0; index < MAX_ORDERS_PER_POSITION; index++) {
     const { ephemeral } = await deriveOrder(ownerSecret, salt, index);
-    const view = findOwnOrderNote(pure, ledger.orderNotes, ledger.liquidator, ephemeral);
+    const view = findOwnOrderNote(pure, ledger.orderNotes, ledger.keepers, ephemeral);
     if (!view) break;
     const order: TriggerOrder = { position: bytes(record.commitment), price: view.price, above: view.above, salt: view.salt };
     // A note alone is not an order: the commitment is what executeOrder checks.
@@ -111,7 +111,7 @@ export async function placeOrder(perp: ContractHandle, record: PositionRecord, k
   const ownerSecret = bytes(record.opening.ownerSecret);
   const { salt, ephemeral } = await deriveOrder(ownerSecret, position.salt, index);
   const order: TriggerOrder = { position: bytes(record.commitment), price, above: firesAbove(position.isLong, kind), salt };
-  const note = sealOrderNote(perp.module.pureCircuits, ledger.liquidator, position.salt, order, ephemeral);
+  const note = sealOrderNote(perp.module.pureCircuits, ledger.keepers, position.salt, order, ephemeral);
   usedIndex.set(record.commitment, index);
   const tx: any = await perp.deployed.callTx.placeOrder(position, ownerSecret, order, note);
   return { txHash: tx.public.txHash, order: { index, kind, order, cancelled: false } };

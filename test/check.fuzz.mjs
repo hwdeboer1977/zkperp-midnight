@@ -38,7 +38,7 @@ import {
 } from "@midnight-ntwrk/ledger-v8";
 import { Contract, ledger, pureCircuits } from "../contracts/managed/zkperp/contract/index.js";
 import { JUBJUB_ORDER, belowField } from "../dist/core/liquidatorNote.js";
-import { oracleSecrets, rotationMessage, sign as schnorrSign, signedPriceArgs, signerKeys } from "../dist/core/oracle.js";
+import { keeperRotationMessage, oracleSecrets, rotationMessage, sign as schnorrSign, signedPriceArgs, signerKeys } from "../dist/core/oracle.js";
 import { firesAbove, sealOrderNote } from "../dist/core/orders.js";
 import { sealLimitNote } from "../dist/core/limits.js";
 import * as m from "../dist/core/math.js";
@@ -100,8 +100,8 @@ const TRADER = key(0x30);
 const KEEPER = key(0x4b);
 const TREASURY = key(0x7e);
 const NOTE = Uint8Array.from({ length: 128 }, (_, i) => (i * 53 + 7) & 0xff);
-const LIQUIDATOR_SECRET = JUBJUB_ORDER - 0x1234_5678_9abcn;
-const LIQUIDATOR_KEY = pureCircuits.liquidatorPublicKey(LIQUIDATOR_SECRET);
+const KEEPER_SECRETS = [JUBJUB_ORDER - 0x1234_5678_9abcn, JUBJUB_ORDER - 0x2222_2222n, JUBJUB_ORDER - 0x3333_3333n];
+const KEEPER_KEYS = KEEPER_SECRETS.map((x) => pureCircuits.liquidatorPublicKey(x));
 const SIGNERS = oracleSecrets("ab".repeat(32));
 const SIGNER_KEYS = signerKeys(pureCircuits, SIGNERS);
 const PAIRS = [[0, 1], [0, 2], [1, 2]];
@@ -204,7 +204,7 @@ async function runCase(index) {
       createConstructorContext({}, hex(DEPLOYER.bytes)),
       USDC, SIGNER_KEYS, p.price, T0 - 10n, 1n, p.maxLeverage, p.minCollateral, p.maxPayout,
       p.openFeeBps, p.closeFeeBps, p.borrowRate, TREASURY, p.clockSlack, p.maxPriceAge, p.maintenanceBps,
-      p.liquidationFeeBps, LIQUIDATOR_KEY
+      p.liquidationFeeBps, KEEPER_KEYS
     ).currentContractState;
   let state = deploy().data;
   const L = () => ledger(state);
@@ -253,6 +253,16 @@ async function runCase(index) {
     if (!r) throw new Error("rotateSigner refused");
     signers[slot] = fresh;
   }
+  // And sometimes a keeper's key, so later opens seal to a rotated set.
+  if (index % 3 === 1) {
+    const slot = Number(between(0n, 2n));
+    const [i, j] = pick(PAIRS);
+    const key = pureCircuits.liquidatorPublicKey(JUBJUB_ORDER - between(1n, 1n << 64n));
+    const msg = keeperRotationMessage(pureCircuits, ADDRESS, L().keeperEpoch, slot, key);
+    const r = await run(`rotateKeeper ${slot + 1} by ${i + 1}+${j + 1}`, DEPLOYER, "rotateKeeper", BigInt(slot), key, BigInt(i), BigInt(j),
+      schnorrSign(pureCircuits, signers[i], msg), schnorrSign(pureCircuits, signers[j], msg));
+    if (!r) throw new Error("rotateKeeper refused");
+  }
   const advance = async (seconds) => {
     now += seconds;
     await setPrice(L().markPrice, "setPrice (refresh)");
@@ -297,7 +307,7 @@ async function runCase(index) {
       const r = await run(
         `limit ${i}`, TRADER, "placeLimitOrder", { nonce, color: USDC, value: collateral + openFee },
         size, isLong, openFee, price, order.expiry, secret, salt, order.payToEnc, NOTE,
-        sealLimitNote(pureCircuits, LIQUIDATOR_KEY, order, scalar())
+        sealLimitNote(pureCircuits, L().keepers, order, scalar())
       );
       if (r) limits.push({ order, secret });
       continue;
@@ -331,7 +341,7 @@ async function runCase(index) {
       above: firesAbove(o.position.isLong, kind),
       salt: belowField(randomBytes32()),
     };
-    const note = sealOrderNote(pureCircuits, LIQUIDATOR_KEY, o.position.salt, order, scalar());
+    const note = sealOrderNote(pureCircuits, L().keepers, o.position.salt, order, scalar());
     if (await run(`place ${kind}`, TRADER, "placeOrder", o.position, o.secret, order, note)) o.orders.push(order);
     if (o.orders.length && chance(0.2)) {
       const cancelled = o.orders.pop();
@@ -455,7 +465,7 @@ try {
 {
   const wrapper = contract.initialState(
     createConstructorContext({}, hex(DEPLOYER.bytes)), USDC, SIGNER_KEYS, 3_000_000_000n,
-    1n, 1n, 20n, 1n, 1_000_000n, 10n, 10n, 0n, TREASURY, 600n, 3_900n, 250n, 50n, LIQUIDATOR_KEY
+    1n, 1n, 20n, 1n, 1_000_000n, 10n, 10n, 0n, TREASURY, 600n, 3_900n, 250n, 50n, KEEPER_KEYS
   ).currentContractState;
   const runDeposit = () => {
     const ctx = createCircuitContext(ADDRESS, hex(LP.bytes), wrapper, {}, undefined, undefined, 1_800_000_000);

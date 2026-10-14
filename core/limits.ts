@@ -6,7 +6,7 @@
  * becomes a position. Browser and Node alike.
  *
  * The note uses the liquidator note's format (`sealLiquidatorNote`): ten field
- * elements masked under an ECDH secret with the liquidator key. The trader
+ * elements masked under an ECDH secret with each keeper's key. The trader
  * seals it, outside the circuit, as for trigger orders; a false note only
  * stops the trader's own order from filling.
  *
@@ -101,18 +101,18 @@ export function decodeLimitPlaintext(m: readonly bigint[]): LimitOrder {
 
 /** The contract's pure circuits this module uses. */
 interface Pure {
-  sealLiquidatorNote(m: bigint[], key: { x: bigint; y: bigint }, ephemeral: bigint): any;
-  openLiquidatorNote(note: any, secret: bigint): bigint[];
+  sealLiquidatorNote(m: bigint[], keys: { x: bigint; y: bigint }[], ephemeral: bigint): any;
+  openLiquidatorNote(note: any, slot: bigint, secret: bigint): bigint[];
 }
 
-/** The keeper's note for `order`, sealed to the liquidator key. */
-export function sealLimitNote(pure: Pure, liquidatorKey: { x: bigint; y: bigint }, order: LimitOrder, ephemeral: bigint) {
-  return pure.sealLiquidatorNote(limitPlaintext(order), liquidatorKey, ephemeral);
+/** The keepers' note for `order`, sealed to the three keepers' keys (the ledger's `keepers`). */
+export function sealLimitNote(pure: Pure, keeperKeys: { x: bigint; y: bigint }[], order: LimitOrder, ephemeral: bigint) {
+  return pure.sealLiquidatorNote(limitPlaintext(order), keeperKeys, ephemeral);
 }
 
-/** The keeper's side: a limit note opened with the liquidator secret. */
-export function openLimitNote(pure: Pure, note: any, secret: bigint): LimitOrder {
-  return decodeLimitPlaintext(pure.openLiquidatorNote(note, secret));
+/** Keeper `slot`'s side: a limit note opened with its secret. */
+export function openLimitNote(pure: Pure, note: any, slot: number, secret: bigint): LimitOrder {
+  return decodeLimitPlaintext(pure.openLiquidatorNote(note, BigInt(slot), secret));
 }
 
 /** The position a fill opens: the order's fields at the fill's entry price and open time. */

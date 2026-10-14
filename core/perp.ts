@@ -344,16 +344,17 @@ export interface Watched extends LiquidatorView {
 }
 
 /**
- * Every live position whose liquidator note opens under `secret`. A note under
- * another key decodes to garbage or to a commitment that is not in the tree,
- * and is skipped.
+ * Every live position whose liquidator note opens for keeper `slot` under
+ * `secret`. A note sealed to another key in that slot (before a rotation)
+ * decodes to garbage or to a commitment that is not in the tree, and is
+ * skipped.
  */
-export function watchedPositions(perp: ContractHandle, ledger: any, secret: bigint): Watched[] {
+export function watchedPositions(perp: ContractHandle, ledger: any, slot: number, secret: bigint): Watched[] {
   const out: Watched[] = [];
   for (const note of ledger.liquidatorNotes as Iterable<any>) {
     let view: LiquidatorView;
     try {
-      view = decodeLiquidatorPlaintext(perp.module.pureCircuits.openLiquidatorNote(note, secret));
+      view = decodeLiquidatorPlaintext(perp.module.pureCircuits.openLiquidatorNote(note, BigInt(slot), secret));
     } catch {
       continue;
     }
@@ -380,7 +381,8 @@ export interface Liquidated {
 /**
  * Liquidates `w` at the current mark price, from the keeper's wallet behind
  * `perp.providers`. The equity left goes to the trader's `payTo`, encrypted
- * to the key their liquidator note carries; the fees go to the treasury.
+ * to the key their liquidator note carries; the trading fees go to the
+ * treasury, and the liquidation fee to this wallet.
  */
 export async function liquidatePosition(
   perp: ContractHandle,
@@ -456,7 +458,7 @@ export async function placeOrder(
   const { salt, ephemeral } = await deriveOrder(ownerSecret, position.salt, index);
   const order: TriggerOrder = { position: bytes(record.commitment), price, above: firesAbove(position.isLong, kind), salt };
   const ledger = await readLedger(perp);
-  const note = sealOrderNote(perp.module.pureCircuits, ledger.liquidator, position.salt, order, ephemeral);
+  const note = sealOrderNote(perp.module.pureCircuits, ledger.keepers, position.salt, order, ephemeral);
   const tx = await perp.deployed.callTx.placeOrder(position, ownerSecret, order, note);
   return { txHash: tx.public.txHash, order, index };
 }
@@ -474,14 +476,14 @@ export interface WatchedOrder {
   position: Watched;
 }
 
-/** Every live order whose note opens under `secret`, matched to the live positions in `live`. */
-export function watchedOrders(perp: ContractHandle, ledger: any, secret: bigint, live: Watched[]): WatchedOrder[] {
+/** Every live order whose note opens for keeper `slot` under `secret`, matched to the live positions in `live`. */
+export function watchedOrders(perp: ContractHandle, ledger: any, slot: number, secret: bigint, live: Watched[]): WatchedOrder[] {
   const bySalt = new Map(live.map((w) => [hex(w.position.salt), w]));
   const out: WatchedOrder[] = [];
   for (const note of ledger.orderNotes as Iterable<any>) {
     let view: OrderView;
     try {
-      view = openOrderNote(perp.module.pureCircuits, note, secret);
+      view = openOrderNote(perp.module.pureCircuits, note, slot, secret);
     } catch {
       continue;
     }
@@ -636,7 +638,7 @@ export async function placeLimitOrder(
   };
   const order = limitOf(perp, record);
   record.commitment = hex(perp.module.pureCircuits.limitCommitment(order));
-  const keeperNote = sealLimitNote(perp.module.pureCircuits, ledger.liquidator, order, randomScalar());
+  const keeperNote = sealLimitNote(perp.module.pureCircuits, ledger.keepers, order, randomScalar());
 
   const { status: _status, createdAt: _createdAt, ...pending } = record;
   recordLimitPending(pending);
@@ -718,12 +720,13 @@ export interface WatchedLimit {
   commitment: string;
 }
 
-export function watchedLimits(perp: ContractHandle, ledger: any, secret: bigint): WatchedLimit[] {
+/** Every waiting limit order whose note opens for keeper `slot` under `secret`. */
+export function watchedLimits(perp: ContractHandle, ledger: any, slot: number, secret: bigint): WatchedLimit[] {
   const out: WatchedLimit[] = [];
   for (const note of ledger.limitNotes as Iterable<any>) {
     let order: LimitOrder;
     try {
-      order = openLimitNote(perp.module.pureCircuits, note, secret);
+      order = openLimitNote(perp.module.pureCircuits, note, slot, secret);
     } catch {
       continue;
     }

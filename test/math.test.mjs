@@ -134,12 +134,12 @@ console.log("\n  settlement\n");
   );
   const liq = s({ profit: false, pnl: 900n * PUSDC }, 5n * PUSDC);
   expect(
-    "a liquidation fee comes out of the equity, to the treasury",
-    liq.equity === 88n * PUSDC && liq.toTreasury === 27n * PUSDC && liq.toTrader === 83n * PUSDC,
+    "a liquidation fee comes out of the equity, to the keeper",
+    liq.equity === 88n * PUSDC && liq.toTreasury === 22n * PUSDC && liq.toKeeper === 5n * PUSDC && liq.toTrader === 83n * PUSDC,
     show(liq)
   );
   const liqThin = s({ profit: false, pnl: 986n * PUSDC }, 5n * PUSDC);
-  expect("a liquidation fee is capped by the equity left", liqThin.equity === 2n * PUSDC && liqThin.toTreasury === 24n * PUSDC && liqThin.toTrader === 0n, show(liqThin));
+  expect("a liquidation fee is capped by the equity left", liqThin.equity === 2n * PUSDC && liqThin.toTreasury === 22n * PUSDC && liqThin.toKeeper === 2n * PUSDC && liqThin.toTrader === 0n, show(liqThin));
 
   // The coin and the profit are conserved: whatever goes in comes out.
   let conserved = true;
@@ -149,15 +149,15 @@ console.log("\n  settlement\n");
       for (const lf of [0n, 5n * PUSDC]) {
         const r = s({ profit, pnl: v }, lf);
         const inn = p.collateral + p.openFee + r.fromPool;
-        const out = r.toPool + r.toTreasury + r.toTrader;
-        if (inn !== out || r.toTrader < 0n || r.toTreasury < 0n || r.toPool < 0n) {
+        const out = r.toPool + r.toTreasury + r.toKeeper + r.toTrader;
+        if (inn !== out || r.toTrader < 0n || r.toTreasury < 0n || r.toKeeper < 0n || r.toPool < 0n) {
           conserved = false;
           firstBroken ||= `${profit} ${v} ${lf}: ${show(r)}`;
         }
       }
     }
   }
-  expect("collateral + opening fee + profit = to the pool + to the treasury + to the trader, never negative", conserved, firstBroken);
+  expect("collateral + opening fee + profit = to the pool + to the treasury + to the keeper + to the trader, never negative", conserved, firstBroken);
 }
 
 // ── Liquidation ─────────────────────────────────────────────────────────────

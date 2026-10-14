@@ -158,13 +158,29 @@ Costs and trade-offs:
 - **Privacy:** each keeper sees every position's size, direction, entry, collateral and payout key, never the owner secret. Three keepers means three parties with that view, not one.
 - **Rotation does not revoke:** a removed keeper keeps its view of positions opened while it was a keeper, because their notes were written to its key.
 
+**Status 2026-10-13:** built, and tested in the simulator, the `/check` fuzzer (313 calls, 0 failures, 10 `rotateKeeper`) and on the devnet (zkperp `6535f8be…`, 15 circuits deployed and inserted). Not yet on preview. On the devnet:
+
+- `npm run liquidation`: each keeper opens its own copy; keeper 3 alone liquidates; the treasury gets the trading fees and keeper 3's wallet the 9.50 pUSDC liquidation fee; keeper 1's late liquidation is refused.
+- `npm run oracle:race`: part C, signers 2+3 rotate keeper 3's key and put it back.
+- Keeper services 2 and 3 only (keeper 1 down), `npm run limit -- --keeper`: keeper 2 filled both orders at once (35 and 38 s after the price moved); keeper 3 logged that keeper 2 acts first and never submitted.
+
+What was chosen:
+
+- **One note, three copies:** `LiquidatorNote.fields` is now `Vector<3, Vector<10, Field>>`, one copy per keeper slot under one ephemeral scalar (three ECDHs, one ephemeral point). Keeper i opens `fields[i]` only. Trigger-order and limit-order notes use the same format; the trader seals them to the ledger's `keepers`.
+- **Rotation by two of the three oracle signers** (`rotateKeeper`, its own message domain and epoch), not by the keepers. One more circuit: 15 in all.
+- **Fee to the caller** in `liquidatePosition` only. In the shared settlement it doubled `closePosition`'s proving key (38.8 → 76.7 MB, past 1AM's limit), so `settle` was split: `settle` checks and pays the treasury, `liquidatePosition` pays the keeper, `payOut` pays the trader and the pool.
+- **Keeper service:** `--keeper n`, its own key (`KEEPER_SECRET_<n>`), wallet (`KEEPER_<n>_SEED`), LevelDB and port (3030–3032). Keeper n acts (n − 1) × 60 s after something is due (`KEEPER_STAGGER_MS`), and waits up to 3 min more while a lower keeper's /health says it is busy; lower keepers that are all down are not waited for.
+
+Proving keys: `openPosition` 11.0 MB and `executeLimitOrder` 21.6 MB, both unchanged (keys grow in powers of two); `closePosition` 38.8 MB, unchanged; `liquidatePosition` 38.7 → **76.7 MB** (keeper-proven, like `executeOrder`; expect its proof to take about twice as long); `rotateKeeper` 1.4 MB.
+
 Tasks:
 
-- [ ] Contract: three keeper keys; three notes per open; liquidation fee to the caller; key rotation.
-- [ ] Keeper: takes its own key and wallet; decrypts only its own note per position.
-- [ ] Frontend: the Privacy inspector and Public page say "three keepers"; the Liquidity explainer and docs say the liquidation fee goes to the keeper.
-- [ ] Tests: each keeper alone can liquidate; a second liquidation of the same position is refused; the fee reaches the liquidating keeper; rotation.
-- [ ] Re-measure the open circuit's proving-key size and proving time.
+- [x] Contract: three keeper keys; three notes per open; liquidation fee to the caller; key rotation.
+- [x] Keeper: takes its own key and wallet; decrypts only its own note per position.
+- [x] Frontend: the Privacy inspector and Public page say "three keepers" (and how many are up); the keeper line names which keeper is busy. The docs say the liquidation fee goes to the keeper.
+- [x] Tests: each keeper alone can liquidate; a second liquidation of the same position is refused; the fee reaches the liquidating keeper; rotation.
+- [x] Re-measure the open circuit's proving-key size. Proving time: not yet re-measured.
+- [ ] Preview: redeploy with `KEEPER_SECRET_1..3_PREVIEW` and `KEEPER_1..3_SEED_PREVIEW` in `.env`, start three keepers, and liquidate with one or two of them stopped.
 
 ## 3 + 4 + 6. One redeployment
 
@@ -184,7 +200,7 @@ Expected count after steps 3 and 4:
 |---|---|
 | Today, with limit orders | 13 |
 | Step 3: `setPrice` takes a 2-of-3 signed report (same circuit), plus a rotation circuit | +1 |
-| Step 4: three notes in `openPosition` and the fee to the caller in `liquidatePosition` (no new circuits), plus key rotation | +1, or 0 if one rotation circuit serves signers and keepers |
+| Step 4: three notes in `openPosition` and the fee to the caller in `liquidatePosition` (no new circuits), plus key rotation | +1 (`rotateKeeper`; 15 in all, built 2026-10-13) |
 | Step 6, if `executeOrder` merges into `closePosition` | −1 |
 | **Total** | **about 14–15** |
 

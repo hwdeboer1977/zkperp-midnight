@@ -11,16 +11,18 @@
  *   npm run relayer -- --signer 1   # and --signer 2, 3: the oracle's three
  *                                   # signers (relayer:preview for preview)
  *   npm run treasury         # in another terminal
- *   npm run keeper           # in another
+ *   npm run keeper -- --keeper 1    # and --keeper 2, 3: three independent
+ *                                   # keepers (keeper:preview for preview)
  *
  * On the devnet the dev wallet is pre-funded. On preview it is the operator
  * wallet, from your own secret seed (WALLET_SEED_PREVIEW), separate from any
  * trader's wallet:
  * the first run stops with its address if it holds no tNIGHT, and registers
- * its NIGHT for DUST once it does. The treasury, keeper and three oracle
- * signer wallets (and, on the devnet only, a command-line trader)
- * derive from it and are funded from it. The oracle signer keys are separate
- * from those wallets (ORACLE_SIGNER_1..3, or derived; see core/oracle.ts).
+ * its NIGHT for DUST once it does. The treasury, three keeper and three
+ * oracle signer wallets (and, on the devnet only, a command-line trader)
+ * derive from it and are funded from it. The oracle signer keys and keeper
+ * keys are separate from those wallets (ORACLE_SIGNER_1..3 and
+ * KEEPER_SECRET_1..3, or derived; see core/oracle.ts and core/trader.ts).
  *
  * Unlike the demo, which drives a mock price of its own, this deploys zkperp
  * with Chainlink's latest round as its first price, so the relayer can take
@@ -42,7 +44,7 @@ import { SIGNER_SLOTS, oracleSecrets, signerKeys } from "../core/oracle.js";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, isLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, getUnshieldedAddress, waitForSync, type BuiltWallet } from "../core/wallet.js";
-import { keeperSeed, liquidatorSecret, oracleWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { KEEPER_SLOTS, keeperSecrets, keeperWalletSeed, oracleWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import { readLedger, type ContractHandle } from "../core/perp.js";
 import { addLiquidity } from "../core/pool.js";
 import { balance, coinKey, deployOrFind, handle, waitForBalance } from "../core/session.js";
@@ -116,8 +118,12 @@ async function main() {
     if (trader) others.push(trader);
     const treasury = await readyWallet(dev, treasurySeed(devSeed), network, info, "treasury");
     others.push(treasury);
-    const keeper = await readyWallet(dev, keeperSeed(devSeed), network, info, "keeper");
-    others.push(keeper);
+    // One wallet per keeper, funded now for the same reason as the signers'.
+    const keeperWallets: BuiltWallet[] = [];
+    for (const slot of KEEPER_SLOTS) {
+      keeperWallets.push(await readyWallet(dev, keeperWalletSeed(devSeed, slot), network, info, `keeper ${slot + 1}`));
+    }
+    others.push(...keeperWallets);
     // One wallet per oracle signer, funded now: three relayers starting at
     // once would otherwise all fund themselves from the dev wallet together.
     const signerWallets: BuiltWallet[] = [];
@@ -128,7 +134,7 @@ async function main() {
     info(`dev      ${dev.unshieldedAddress}`);
     if (trader) info(`trader   ${trader.unshieldedAddress}`);
     info(`treasury ${treasury.unshieldedAddress}`);
-    info(`keeper   ${keeper.unshieldedAddress}`);
+    keeperWallets.forEach((w, slot) => info(`keeper ${slot + 1} ${w.unshieldedAddress}`));
     signerWallets.forEach((w, slot) => info(`signer ${slot + 1} ${w.unshieldedAddress}`));
 
     step("pUSDC");
@@ -170,7 +176,7 @@ async function main() {
         PARAMS.maxPriceAge,
         PARAMS.maintenanceBps,
         PARAMS.liquidationFeeBps,
-        module.pureCircuits.liquidatorPublicKey(liquidatorSecret(devSeed)),
+        keeperSecrets(devSeed).map((x) => module.pureCircuits.liquidatorPublicKey(x)),
       ],
       () => false
     );
@@ -213,7 +219,7 @@ async function main() {
     fs.writeFileSync(FILE, JSON.stringify(stack, null, 2) + "\n");
     console.log(`\n${chalk.green.bold(`${network.name} stack ready.`)} ${chalk.gray(FILE)}`);
     const suffix = isLocal(network) ? "" : `:${network.key}`;
-    console.log(chalk.gray(`   next: npm run relayer${suffix} -- --signer 1 (and 2, 3), treasury${suffix} and keeper${suffix}, each in its own terminal`));
+    console.log(chalk.gray(`   next: npm run relayer${suffix} -- --signer 1 (and 2, 3), treasury${suffix}, and keeper${suffix} -- --keeper 1 (and 2, 3), each in its own terminal`));
   } finally {
     for (const w of others) await w.facade.stop();
     await dev.facade.stop();

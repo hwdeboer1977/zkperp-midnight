@@ -12,6 +12,8 @@
  *   B  rotation: signers 1 and 2 replace signer 3's key; the new key then
  *      signs a price with signer 1, and the old one no longer can. Signers 1
  *      and 2 then put the old key back, so the relayers keep working.
+ *   C  keeper rotation: signers 2 and 3 replace keeper 3's key, and put it
+ *      back, so the keepers keep working.
  *
  * Each price is the contract's own, at the round after the contract's: run it
  * while the relayers are stopped, or they wait for the next Chainlink round.
@@ -26,7 +28,7 @@ import { circuitNow, readLedger, submitPrice, submitSignedPrice, type ContractHa
 import { handle } from "../core/session.js";
 import { randomScalar } from "../core/liquidatorNote.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
-import { oracleSecrets, quorum, rotationMessage, sign, signPrice, SIGNER_SLOTS, type PriceReport } from "../core/oracle.js";
+import { keeperRotationMessage, oracleSecrets, quorum, rotationMessage, sign, signPrice, SIGNER_SLOTS, type PriceReport } from "../core/oracle.js";
 
 const step = (s: string) => console.log(`\n${chalk.blue.bold("▶")} ${chalk.bold(s)}`);
 const info = (s: string) => console.log(chalk.gray(`   ${s}`));
@@ -127,6 +129,25 @@ async function main() {
     const r2 = await attempt("signers 1+2 put the old key back", () => rotate(oldKey, perps[1]));
     const l3 = await readLedger(perps[0]);
     verdict("B, restore", r2.ok && l3.signers[2].x === oldKey.x, `epoch ${l3.signerEpoch}`);
+
+    step("C: keeper rotation");
+    const oldKeeper = l3.keepers[2];
+    const newKeeper = pc.liquidatorPublicKey(randomScalar());
+    const rotateKeeper = async (key: any, by: ContractHandle) => {
+      const epoch = (await readLedger(by)).keeperEpoch;
+      const msg = keeperRotationMessage(pc, perpAddress, epoch, 2, key);
+      const tx = await by.deployed.callTx.rotateKeeper(2n, key, ...quorum([
+        { slot: 1, signature: sign(pc, secrets[1], msg) },
+        { slot: 2, signature: sign(pc, secrets[2], msg) },
+      ]));
+      return tx.public.txHash as string;
+    };
+    const k1 = await attempt("signers 2+3 put a new key in keeper slot 3", () => rotateKeeper(newKeeper, perps[2]));
+    const l4 = await readLedger(perps[0]);
+    verdict("C, rotate", k1.ok && l4.keepers[2].x === newKeeper.x && l4.keeperEpoch === l3.keeperEpoch + 1n, `keeper epoch ${l4.keeperEpoch}`);
+    const k2 = await attempt("signers 2+3 put the old keeper key back", () => rotateKeeper(oldKeeper, perps[1]));
+    const l5 = await readLedger(perps[0]);
+    verdict("C, restore", k2.ok && l5.keepers[2].x === oldKeeper.x, `keeper epoch ${l5.keeperEpoch}`);
   } finally {
     for (const w of wallets) await w.facade.stop();
     if (dev) await dev.facade.stop();

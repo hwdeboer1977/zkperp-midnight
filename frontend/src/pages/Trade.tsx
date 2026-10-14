@@ -363,10 +363,10 @@ export default function TradePage() {
               <p>A commitment and two encrypted notes; the pool's reserved liquidity rises by one slot. Longs and shorts look alike.</p>
             </div>
             <div>
-              <b>The keeper</b>
+              <b>The three keepers</b>
               <p>
-                Decrypts its note: size, side, collateral, entry and payout key — enough to liquidate, never the owner secret, so it
-                cannot close for you. It also reads your stop loss and take profit levels, and your limit orders' level, size and
+                Each decrypts its copy of the note: size, side, collateral, entry and payout key — enough to liquidate, never the
+                owner secret, so none can close for you. Any one of them can liquidate alone, and is paid the liquidation fee. It also reads your stop loss and take profit levels, and your limit orders' level, size and
                 side, to execute them; the public sees only that an order was placed, and later that it filled or was cancelled.
               </p>
             </div>
@@ -500,7 +500,7 @@ export default function TradePage() {
                 <dd>{fmt6((plan.size * BigInt(ledger.borrowRate) * 3600n) / 1_000_000_000_000n, 4)} / hour</dd>
               </dl>
               <dl className="summary risk">
-                <dt title={`The keeper may liquidate once equity falls below ${Number(ledger.maintenanceBps) / 100}% of size; a ${Number(ledger.liquidationFeeBps) / 100}% liquidation fee comes out of what is left${mode === "limit" ? ". For a fill exactly at the limit" : ""}`}>
+                <dt title={`The keeper may liquidate once equity falls below ${Number(ledger.maintenanceBps) / 100}% of size; a ${Number(ledger.liquidationFeeBps) / 100}% liquidation fee, to the keeper, comes out of what is left${mode === "limit" ? ". For a fill exactly at the limit" : ""}`}>
                   Liquidation price
                 </dt>
                 <dd className="strong liq">

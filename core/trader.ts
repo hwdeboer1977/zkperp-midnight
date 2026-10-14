@@ -23,7 +23,7 @@ import { buildWallet, currentState, waitForSync, type BuiltWallet } from "./wall
 
 const NIGHT = nativeToken().raw;
 /**
- * NIGHT given to each derived wallet (trader, treasury, keeper), in the
+ * NIGHT given to each derived wallet (trader, treasury, keepers), in the
  * smallest unit: NIGHT_PER_WALLET, or 100 NIGHT. DUST accrues in proportion to
  * the NIGHT held, and registering costs about 0.3 DUST, so a handful of NIGHT
  * leaves a wallet waiting many minutes for its first transaction.
@@ -31,7 +31,7 @@ const NIGHT = nativeToken().raw;
 const NIGHT_FOR_TRADER = BigInt(process.env.NIGHT_PER_WALLET ?? 100_000_000);
 const nightText = (n: bigint) => `${n / 1_000_000n}.${(n % 1_000_000n).toString().padStart(6, "0")}`;
 
-function seedFor(role: "trader" | "treasury" | "keeper" | `oracle-${number}`, devSeed: string): string {
+function seedFor(role: "trader" | "treasury" | `keeper-${number}` | `oracle-${number}`, devSeed: string): string {
   // Per network first (ORACLE_1_SEED_PREVIEW), as for WALLET_SEED_PREVIEW.
   const base = `${role.toUpperCase().replace("-", "_")}_SEED`;
   const scoped = `${base}_${activeNetwork().key.toUpperCase()}`;
@@ -50,8 +50,14 @@ export const traderSeed = (devSeed: string) => seedFor("trader", devSeed);
 /** TREASURY_SEED, or one derived from the dev seed. */
 export const treasurySeed = (devSeed: string) => seedFor("treasury", devSeed);
 
-/** KEEPER_SEED, or one derived from the dev seed: the wallet that submits liquidations. */
-export const keeperSeed = (devSeed: string) => seedFor("keeper", devSeed);
+/** The keeper slots: three independent keepers, each with its own key and wallet. */
+export const KEEPER_SLOTS = [0, 1, 2] as const;
+
+/**
+ * KEEPER_<slot+1>_SEED, or one derived from the dev seed: the wallet keeper
+ * `slot` submits from. It pays the fees and receives the liquidation fees.
+ */
+export const keeperWalletSeed = (devSeed: string, slot: number) => seedFor(`keeper-${slot + 1}`, devSeed);
 
 /**
  * ORACLE_<slot+1>_SEED, or one derived from the dev seed: the wallet oracle
@@ -61,17 +67,23 @@ export const keeperSeed = (devSeed: string) => seedFor("keeper", devSeed);
 export const oracleWalletSeed = (devSeed: string, slot: number) => seedFor(`oracle-${slot + 1}`, devSeed);
 
 /**
- * The liquidator's secret scalar: LIQUIDATOR_SECRET (hex), or one derived from
- * the dev seed. Every open encrypts its position to this key's public half,
- * so whoever holds it sees every position; see docs/privacy.md.
+ * Keeper `slot`'s secret scalar: KEEPER_SECRET_<slot+1>_<NETWORK> or
+ * KEEPER_SECRET_<slot+1> (hex), or one derived from the dev seed. Every open
+ * encrypts its position to each keeper's public key, so whoever holds one sees
+ * every position; see docs/privacy.md. On a public network, give each keeper
+ * its own secret.
  */
-export function liquidatorSecret(devSeed: string): bigint {
-  const explicit = process.env.LIQUIDATOR_SECRET?.trim();
+export function keeperSecret(devSeed: string, slot: number): bigint {
+  const base = `KEEPER_SECRET_${slot + 1}`;
+  const explicit = (process.env[`${base}_${activeNetwork().key.toUpperCase()}`] ?? process.env[base])?.trim();
   const raw = explicit
     ? Buffer.from(explicit.replace(/^0x/, "").padStart(128, "0"), "hex")
-    : createHash("sha512").update(`zkperp-liquidator:${devSeed}`).digest();
+    : createHash("sha512").update(`zkperp-keeper-${slot + 1}:${devSeed}`).digest();
   return scalarFrom(raw);
 }
+
+/** All three keepers' secrets, by slot. Only the devnet scripts hold all three. */
+export const keeperSecrets = (devSeed: string): bigint[] => KEEPER_SLOTS.map((slot) => keeperSecret(devSeed, slot));
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

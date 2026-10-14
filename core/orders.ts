@@ -5,8 +5,9 @@
  * the trader derives them. Browser and Node alike.
  *
  * An order's note uses the liquidator note's format (`sealLiquidatorNote` in
- * contracts/zkperp.compact): ten field elements, each masked with a hash of an
- * ECDH secret between an ephemeral scalar and the liquidator key. Unlike the
+ * contracts/zkperp.compact): ten field elements per keeper, each masked with a
+ * hash of an ECDH secret between an ephemeral scalar and that keeper's key,
+ * one copy for each of the three keepers. Unlike the
  * position's liquidator note, the trader seals it, outside the circuit; a
  * false note only stops the trader's own order from firing.
  *
@@ -22,8 +23,8 @@
  * The order's salt and the note's ephemeral scalar are derived from the
  * position's owner secret, its salt and the order's index, so the trader can
  * find their orders again on another device: rebuild the ephemeral point,
- * look for it among the notes, and unmask with e·L, as the keeper does with
- * l·(e·G).
+ * look for it among the notes, and unmask a keeper's copy with e·L, as that
+ * keeper does with l·(e·G).
  */
 
 import { belowField, scalarFrom } from "./liquidatorNote.js";
@@ -111,40 +112,45 @@ interface Pure {
   liquidatorPublicKey(secret: bigint): { x: bigint; y: bigint };
   liquidatorShared(point: { x: bigint; y: bigint }, scalar: bigint): bigint;
   liquidatorMask(shared: bigint, i: bigint): bigint;
-  sealLiquidatorNote(m: bigint[], key: { x: bigint; y: bigint }, ephemeral: bigint): any;
-  openLiquidatorNote(note: any, secret: bigint): bigint[];
+  sealLiquidatorNote(m: bigint[], keys: { x: bigint; y: bigint }[], ephemeral: bigint): any;
+  openLiquidatorNote(note: any, slot: bigint, secret: bigint): bigint[];
 }
 
-/** The note to place with `order`, sealed to the liquidator key. */
-export function sealOrderNote(pure: Pure, liquidatorKey: { x: bigint; y: bigint }, positionSalt: Uint8Array, order: TriggerOrder, ephemeral: bigint) {
-  return pure.sealLiquidatorNote(orderPlaintext(positionSalt, order), liquidatorKey, ephemeral);
+/** The note to place with `order`, sealed to the three keepers' keys (the ledger's `keepers`). */
+export function sealOrderNote(pure: Pure, keeperKeys: { x: bigint; y: bigint }[], positionSalt: Uint8Array, order: TriggerOrder, ephemeral: bigint) {
+  return pure.sealLiquidatorNote(orderPlaintext(positionSalt, order), keeperKeys, ephemeral);
 }
 
-/** The keeper's side: an order note opened with the liquidator secret. */
-export function openOrderNote(pure: Pure, note: any, secret: bigint): OrderView {
-  return decodeOrderPlaintext(pure.openLiquidatorNote(note, secret));
+/** Keeper `slot`'s side: an order note opened with its secret. */
+export function openOrderNote(pure: Pure, note: any, slot: number, secret: bigint): OrderView {
+  return decodeOrderPlaintext(pure.openLiquidatorNote(note, BigInt(slot), secret));
 }
 
 /**
  * The trader's side: the note in `notes` sealed with `ephemeral`, opened with
- * the shared secret e·L. Null when no note was sealed with it.
+ * the shared secret e·L of a keeper key in `keeperKeys`, by slot (the
+ * ledger's `keepers`). Any slot whose key is unchanged since the order was
+ * placed opens it. Null when no note was sealed with it.
  */
 export function findOwnOrderNote(
   pure: Pure,
   notes: Iterable<any>,
-  liquidatorKey: { x: bigint; y: bigint },
+  keeperKeys: { x: bigint; y: bigint }[],
   ephemeral: bigint
 ): OrderView | null {
   const point = pure.liquidatorPublicKey(ephemeral);
   for (const note of notes) {
     if (note.ephemeral.x !== point.x || note.ephemeral.y !== point.y) continue;
-    const k = pure.liquidatorShared(liquidatorKey, ephemeral);
-    const fields: bigint[] = note.fields;
-    try {
-      return decodeOrderPlaintext(fields.map((c: bigint, i: number) => fieldSub(c, pure.liquidatorMask(k, BigInt(i)))));
-    } catch {
-      return null;
+    for (const [slot, key] of keeperKeys.entries()) {
+      const k = pure.liquidatorShared(key, ephemeral);
+      const fields: bigint[] = note.fields[slot];
+      try {
+        return decodeOrderPlaintext(fields.map((c: bigint, i: number) => fieldSub(c, pure.liquidatorMask(k, BigInt(i)))));
+      } catch {
+        // That keeper's key changed since: try the next.
+      }
     }
+    return null;
   }
   return null;
 }

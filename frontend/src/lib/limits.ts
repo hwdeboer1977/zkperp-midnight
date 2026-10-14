@@ -143,7 +143,7 @@ export async function placeLimitOrder(
     order.payToEnc,
     note,
     // A fresh scalar per order: the keeper note's ephemeral key.
-    sealLimitNote(perp.module.pureCircuits, ledger.liquidator, order, randomScalar())
+    sealLimitNote(perp.module.pureCircuits, ledger.keepers, order, randomScalar())
   );
   return tx.public.txHash;
 }

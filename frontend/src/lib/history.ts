@@ -63,11 +63,11 @@ function closingOf(record: PositionRecord, settle: Settle, l: any, by: PositionC
     closeTime: closeTime.toString(),
     pnl: (pnl.profit ? pnl.pnl : -pnl.pnl).toString(),
     // What the treasury took beyond the opening fee.
-    fees: (s.toTreasury - position.openFee).toString(),
+    fees: (s.toTreasury + s.toKeeper - position.openFee).toString(),
     received: s.toTrader.toString(),
     closeFee: closeFee.toString(),
     borrowFee: borrowFee.toString(),
-    liquidationFee: liquidationFee.toString(),
+    liquidationFee: s.toKeeper.toString(),
     exact: false,
   };
 }

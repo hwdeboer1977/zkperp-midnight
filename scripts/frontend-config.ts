@@ -77,7 +77,7 @@ function main() {
       relayer: "/svc/relayer",
       signers: ["/svc/signer/1", "/svc/signer/2", "/svc/signer/3"],
       treasury: "/svc/treasury",
-      keeper: "/svc/keeper",
+      keepers: ["/svc/keeper/1", "/svc/keeper/2", "/svc/keeper/3"],
     },
   };
   fs.writeFileSync(path.join(FRONTEND, "public", "config.json"), JSON.stringify(config, null, 2) + "\n");

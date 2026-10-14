@@ -3,6 +3,7 @@
 import { reservedOf } from "@core/math";
 import { fmt6 } from "../lib/bytes";
 import { useActivity, useConfig, useLedger, useNow, useService } from "../lib/hooks";
+import { useKeeper } from "../lib/keeper";
 import { ActivityFeed, PriceChart, Stat } from "../components/Market";
 
 interface Epoch {
@@ -19,6 +20,8 @@ export default function PublicPage() {
   // The oracle's three signers, each its own relayer.
   const signerUrl = (n: number) => config?.services.signers?.[n] && `${config.services.signers[n]}/health`;
   const signerHealth = [useService<any>(signerUrl(0)), useService<any>(signerUrl(1)), useService<any>(signerUrl(2))];
+  // The three keepers, any one of which can liquidate alone.
+  const keepers = useKeeper(true, 15_000);
   const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs` : undefined, 30_000);
   const { actions, prices } = useActivity();
 
@@ -64,7 +67,10 @@ export default function PublicPage() {
         <Stat
           label="Open positions"
           value={String(live)}
-          sub={`${ledger.openPositions} opened · ${ledger.closedPositions} closed${liquidations !== undefined ? ` · ${liquidations} liquidated` : ""}`}
+          sub={
+            `${ledger.openPositions} opened · ${ledger.closedPositions} closed${liquidations !== undefined ? ` · ${liquidations} liquidated` : ""}` +
+            (keepers ? ` · ${keepers === "down" ? 0 : keepers.up} of 3 keepers up` : "")
+          }
         />
         <Stat
           label="Mark price · ETH-USD"
@@ -148,7 +154,7 @@ export default function PublicPage() {
             <li>The mark price, when the oracle saw it, and its Chainlink round (now {String(ledger.priceRound)})</li>
             <li>
               Which two of the three oracle signers signed each price: the proof checks their signatures, and no price moves
-              without two. For this demo one operator runs all three signers.
+              without two. For this demo one operator runs all three signers, and all three keepers.
             </li>
             <li>That a position opened, closed or was liquidated, and when</li>
             <li>At a close, the PnL — it is the pool's change</li>
@@ -168,7 +174,8 @@ export default function PublicPage() {
             <li>Who receives a payout</li>
           </ul>
           <p className="muted" style={{ fontSize: 12, margin: "12px 0 0" }}>
-            The keeper can read open positions, so it can liquidate them; the treasury sees fees. See docs/privacy.md.
+            Each of the three keepers can read open positions, so any one of them can liquidate alone, and earns the
+            liquidation fee; the treasury sees the other fees. See docs/privacy.md.
           </p>
         </div>
       </section>

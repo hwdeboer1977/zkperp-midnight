@@ -78,6 +78,7 @@ export function waitForBalance(wallet: BuiltWallet, usdc: Uint8Array, ok: (b: bi
 const DEFERRED: Partial<Record<ContractName, string[]>> = {
   zkperp: [
     "placeOrder", "cancelOrder", "executeOrder", "placeLimitOrder", "executeLimitOrder", "cancelLimitOrder", "rotateSigner",
+    "rotateKeeper",
   ],
 };
 

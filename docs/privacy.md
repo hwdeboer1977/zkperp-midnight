@@ -84,9 +84,9 @@ On Midnight there are two coherent designs. Which one fits depends on one questi
 |---|---|---|
 | Position data | Encrypted notes; one commitment per position | Public state, keyed by position id |
 | Authorization | Owner secret derived from the password root | A receipt token per position, spent at close |
-| Liquidation | A second note, encrypted in-circuit to the keeper | Anyone reads the public data |
+| Liquidation | A second note, encrypted in-circuit to each of three keepers | Anyone reads the public data |
 | Recovery | Wallet recovery phrase plus password | Wallet recovery phrase only |
-| Cost | A password to remember; a trusted keeper; larger open proofs | Sizes, entries and leverage visible; wallet clutter |
+| Cost | A password to remember; three trusted keepers; larger open proofs | Sizes, entries and leverage visible; wallet clutter |
 
 We chose private positions (decided 2026-10-07). Private position data is the point of ZKPerp, and it matches the Aleo version. Public positions would be a different and weaker product. It also has a market risk: with every size, entry and leverage public, everyone can compute everyone's liquidation price, which invites traders to push the price toward those levels.
 
@@ -184,7 +184,7 @@ Losing the passkey or the browser storage loses nothing, because the password st
 - **`liquidatePosition(position, path, coin, pnl, closeFee, borrowFee, liquidationFee, closeTime, capacity)`** settles like a close, with three differences:
   - it takes no owner secret;
   - the position must be at a loss or flat, and its equity (collateral minus loss, closing fee and borrow fee) must be below `maintenanceBps` of size;
-  - it charges a liquidation fee of `liquidationFeeBps` of size, out of the remaining equity, paid to the treasury.
+  - it charges a liquidation fee of `liquidationFeeBps` of size, out of the remaining equity, paid to the treasury (since 2026-10-13: to the keeper that liquidates; see 4b).
 
   Whatever equity remains goes to `payTo`. Close and liquidation share one settlement routine.
 
@@ -203,11 +203,27 @@ The local stack uses 2.5% maintenance and a 0.5% fee. The keeper is `services/ke
 
 **Trust and limits:**
 
-- **The keeper sees everything except the owner secret.** That is every position's size, direction, entry, collateral and payout key, and it can tell when each closes, because it knows the salt. It cannot close a healthy position, nor take any payout. This is the same kind of trust as the treasury, which sees every fee.
+- **The keeper sees everything except the owner secret** (each of the three, since 4b). That is every position's size, direction, entry, collateral and payout key, and it can tell when each closes, because it knows the salt. It cannot close a healthy position, nor take any payout. This is the same kind of trust as the treasury, which sees every fee.
 - **A liquidation is public as such** (the circuit name), and the pool's change shows the loss, as for any close.
 - **Ephemeral scalars must be fresh.** Reusing one across two opens makes the difference between their plaintexts public.
 - **`transientHash` is not promised to stay the same across compiler versions,** so the keeper decrypts each note when it appears.
 - **Cost:** the `openPosition` proving key is 10.5 MB, against 9.5 MB without a liquidator note. Close and liquidation are about 37 MB. See "Proof size" below for how it got there.
+
+### 4b. Three independent keepers (built 2026-10-13, devnet)
+
+One keeper down meant no liquidations, and bad debt growing. Now three keepers, each run by its own party, each with its own key and wallet:
+
+- **Three keys in the contract:** `keepers: Vector<3, JubjubPoint>`, given at deploy (distinct, none the identity).
+- **One note, three copies.** The open circuit seals the note's plaintext to each of the three keys, under one ephemeral scalar: `fields[i] = plaintext + masks(transientHash(ephemeral · keepers[i]))`. The three shared secrets differ, so each copy's masks are its own. Keeper i decrypts only `fields[i]` (`openLiquidatorNote(note, i, secret)`). Trigger-order and limit-order notes, which the trader seals, use the same format; the trader finds their own order note again with any keeper key that is unchanged since.
+- **Any one keeper can liquidate alone,** execute an order or fill a limit order. They race; the nullifier lets only one action on a position land, and the others fail on chain and pay their DUST fee. The keepers stagger themselves: keeper n waits (n − 1) × 60 s once something is due, and longer while a lower keeper says it is busy; a lower keeper that is down is not waited for.
+- **The liquidation fee goes to the caller's own key** (`ownPublicKey()`), so whichever keeper liquidates is paid. A wipe-out leaves no equity, so no fee. The treasury still gets the opening, closing and borrow fees. Executing an order or filling a limit order still pays the keeper nothing.
+- **Rotation:** `rotateKeeper(slot, key, …)`, signed by two of the three oracle signers over the contract's address and a keeper epoch (its own domain, so a signer rotation's signatures do not rotate a keeper). The keepers cannot rotate one another.
+
+**Who sees what:** each keeper sees what the single keeper saw: every position and every order, never an owner secret. Three keepers means three parties with that view. **Rotation does not revoke:** a removed keeper keeps reading the positions opened while it was a keeper, and a new keeper cannot read those (the other two can).
+
+**Cost:** `openPosition` stays 11.0 MB, as does `executeLimitOrder` at 21.6 MB: proving keys grow in powers of two, and two more ECDHs fit. The fee to the keeper is one more output in `liquidatePosition`, which took its key from 38.7 to 76.7 MB (the keeper proves it, as `executeOrder` at 76.7 MB). The same send in the shared settlement also doubled the trader's `closePosition`, past what 1AM carries; so it sits in `liquidatePosition` only, and `closePosition` stays 38.8 MB. `rotateKeeper` is 1.4 MB.
+
+**Tested:** `test/zkperp.test.mjs` (each keeper opens its own copy and not another's; after a rotation the next open seals to the new key; the fee reaches whichever keeper liquidates; rotation's refusals), the `/check` fuzzer (rotations and liquidations through the proof server), and `npm run liquidation` on the devnet (keeper 3 liquidates alone and is paid; keeper 1 then is refused).
 
 ### 5. Stop loss and take profit (built 2026-10-08, devnet)
 
@@ -228,7 +244,7 @@ A trigger order closes a position once the mark price reaches a level: a long's 
 
 - It fills at the mark price, not the level. The oracle moves on a 0.5% move or the hourly heartbeat, so a stop can fill past its level.
 - A separate circuit tells the public that a close was an order's. Merging it into `closePosition` would hide that, at the cost of a larger close circuit.
-- No execution fee: the keeper is paid nothing for it yet (roadmap step 4).
+- No execution fee: the keeper is paid nothing for it (only liquidations pay the keeper, since 2026-10-13).
 - `executeOrder`'s proving key is 76.7 MB, proven by the keeper on its own server; the trader's circuits are small (`placeOrder` 10 MB, `cancelOrder` 5.2 MB).
 
 Tests: `test/zkperp.test.mjs` ("trigger orders"), and `npm run stoploss` on the devnet, with `--keeper` to have the keeper service execute.

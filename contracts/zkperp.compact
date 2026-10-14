@@ -125,19 +125,24 @@ import CompactStandardLibrary;
 // A position whose equity (collateral less loss, closing and borrow fees)
 // falls below `maintenanceBps` of its size can be closed without its owner
 // secret, by `liquidatePosition`. The rest of its equity, less a liquidation
-// fee, still goes to the trader's `payTo`; the fee goes to the treasury, which
-// runs the keeper.
+// fee, still goes to the trader's `payTo`; the fee goes to whoever liquidates
+// (the caller's own key), so an independent keeper is paid for its work.
 //
-// To liquidate, the keeper needs every field of the position except the owner
+// To liquidate, a keeper needs every field of the position except the owner
 // secret, and none of them is public. So every open writes a second note,
-// encrypted IN THE CIRCUIT to the `liquidator` key (see `sealLiquidatorNote`):
-// the trader cannot hand the keeper a false copy, because the circuit builds
-// the note from the very fields it commits to. The nullifier depends on the
-// salt only, so the keeper can retire the position without the owner secret.
+// encrypted IN THE CIRCUIT to each of the three `keepers` keys (see
+// `sealLiquidatorNote`): the trader cannot hand the keepers a false copy,
+// because the circuit builds the note from the very fields it commits to. Any
+// one keeper can liquidate alone, so one keeper down stops nothing. They race
+// for the fee; the nullifier lets only one liquidation of a position land.
+// The nullifier depends on the salt only, so a keeper can retire the position
+// without the owner secret.
 //
-// ⚠️ This trusts the liquidator key's holder, like the treasury: it sees every
-// position's size, direction, entry and collateral, and can tell when each one
-// closes. It cannot close a healthy position nor take any payout.
+// ⚠️ This trusts each keeper, like the treasury: each sees every position's
+// size, direction, entry and collateral, and can tell when each one closes.
+// None can close a healthy position nor take any payout. Two of the three
+// oracle signers can replace a keeper's key (`rotateKeeper`); a removed keeper
+// keeps its view of the positions opened while it was one.
 //
 // ── Trigger orders: stop loss and take profit ──────────────────────────────
 //
@@ -149,7 +154,7 @@ import CompactStandardLibrary;
 // `closePosition` does, at the mark price, paying the position's `payTo`.
 //
 // An order exists on chain only as a commitment in `orders`, with a note
-// encrypted to the liquidator key (written by the trader, not the circuit: a
+// encrypted to the keepers' keys (written by the trader, not the circuit: a
 // false note only stops the trader's own order from firing). Placing one needs
 // the owner secret, or the keeper, who knows every other field, could attach
 // an order at the current price and close any position. Cancelling publishes
@@ -232,8 +237,13 @@ export sealed ledger maxPriceAge: Uint<32>;
 export sealed ledger maintenanceBps: Uint<16>;
 export sealed ledger liquidationFeeBps: Uint<16>;
 
-// The keeper's public key. Every open encrypts its position to it.
-export sealed ledger liquidator: JubjubPoint;
+// The three keepers' public keys. Every open encrypts its position to each.
+// Two of the three oracle signers can replace one; see `rotateKeeper`.
+export ledger keepers: Vector<3, JubjubPoint>;
+
+// How many keeper rotations there have been; each rotation signs it, so none
+// replays.
+export ledger keeperEpoch: Uint<64>;
 
 // ── Oracle ─────────────────────────────────────────────────────────────────
 //
@@ -345,16 +355,16 @@ export ledger closedPositions: Counter;
 // of different values commute, so concurrent opens do not conflict.
 export ledger notes: Set<Bytes<128>>;
 
-// One note per position for the keeper: the position's fields, minus nothing
-// the keeper needs and plus nothing it must not have, encrypted to
-// `liquidator` by the open circuit itself. See `sealLiquidatorNote`.
+// One note per position for the keepers: the position's fields, minus nothing
+// a keeper needs and plus nothing it must not have, encrypted to each of the
+// `keepers` by the open circuit itself. See `sealLiquidatorNote`.
 export struct LiquidatorNote {
-  // e·G for the open's ephemeral scalar e. The keeper's shared secret is
+  // e·G for the open's ephemeral scalar e. Keeper i's shared secret is
   // e·L = l·(e·G), for its key L = l·G.
   ephemeral: JubjubPoint;
-  // `liquidatorPlaintext(...)`, each element plus a mask from the shared
-  // secret. Uniform field elements to anyone else.
-  fields: Vector<10, Field>;
+  // By keeper slot: `liquidatorPlaintext(...)`, each element plus a mask from
+  // that keeper's shared secret. Uniform field elements to anyone else.
+  fields: Vector<3, Vector<10, Field>>;
 }
 export ledger liquidatorNotes: Set<LiquidatorNote>;
 
@@ -444,11 +454,11 @@ constructor(
   priceAge: Uint<32>,
   maintenance: Uint<16>,
   liquidationFee: Uint<16>,
-  liquidatorKey: JubjubPoint
+  keeperKeys: Vector<3, JubjubPoint>
 ) {
   usdc = disclose(usdcToken);
   const keys = disclose(signerKeys);
-  assert(validSigner(keys[0]) && validSigner(keys[1]) && validSigner(keys[2]), "a signer key is the identity");
+  assert(validKey(keys[0]) && validKey(keys[1]) && validKey(keys[2]), "a signer key is the identity");
   assert(keys[0] != keys[1] && keys[0] != keys[2] && keys[1] != keys[2], "the signer keys must differ");
   signers = keys;
   assert(disclose(initialPrice) > 0, "price must be positive");
@@ -474,7 +484,10 @@ constructor(
   maintenanceBps = disclose(maintenance);
   assert(disclose(liquidationFee) <= 10000, "the liquidation fee is at most 10 000 bps");
   liquidationFeeBps = disclose(liquidationFee);
-  liquidator = disclose(liquidatorKey);
+  const kk = disclose(keeperKeys);
+  assert(validKey(kk[0]) && validKey(kk[1]) && validKey(kk[2]), "a keeper key is the identity");
+  assert(kk[0] != kk[1] && kk[0] != kk[2] && kk[1] != kk[2], "the keeper keys must differ");
+  keepers = kk;
   lpToken = default<Bytes<32>>;
 }
 
@@ -490,7 +503,7 @@ export pure circuit positionCommitment(p: Position): Bytes<32> {
 }
 
 // Published when a position closes, so it cannot close twice. Derived from the
-// salt, which only the trader and the liquidator know, so the public cannot
+// salt, which only the trader and the keepers know, so the public cannot
 // match it to the commitment it retires. That unlinkability is why a close
 // proves membership in `positions` instead of naming a leaf. Not from the
 // owner secret: a liquidation must be able to retire the position without it.
@@ -522,10 +535,11 @@ export pure circuit limitNullifier(salt: Bytes<32>): Bytes<32> {
 // ── The liquidator's note ──────────────────────────────────────────────────
 //
 // ECDH on Jubjub plus a Poseidon mask per field element: for the open's
-// ephemeral scalar e and the keeper's key L, the shared secret is
+// ephemeral scalar e and a keeper's key L, the shared secret is
 // k = transientHash(e·L), and element i is plaintext[i] + transientHash(k, i).
 // Each mask is uniform in the field, so a ciphertext element is uniform to
-// anyone without k, whatever field element it hides.
+// anyone without k, whatever field element it hides. One e serves all three
+// keepers: their shared secrets e·L differ, so each mask stays its own.
 //
 // transientHash is not promised to stay the same across compiler versions:
 // the keeper decrypts each note when it appears and keeps the plaintext.
@@ -578,23 +592,30 @@ export pure circuit liquidatorPlaintext(
   ];
 }
 
-export pure circuit sealLiquidatorNote(m: Vector<10, Field>, key: JubjubPoint, ephemeral: Field): LiquidatorNote {
+// `m` masked under the shared secret of `ephemeral` and `key`.
+pure circuit maskTo(m: Vector<10, Field>, key: JubjubPoint, ephemeral: Field): Vector<10, Field> {
   const k = liquidatorShared(key, ephemeral);
+  return [
+    m[0] + liquidatorMask(k, 0), m[1] + liquidatorMask(k, 1), m[2] + liquidatorMask(k, 2),
+    m[3] + liquidatorMask(k, 3), m[4] + liquidatorMask(k, 4), m[5] + liquidatorMask(k, 5),
+    m[6] + liquidatorMask(k, 6), m[7] + liquidatorMask(k, 7), m[8] + liquidatorMask(k, 8),
+    m[9] + liquidatorMask(k, 9)
+  ];
+}
+
+// `m` sealed to each of the three keeper keys, by slot.
+export pure circuit sealLiquidatorNote(m: Vector<10, Field>, keys: Vector<3, JubjubPoint>, ephemeral: Field): LiquidatorNote {
   return LiquidatorNote {
     ephemeral: ecMulGenerator(ephemeral),
-    fields: [
-      m[0] + liquidatorMask(k, 0), m[1] + liquidatorMask(k, 1), m[2] + liquidatorMask(k, 2),
-      m[3] + liquidatorMask(k, 3), m[4] + liquidatorMask(k, 4), m[5] + liquidatorMask(k, 5),
-      m[6] + liquidatorMask(k, 6), m[7] + liquidatorMask(k, 7), m[8] + liquidatorMask(k, 8),
-      m[9] + liquidatorMask(k, 9)
-    ]
+    fields: [maskTo(m, keys[0], ephemeral), maskTo(m, keys[1], ephemeral), maskTo(m, keys[2], ephemeral)]
   };
 }
 
-// The keeper's side: the plaintext elements of `note`, for its secret scalar.
-export pure circuit openLiquidatorNote(note: LiquidatorNote, secret: Field): Vector<10, Field> {
+// A keeper's side: the plaintext elements of `note` in its `slot`, for its
+// secret scalar.
+export pure circuit openLiquidatorNote(note: LiquidatorNote, slot: Uint<8>, secret: Field): Vector<10, Field> {
   const k = liquidatorShared(note.ephemeral, secret);
-  const c = note.fields;
+  const c = slot == 0 ? note.fields[0] : (slot == 1 ? note.fields[1] : note.fields[2]);
   return [
     c[0] - liquidatorMask(k, 0), c[1] - liquidatorMask(k, 1), c[2] - liquidatorMask(k, 2),
     c[3] - liquidatorMask(k, 3), c[4] - liquidatorMask(k, 4), c[5] - liquidatorMask(k, 5),
@@ -665,12 +686,21 @@ export pure circuit rotationMessage(market: Bytes<32>, epoch: Uint<64>, slot: Ui
   });
 }
 
+// What signers sign to put `key` in keeper slot `slot`, at keeper rotation
+// number `epoch`. Its own domain, so a signer rotation never passes as one.
+export pure circuit keeperRotationMessage(market: Bytes<32>, epoch: Uint<64>, slot: Uint<8>, key: JubjubPoint): Field {
+  return transientHash<Rotation>(Rotation {
+    domain: pad(32, "zkperp:keeper:rotate"), market: market, epoch: epoch, slot: slot, key: key
+  });
+}
+
 export pure circuit signatureChallenge(nonce: JubjubPoint, key: JubjubPoint, message: Field): Field {
   return transientHash<Challenge>(Challenge { nonce: nonce, key: key, message: message });
 }
 
-// The identity would accept any signature: s·G == R + c·O for R = s·G.
-pure circuit validSigner(key: JubjubPoint): Boolean {
+// The identity would accept any signature: s·G == R + c·O for R = s·G. As a
+// keeper key, it would make every shared secret public.
+pure circuit validKey(key: JubjubPoint): Boolean {
   return key != ecMulGenerator(0);
 }
 
@@ -741,12 +771,38 @@ export circuit rotateSigner(
   assert(n < 3, "no such signer slot");
   const epoch = signerEpoch;
   signedByTwo(rotationMessage(kernel.self().bytes, epoch, n, k), i, j, a, b);
-  assert(validSigner(k), "the new key is the identity");
+  assert(validKey(k), "the new key is the identity");
   const keys = signers;
   assert((n == 0 || keys[0] != k) && (n == 1 || keys[1] != k) && (n == 2 || keys[2] != k),
     "the new key is already a signer");
   signers = [n == 0 ? k : keys[0], n == 1 ? k : keys[1], n == 2 ? k : keys[2]];
   signerEpoch = (epoch + 1) as Uint<64>;
+}
+
+// Puts `key` in keeper slot `slot`, signed by two of the oracle signers: to
+// replace a keeper that left, or whose key leaked. Positions opened from now
+// on are sealed to the new key; the old one still reads those opened before.
+export circuit rotateKeeper(
+  slot: Uint<8>,
+  key: JubjubPoint,
+  first: Uint<8>,
+  second: Uint<8>,
+  a: Signature,
+  b: Signature
+): [] {
+  const n = disclose(slot);
+  const k = disclose(key);
+  const i = disclose(first);
+  const j = disclose(second);
+  assert(n < 3, "no such keeper slot");
+  const epoch = keeperEpoch;
+  signedByTwo(keeperRotationMessage(kernel.self().bytes, epoch, n, k), i, j, a, b);
+  assert(validKey(k), "the new key is the identity");
+  const keys = keepers;
+  assert((n == 0 || keys[0] != k) && (n == 1 || keys[1] != k) && (n == 2 || keys[2] != k),
+    "the new key is already a keeper");
+  keepers = [n == 0 ? k : keys[0], n == 1 ? k : keys[1], n == 2 ? k : keys[2]];
+  keeperEpoch = (epoch + 1) as Uint<64>;
 }
 
 // Every open and close prices against `markPrice` and calls this first. It
@@ -977,7 +1033,7 @@ export circuit openPosition(
   );
   liquidatorNotes.insert(disclose(sealLiquidatorNote(
     liquidatorPlaintext(position, payToLo, payToHi, encLo, encHi),
-    liquidator,
+    keepers,
     ephemeral
   )));
   openPositions.increment(1);
@@ -1053,14 +1109,16 @@ export circuit closePosition(
 ): [] {
   assert(position.owner == ownerKey(ownerSecret), "not the owner of this position");
   retire(position, path);
-  settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, capacity, false);
+  const s = settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, false);
+  payOut(s, s.rest, capacity);
 }
 
 // Closes a position whose equity is below maintenance margin, without its
 // owner secret: the keeper knows every other field from the position's
 // liquidator note. Settles as `closePosition` does, plus a liquidation fee of
 // ceil(size × liquidationFeeBps / 10 000) out of what equity is left, to the
-// treasury. Whatever equity remains after that still goes to `payTo`.
+// caller's own key: whichever keeper liquidates is paid. Whatever equity
+// remains after that still goes to `payTo`.
 //
 // Only a position at a loss, or flat, can be liquidated; one in profit is
 // above maintenance by construction of the leverage cap.
@@ -1076,7 +1134,19 @@ export circuit liquidatePosition(
   capacity: Uint<64>
 ): [] {
   retire(position, path);
-  settle(position, collateral, pnl, closeFee, borrowFee, liquidationFee, closeTime, capacity, true);
+  const s = settle(position, collateral, pnl, closeFee, borrowFee, liquidationFee, closeTime, true);
+  // The keeper's fee, to the caller's own key, when the equity left any. Here
+  // and not in `settle`, which closes share: one more send there doubled the
+  // trader's close proving key (38.8 → 76.7 MB, past what 1AM carries).
+  const paysKeeper = disclose(s.liqTaken > 0);
+  const rest = paysKeeper
+    ? sendImmediateShielded(
+        s.rest,
+        left<ZswapCoinPublicKey, ContractAddress>(disclose(ownPublicKey())),
+        s.liqTaken as Uint<128>
+      ).change.value
+    : s.rest;
+  payOut(s, rest, capacity);
 }
 
 // Attaches a trigger order to the caller's position; see "Trigger orders"
@@ -1125,7 +1195,8 @@ export circuit executeOrder(
   const mark = markPrice;
   assert(order.above ? mark >= order.price : mark <= order.price, "the order's price has not been reached");
   retire(position, path);
-  settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, capacity, false);
+  const s = settle(position, collateral, pnl, closeFee, borrowFee, 0, closeTime, false);
+  payOut(s, s.rest, capacity);
 }
 
 // Places a limit order; see "Limit orders" above. Takes the collateral coin
@@ -1133,7 +1204,7 @@ export circuit executeOrder(
 // fill only has to check the price and the pool's room.
 //
 // `note` is the order encrypted for the trader, like a position's note;
-// `keeperNote` the order sealed to the liquidator key by the trader (see
+// `keeperNote` the order sealed to the keepers' keys by the trader (see
 // core/limits.ts). Neither is checked: a false one only stops the trader's own
 // order from being found or filled, and the trader can still cancel it.
 //
@@ -1230,7 +1301,7 @@ export circuit executeLimitOrder(
   );
   liquidatorNotes.insert(disclose(sealLiquidatorNote(
     liquidatorPlaintext(position, payToLo, payToHi, encLo, encHi),
-    liquidator,
+    keepers,
     ephemeral
   )));
   openPositions.increment(1);
@@ -1286,8 +1357,24 @@ circuit retire(position: Position, path: MerkleTreePath<20, Bytes<32>>): [] {
   closed.insert(nullifier);
 }
 
+// What `settle` leaves for `payOut`: the collateral coin less what the
+// treasury got, and how to divide it.
+struct Settlement {
+  // The change of the treasury's send: the keeper's fee, the loss and the
+  // trader's share.
+  rest: ShieldedCoinInfo;
+  payTo: Either<ZswapCoinPublicKey, ContractAddress>;
+  // The liquidation fee taken, for the keeper; zero for a close.
+  liqTaken: Uint<64>;
+  lossAmt: Uint<64>;
+  back: Uint<64>;
+  profitAmt: Uint<64>;
+}
+
 // The settlement shared by a close and a liquidation; see `closePosition`. For
-// a close `liquidation` is false and `liquidationFee` zero.
+// a close `liquidation` is false and `liquidationFee` zero. Checks everything
+// and pays the treasury; the caller pays a liquidation's keeper out of `rest`,
+// then `payOut` the rest.
 circuit settle(
   position: Position,
   collateral: QualifiedShieldedCoinInfo,
@@ -1296,9 +1383,8 @@ circuit settle(
   borrowFee: Uint<64>,
   liquidationFee: Uint<64>,
   closeTime: Uint<64>,
-  capacity: Uint<64>,
   liquidation: Boolean
-): [] {
+): Settlement {
   // The coin must be the one this position committed to, or a trader could
   // close their position against someone else's collateral.
   assert(collateral.nonce == position.collateralNonce, "not this position's collateral coin");
@@ -1397,11 +1483,12 @@ circuit settle(
     !liquidation || equity * 10000 < position.size * maintenanceBps,
     "the position is above maintenance margin"
   );
-  // 2b. A liquidation's fee, out of the equity; zero for a close.
-  const liqTaken = (liquidationFee >= equity ? equity : liquidationFee) as Uint<64>;
+  // 2b. A liquidation's fee, out of the equity, to the caller; zero for a
+  //     close. Disclosed to build its output, like the treasury's below.
+  const liqTaken = disclose((liquidationFee >= equity ? equity : liquidationFee) as Uint<64>);
   // Disclosed to build the treasury's output; a shielded output's value is
   // inside its commitment, so this publishes nothing.
-  const toTreasury = disclose((position.openFee + feeTaken + liqTaken) as Uint<64>);
+  const toTreasury = disclose((position.openFee + feeTaken) as Uint<64>);
 
   // 3. The trader's share of the coin.
   const back = disclose((equity - liqTaken) as Uint<64>);
@@ -1410,21 +1497,36 @@ circuit settle(
   const profitRaw: Uint<64> = isProfit ? amount : 0;
   const profitAmt = disclose((profitRaw >= shortfall ? profitRaw - shortfall : 0) as Uint<64>);
 
-  // Whether the trader gets anything from the coin. Disclosed because it
-  // decides whether an output to them exists; it is false only when the loss
-  // and fees took the whole collateral.
-  const hasBack = disclose(back > 0);
-
   // The treasury first: the opening fee is at least 1, so this send is never
-  // of nothing. The change holds exactly lossAmt + back.
+  // of nothing. Its change holds exactly liqTaken + lossAmt + back.
   const fromCoin = sendShielded(
     coin,
     left<ZswapCoinPublicKey, ContractAddress>(treasury),
     toTreasury as Uint<128>
   );
-  const rest = fromCoin.change.value;
+  return Settlement {
+    rest: fromCoin.change.value,
+    payTo: payTo,
+    liqTaken: liqTaken,
+    lossAmt: lossAmt,
+    back: back,
+    profitAmt: profitAmt
+  };
+}
+
+// The rest of a settlement: `rest` (the treasury's change, less any keeper's
+// fee: exactly lossAmt + back) to the trader and the pool, and a profit out of
+// the pool. `capacity` as in `closePosition`.
+circuit payOut(s: Settlement, rest: ShieldedCoinInfo, capacity: Uint<64>): [] {
+  const lossAmt = s.lossAmt;
+  const profitAmt = s.profitAmt;
+  const back = s.back;
+  // Whether the trader gets anything from the coin. Disclosed because it
+  // decides whether an output to them exists; it is false only when the loss
+  // and fees took the whole collateral.
+  const hasBack = disclose(back > 0);
   if (hasBack) {
-    const paid = sendImmediateShielded(rest, payTo, back as Uint<128>);
+    const paid = sendImmediateShielded(rest, s.payTo, back as Uint<128>);
     if (lossAmt > 0) {
       pool.writeCoin(
         mergeCoinImmediate(pool, paid.change.value),
@@ -1442,7 +1544,7 @@ circuit settle(
     // backs this position's slot); checked anyway, since a send of the whole
     // pool would leave no coin to write back.
     assert(profitAmt < poolValue, "the pool cannot pay this profit");
-    const paid = sendShielded(pool, payTo, profitAmt as Uint<128>);
+    const paid = sendShielded(pool, s.payTo, profitAmt as Uint<128>);
     pool.writeCoin(paid.change.value, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
   }
   // This position's slot frees first: a profit can move the pool below a slot

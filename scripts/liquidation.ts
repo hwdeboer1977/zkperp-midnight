@@ -5,12 +5,14 @@
  *
  *   npm run setup:local && npm run liquidation
  *
- * The trader opens a 19x long; the admin drops the mock price 3.5%; the keeper
- * finds the position from its liquidator note — which it decrypts with the
- * liquidator secret, never seeing the owner secret — and liquidates it. Then:
+ * The trader opens a 19x long; each of the three keepers finds the position
+ * from its copy of the liquidator note — which it decrypts with its own
+ * secret, never seeing the owner secret. The admin drops the mock price 3.5%,
+ * and keeper 3 alone liquidates it, as if keepers 1 and 2 were down. Then:
  * the trader's wallet receives the equity left, which proves the output was
  * encrypted to the trader's key carried in the note; the treasury gets the
- * fees and the liquidation fee; the position can no longer be closed.
+ * trading fees; keeper 3's wallet the liquidation fee; keeper 1's late
+ * liquidation and the trader's close are refused.
  *
  * Stop the relayer first: it would put the Chainlink price back.
  */
@@ -23,7 +25,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
-import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { KEEPER_SLOTS, keeperSecrets, keeperWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   canLiquidate,
   closePosition,
@@ -64,7 +66,10 @@ async function main() {
 
   const devSeed = walletSeed();
   const oracle = oracleSecrets(devSeed);
-  const secret = liquidatorSecret(devSeed);
+  const secrets = keeperSecrets(devSeed);
+  // Keeper 3 liquidates; keeper 1 comes too late.
+  const LIQUIDATOR = 2;
+  const LATE = 0;
 
   step("Wallets");
   const wallets: BuiltWallet[] = [];
@@ -74,14 +79,18 @@ async function main() {
     await waitForSync(dev, () => {});
     const trader = await readyTrader(dev, traderSeed(devSeed), LOCAL, info);
     wallets.push(trader);
-    const keeper = await readyWallet(dev, keeperSeed(devSeed), LOCAL, info, "keeper");
-    wallets.push(keeper);
+    const keepers: BuiltWallet[] = [];
+    for (const slot of KEEPER_SLOTS) keepers.push(await readyWallet(dev, keeperWalletSeed(devSeed, slot), LOCAL, info, `keeper ${slot + 1}`));
+    wallets.push(...keepers);
     const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
     wallets.push(treasury);
 
     const devPerp = await handle(dev, devSeed, "zkperp", perpAddress);
     const traderPerp = await handle(trader, traderSeed(devSeed), "zkperp", perpAddress);
-    const keeperPerp = await handle(keeper, keeperSeed(devSeed), "zkperp", perpAddress);
+    // One at a time: concurrent opens of the same LevelDB fail.
+    const keeperPerps = [];
+    for (const slot of KEEPER_SLOTS) keeperPerps.push(await handle(keepers[slot]!, keeperWalletSeed(devSeed, slot), "zkperp", perpAddress));
+    const keeperPerp = keeperPerps[LIQUIDATOR]!;
     const l0 = await readLedger(devPerp);
     const usdc: Uint8Array = l0.usdc;
     const p0: bigint = l0.markPrice;
@@ -98,10 +107,17 @@ async function main() {
     const posted = await waitForBalance(trader, usdc, (b) => b < before);
     check("the trader posted the coin", before - posted === COIN, `${fmt(before)} → ${fmt(posted)}`);
 
-    step("The keeper reads it from its liquidator note");
+    step("Each keeper reads it from its copy of the liquidator note");
     let ledger = await readLedger(keeperPerp);
-    const watched = watchedPositions(keeperPerp, ledger, secret).find((w) => w.commitment === opened.record.commitment);
-    check("the keeper's secret opens the note into this position", watched !== undefined);
+    const seenBy = KEEPER_SLOTS.map((slot) =>
+      watchedPositions(keeperPerp, ledger, slot, secrets[slot]!).find((w) => w.commitment === opened.record.commitment)
+    );
+    check("each keeper's secret opens its copy into this position", seenBy.every((w) => w !== undefined));
+    check(
+      "a keeper's secret does not open another keeper's copy",
+      !watchedPositions(keeperPerp, ledger, 0, secrets[1]!).some((w) => w.commitment === opened.record.commitment)
+    );
+    const watched = seenBy[LIQUIDATOR];
     if (!watched) throw new Error("the keeper does not see the position");
     check(
       "the note carries the trader's real payout key",
@@ -117,15 +133,16 @@ async function main() {
     info(`price $${fmt(ledger.markPrice)}`);
     check("now it is below maintenance", canLiquidate(ledger, watched));
 
-    step("The keeper liquidates");
+    step(`Keeper ${LIQUIDATOR + 1} liquidates alone`);
     const traderBefore = await balance(trader, usdc);
     const treasuryBefore = await balance(treasury, usdc);
+    const keeperBefore = await balance(keepers[LIQUIDATOR]!, usdc);
     const poolBefore: bigint = ledger.poolValue;
     const liq = await liquidatePosition(keeperPerp, watched, usdc, treasuryEncKey);
     markClosed(opened.record.commitment, liq.txHash);
     info(
       `liquidated ${liq.txHash.slice(0, 16)}…: loss ${fmt(liq.settled.toPool)}, to treasury ${fmt(liq.settled.toTreasury)}, ` +
-        `to trader ${fmt(liq.settled.toTrader)}`
+        `to keeper ${fmt(liq.settled.toKeeper)}, to trader ${fmt(liq.settled.toTrader)}`
     );
     const after = await readLedger(devPerp);
     check("the pool gained the loss", after.poolValue === poolBefore + liq.settled.toPool, fmt((after.poolValue as bigint) - poolBefore));
@@ -141,10 +158,26 @@ async function main() {
     );
     const treasuryAfter = await waitForBalance(treasury, usdc, (b) => b >= treasuryBefore + liq.settled.toTreasury);
     check(
-      "the treasury received the fees and the liquidation fee",
+      "the treasury received the trading fees",
       treasuryAfter - treasuryBefore === liq.settled.toTreasury,
       `${fmt(treasuryAfter - treasuryBefore)} vs ${fmt(liq.settled.toTreasury)}`
     );
+    const keeperAfter = await waitForBalance(keepers[LIQUIDATOR]!, usdc, (b) => b >= keeperBefore + liq.settled.toKeeper);
+    check(
+      `keeper ${LIQUIDATOR + 1}'s wallet received the liquidation fee`,
+      liq.settled.toKeeper > 0n && keeperAfter - keeperBefore === liq.settled.toKeeper,
+      `${fmt(keeperAfter - keeperBefore)} vs ${fmt(liq.settled.toKeeper)}`
+    );
+
+    step(`Keeper ${LATE + 1} comes too late`);
+    let late = false;
+    try {
+      await liquidatePosition(keeperPerps[LATE]!, seenBy[LATE]!, usdc, treasuryEncKey);
+    } catch (error) {
+      late = /already closed/.test(String(error instanceof Error ? error.message : error));
+      if (!late) info(`refused with: ${String(error).slice(0, 200)}`);
+    }
+    check("a second liquidation of the position is refused", late);
 
     step("The trader can no longer close it");
     let refused = false;

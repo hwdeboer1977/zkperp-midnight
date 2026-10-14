@@ -33,7 +33,7 @@ import { decodeLimitPlaintext, filledPosition, limitExpired, limitReached, openL
 import { executeLimitCall, limitFillOf, limitFires, limitOf, watchedLimits } from "../dist/core/perp.js";
 import { orderPlaintext } from "../dist/core/orders.js";
 import * as m from "../dist/core/math.js";
-import { oracleSecrets, rotationMessage, sign, signedPriceArgs, signerKeys, signPrice } from "../dist/core/oracle.js";
+import { keeperRotationMessage, oracleSecrets, rotationMessage, sign, signedPriceArgs, signerKeys, signPrice } from "../dist/core/oracle.js";
 
 let failures = 0;
 const expect = (name, cond, detail = "") => {
@@ -82,7 +82,9 @@ const LIQUIDATOR_SECRET = JUBJUB_ORDER - 0x1234_5678_9abcn;
 const SIGNERS = oracleSecrets("ab".repeat(32));
 const SIGNER_KEYS = signerKeys(pureCircuits, SIGNERS);
 const ROUND0 = 110680464442257320000n;
-const LIQUIDATOR_KEY = pureCircuits.liquidatorPublicKey(LIQUIDATOR_SECRET);
+// The three keepers' secrets; keeper 1's is LIQUIDATOR_SECRET.
+const KEEPER_SECRETS = [LIQUIDATOR_SECRET, JUBJUB_ORDER - 0x2222_2222n, JUBJUB_ORDER - 0x3333_3333n];
+const KEEPER_KEYS = KEEPER_SECRETS.map((x) => pureCircuits.liquidatorPublicKey(x));
 const EPHEMERAL = JUBJUB_ORDER - 0xfeed_beefn;
 const TRADER_ENC = bytes32(0x3e);
 
@@ -103,7 +105,7 @@ const borrowFeeOf = (size, seconds) => ceilDiv(size * BORROW_RATE * seconds, 1_0
 const ADDRESS = sampleContractAddress();
 const contract = new Contract({});
 
-const deploy = () =>
+const deploy = (keeperKeys = KEEPER_KEYS) =>
   contract.initialState(
     createConstructorContext({}, hex(DEPLOYER.bytes)),
     USDC,
@@ -122,7 +124,7 @@ const deploy = () =>
     MAX_PRICE_AGE,
     MAINTENANCE_BPS,
     LIQUIDATION_FEE_BPS,
-    LIQUIDATOR_KEY
+    keeperKeys
   ).currentContractState;
 
 /** Slots of MAX_PAYOUT a pool of `value` backs, as the contract pins it. */
@@ -195,6 +197,17 @@ const genesis = deploy().data;
   expect("the mark price is the initial price", l.markPrice === PRICE);
   expect("the pool starts empty", l.poolValue === 0n && l.lpSupply === 0n);
   expect("the fees and treasury are as configured", l.openFeeBps === OPEN_FEE_BPS && l.borrowRate === BORROW_RATE && hex(l.treasury.bytes) === hex(TREASURY.bytes));
+  expect("the three keeper keys are stored", [...l.keepers].every((k, i) => k.x === KEEPER_KEYS[i].x && k.y === KEEPER_KEYS[i].y) && l.keeperEpoch === 0n);
+  const refused = (keys) => {
+    try {
+      deploy(keys);
+      return false;
+    } catch {
+      return true;
+    }
+  };
+  expect("a deploy with a keeper key twice is refused", refused([KEEPER_KEYS[0], KEEPER_KEYS[1], KEEPER_KEYS[0]]));
+  expect("a deploy with the identity as a keeper key is refused", refused([KEEPER_KEYS[0], KEEPER_KEYS[1], pureCircuits.liquidatorPublicKey(0n)]));
 }
 
 // ── Oracle ──────────────────────────────────────────────────────────────────
@@ -290,6 +303,46 @@ const genesis = deploy().data;
   expect("the new key signs prices", viaNew.ok && ledger(viaNew.state).markPrice === r.price, why(viaNew));
   const viaOld = call(TRADER, rotated.state, "setPrice", ...signedPriceArgs(pureCircuits, ADDRESS, r, new Map([[0, SIGNERS[0]], [2, SIGNERS[2]]])));
   expect("the replaced key no longer does", !viaOld.ok && /does not match/.test(viaOld.error), why(viaOld));
+}
+
+// ── Keeper rotation ─────────────────────────────────────────────────────────
+// Two of the oracle signers replace a keeper's key. Notes written after carry
+// the new key's copy; the notes written before stay readable to the old key.
+const rotateKeeper = (state, slot, key, i = 0, j = 1, epoch = ledger(state).keeperEpoch) => {
+  const msg = keeperRotationMessage(pureCircuits, ADDRESS, epoch, slot, key);
+  return call(TRADER, state, "rotateKeeper", BigInt(slot), key, BigInt(i), BigInt(j), sign(pureCircuits, SIGNERS[i], msg), sign(pureCircuits, SIGNERS[j], msg));
+};
+const NEW_KEEPER = JUBJUB_ORDER - 0x4444_4444n;
+const NEW_KEEPER_KEY = pureCircuits.liquidatorPublicKey(NEW_KEEPER);
+{
+  const rotated = rotateKeeper(genesis, 2, NEW_KEEPER_KEY);
+  const l = rotated.ok && ledger(rotated.state);
+  expect(
+    "two oracle signers replace keeper 3's key",
+    rotated.ok && l.keepers[2].x === NEW_KEEPER_KEY.x && l.keepers[0].x === KEEPER_KEYS[0].x && l.keeperEpoch === 1n && l.signerEpoch === 0n,
+    why(rotated)
+  );
+  const alone = rotateKeeper(genesis, 2, NEW_KEEPER_KEY, 1, 1);
+  expect("one signer cannot rotate a keeper alone", !alone.ok && /two different signer slots/.test(alone.error), why(alone));
+  const replay = rotateKeeper(rotated.state, 2, NEW_KEEPER_KEY, 0, 1, 0n);
+  expect("a keeper rotation cannot be replayed", !replay.ok && /does not match/.test(replay.error), why(replay));
+  const asSigner = (() => {
+    const msg = rotationMessage(pureCircuits, ADDRESS, 0n, 2, NEW_KEEPER_KEY);
+    return call(TRADER, genesis, "rotateKeeper", 2n, NEW_KEEPER_KEY, 0n, 1n, sign(pureCircuits, SIGNERS[0], msg), sign(pureCircuits, SIGNERS[1], msg));
+  })();
+  expect("signatures on a signer rotation do not rotate a keeper", !asSigner.ok && /does not match/.test(asSigner.error), why(asSigner));
+  const dup = rotateKeeper(genesis, 2, KEEPER_KEYS[0]);
+  expect("a key already keeping cannot take a second slot", !dup.ok && /already a keeper/.test(dup.error), why(dup));
+  const identity = rotateKeeper(genesis, 2, pureCircuits.liquidatorPublicKey(0n));
+  expect("the identity cannot be a keeper key", !identity.ok && /identity/.test(identity.error), why(identity));
+  const noSlot = rotateKeeper(genesis, 3, NEW_KEEPER_KEY);
+  expect("there is no fourth keeper slot", !noSlot.ok && /no such keeper slot/.test(noSlot.error), why(noSlot));
+  const byKeepers = (() => {
+    const msg = keeperRotationMessage(pureCircuits, ADDRESS, 0n, 2, NEW_KEEPER_KEY);
+    const ks = KEEPER_SECRETS;
+    return call(TRADER, genesis, "rotateKeeper", 2n, NEW_KEEPER_KEY, 0n, 1n, sign(pureCircuits, ks[0], msg), sign(pureCircuits, ks[1], msg));
+  })();
+  expect("the keepers themselves cannot rotate a keeper", !byKeepers.ok && /does not match/.test(byKeepers.error), why(byKeepers));
 }
 
 // ── Trading needs a pool ────────────────────────────────────────────────────
@@ -491,16 +544,51 @@ expect("control: the liquidator note is stored", after.liquidatorNotes.size() ==
 console.log("\n  the liquidator's note\n");
 {
   const [note] = [...after.liquidatorNotes];
-  const view = decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, LIQUIDATOR_SECRET));
+  const view = decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, 0n, LIQUIDATOR_SECRET));
   expect(
     "the keeper's key opens it into the position, owner secret excluded",
     hex(pureCircuits.positionCommitment(view.position)) === hex(commitment)
   );
   expect("it carries the trader's encryption key", hex(view.payToEnc) === hex(TRADER_ENC));
+  const copies = [0, 1, 2].map((slot) => decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, BigInt(slot), KEEPER_SECRETS[slot])));
+  expect(
+    "each of the three keepers opens its own copy into the position",
+    copies.every((v) => hex(pureCircuits.positionCommitment(v.position)) === hex(commitment))
+  );
+  let crossed;
+  try {
+    crossed = decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, 0n, KEEPER_SECRETS[1]));
+  } catch {
+    crossed = null;
+  }
+  expect(
+    "a keeper's secret does not open another keeper's copy",
+    crossed === null || hex(pureCircuits.positionCommitment(crossed.position)) !== hex(commitment)
+  );
+  expect("the three copies differ", new Set(note.fields.map((f) => render(f))).size === 3);
+
+  // After keeper 3's key is replaced, a new open seals its copy to the new key.
+  const rotatedPool = rotateKeeper(pooled, 2, NEW_KEEPER_KEY);
+  const later = rotatedPool.ok && openCall(TRADER, rotatedPool.state, coin(COLLATERAL), SIZE, true, OWNER_SECRET, bytes32(0x0d));
+  const laterNote = later?.ok && [...ledger(later.state).liquidatorNotes][0];
+  const opensAs = (n, slot, secret) => {
+    try {
+      decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(n, BigInt(slot), secret));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  expect(
+    "after a rotation, the new keeper key opens the next open's note and the old one does not",
+    laterNote && opensAs(laterNote, 2, NEW_KEEPER) && !opensAs(laterNote, 2, KEEPER_SECRETS[2]) && opensAs(laterNote, 0, KEEPER_SECRETS[0]),
+    rotatedPool.ok ? why(later) : why(rotatedPool)
+  );
+  expect("the old key still opens the notes written before", opensAs(note, 2, KEEPER_SECRETS[2]));
   expect("it does not carry the owner secret", !render(note).includes(hex(OWNER_SECRET)));
   let wrong;
   try {
-    wrong = decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, LIQUIDATOR_SECRET + 1n));
+    wrong = decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(note, 0n, LIQUIDATOR_SECRET + 1n));
   } catch {
     wrong = null;
   }
@@ -840,8 +928,15 @@ const lossAt = (price) => ceilDiv(SIZE * (PRICE - price), PRICE);
   if (liq.ok) {
     const l = ledger(liq.state);
     expect("the trader's payTo gets the equity less the liquidation fee", paidTo(liq, TRADER) === equity - LIQ_FEE, `${paidTo(liq, TRADER)} vs ${equity - LIQ_FEE}`);
-    expect("the treasury gets the three fees and the liquidation fee", paidTo(liq, TREASURY) === FEES + LIQ_FEE, `${paidTo(liq, TREASURY)} vs ${FEES + LIQ_FEE}`);
-    expect("the keeper is paid nothing directly", paidTo(liq, KEEPER) === 0n);
+    expect("the treasury gets the three fees", paidTo(liq, TREASURY) === FEES, `${paidTo(liq, TREASURY)} vs ${FEES}`);
+    expect("the keeper that liquidates gets the liquidation fee", paidTo(liq, KEEPER) === LIQ_FEE, `${paidTo(liq, KEEPER)} vs ${LIQ_FEE}`);
+    const OTHER_KEEPER = key(0x4c);
+    const byOther = liquidate(state, { pnl: loss, caller: OTHER_KEEPER });
+    expect(
+      "whichever keeper liquidates is paid, not a fixed one",
+      byOther.ok && paidTo(byOther, OTHER_KEEPER) === LIQ_FEE && paidTo(byOther, KEEPER) === 0n,
+      why(byOther)
+    );
     expect("the pool gains the loss", l.poolValue === ledger(state).poolValue + loss);
     expect("no slot stays reserved", reservedOf(l) === 0n, String(reservedOf(l)));
     expect("the position's nullifier is spent", l.closed.member(pureCircuits.positionNullifier(SALT)));
@@ -880,6 +975,7 @@ const lossAt = (price) => ceilDiv(SIZE * (PRICE - price), PRICE);
   if (wiped.ok) {
     expect("the trader gets nothing", paidTo(wiped, TRADER) === 0n);
     expect("the treasury gets only the opening fee", paidTo(wiped, TREASURY) === OPEN_FEE, `${paidTo(wiped, TREASURY)} vs ${OPEN_FEE}`);
+    expect("no equity, no liquidation fee: the keeper gets nothing", paidTo(wiped, KEEPER) === 0n);
     expect("the pool keeps the whole collateral", ledger(wiped.state).poolValue === ledger(at(crash)).poolValue + COLLATERAL);
   }
 }
@@ -892,7 +988,7 @@ console.log("\n  trigger orders\n");
   const STOP = 2_901_234_567n; // distinctive, to search the transcripts for
   const { salt: ORDER_SALT, ephemeral: ORDER_EPHEMERAL } = await deriveOrder(OWNER_SECRET, SALT, 0);
   const stopLoss = { position: commitment, price: STOP, above: firesAbove(true, "stopLoss"), salt: ORDER_SALT };
-  const stopNote = sealOrderNote(pureCircuits, LIQUIDATOR_KEY, SALT, stopLoss, ORDER_EPHEMERAL);
+  const stopNote = sealOrderNote(pureCircuits, KEEPER_KEYS, SALT, stopLoss, ORDER_EPHEMERAL);
   const place = (state, overrides = {}) => {
     const o = { position, secret: OWNER_SECRET, order: stopLoss, note: stopNote, caller: TRADER, time: T0, ...overrides };
     return callAt(o.time, o.caller, state, "placeOrder", o.position, o.secret, o.order, o.note);
@@ -941,25 +1037,25 @@ console.log("\n  trigger orders\n");
     expect("its note is stored", l.orderNotes.size() === 1n);
 
     const [note] = [...l.orderNotes];
-    const seen = openOrderNote(pureCircuits, note, LIQUIDATOR_SECRET);
+    const seen = openOrderNote(pureCircuits, note, 0, LIQUIDATOR_SECRET);
     expect(
       "the keeper's secret opens the note: position salt, level, direction, order salt",
       hex(seen.positionSalt) === hex(SALT) && seen.price === STOP && seen.above === false && hex(seen.salt) === hex(ORDER_SALT)
     );
     let otherKey = true;
     try {
-      openOrderNote(pureCircuits, note, LIQUIDATOR_SECRET - 1n);
+      openOrderNote(pureCircuits, note, 0, LIQUIDATOR_SECRET - 1n);
       otherKey = false;
     } catch {}
     expect("another key does not open it", otherKey);
-    const mine = findOwnOrderNote(pureCircuits, l.orderNotes, LIQUIDATOR_KEY, ORDER_EPHEMERAL);
+    const mine = findOwnOrderNote(pureCircuits, l.orderNotes, KEEPER_KEYS, ORDER_EPHEMERAL);
     expect("the trader finds and reads their own note again from the derived scalar", mine !== null && mine.price === STOP && hex(mine.salt) === hex(ORDER_SALT));
-    expect("a scalar for another index finds nothing", findOwnOrderNote(pureCircuits, l.orderNotes, LIQUIDATOR_KEY, (await deriveOrder(OWNER_SECRET, SALT, 1)).ephemeral) === null);
+    expect("a scalar for another index finds nothing", findOwnOrderNote(pureCircuits, l.orderNotes, KEEPER_KEYS, (await deriveOrder(OWNER_SECRET, SALT, 1)).ephemeral) === null);
 
     const placeHaystack = [placed.state.toString(), render(placed.transcript)].join("\n").toLowerCase();
     const inPlace = (needles) => needles.some((x) => placeHaystack.includes(x.toLowerCase()));
     // (Not the commitment: the tree stores a hash of each leaf.)
-    expect("control: the order's note is visible", inPlace(encodings(stopNote.fields[0])));
+    expect("control: the order's note is visible", inPlace(encodings(stopNote.fields[0][0])));
     expect("placing: the level is not published", !inPlace(encodings(STOP)));
     expect("placing: the position's commitment is not published", !inPlace([hex(commitment)]));
     expect("placing: the order salt is not published", !inPlace([hex(ORDER_SALT)]));
@@ -1019,7 +1115,7 @@ console.log("\n  trigger orders\n");
   const { salt: TP_SALT, ephemeral: TP_EPHEMERAL } = await deriveOrder(OWNER_SECRET, SALT, 1);
   const TP = 3_120_000_000n;
   const takeProfit = { position: commitment, price: TP, above: firesAbove(true, "takeProfit"), salt: TP_SALT };
-  const tpPlaced = place(opened.state, { order: takeProfit, note: sealOrderNote(pureCircuits, LIQUIDATOR_KEY, SALT, takeProfit, TP_EPHEMERAL) });
+  const tpPlaced = place(opened.state, { order: takeProfit, note: sealOrderNote(pureCircuits, KEEPER_KEYS, SALT, takeProfit, TP_EPHEMERAL) });
   expect("the owner places a take profit", tpPlaced.ok, why(tpPlaced));
   if (tpPlaced.ok) {
     const below = execute(priced(tpPlaced.state, TP - 1n), takeProfit, { pnl: floorDiv(SIZE * (TP - 1n - PRICE), PRICE) });
@@ -1045,7 +1141,7 @@ console.log("\n  trigger orders\n");
     const keeperView = { module: { pureCircuits } };
     const watching = (state) => {
       const l = ledger(state);
-      return watchedOrders(keeperView, l, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, LIQUIDATOR_SECRET));
+      return watchedOrders(keeperView, l, 0, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, 0, LIQUIDATOR_SECRET));
     };
     expect("with no order placed the keeper watches none", watching(opened.state).length === 0);
     if (placed.ok && tpPlaced.ok) {
@@ -1054,7 +1150,7 @@ console.log("\n  trigger orders\n");
         "the keeper rebuilds the placed order exactly from its note",
         w !== undefined && hex(pureCircuits.orderCommitment(w.order)) === hex(pureCircuits.orderCommitment(stopLoss)) && w.position.commitment === hex(commitment)
       );
-      expect("another key watches nothing", watchedOrders(keeperView, ledger(placed.state), LIQUIDATOR_SECRET - 1n, watchedPositions(keeperView, ledger(placed.state), LIQUIDATOR_SECRET)).length === 0);
+      expect("another key watches nothing", watchedOrders(keeperView, ledger(placed.state), 0, LIQUIDATOR_SECRET - 1n, watchedPositions(keeperView, ledger(placed.state), 0, LIQUIDATOR_SECRET)).length === 0);
       expect("orderFires: not above the stop", w !== undefined && !orderFires(ledger(priced(placed.state, STOP + 1n)), w));
       expect("orderFires: at the stop", w !== undefined && orderFires(ledger(priced(placed.state, STOP)), w));
       const cancelled = callAt(T0, TRADER, placed.state, "cancelOrder", position, OWNER_SECRET, stopLoss);
@@ -1086,7 +1182,7 @@ console.log("\n  trigger orders\n");
     const { salt, ephemeral } = await deriveOrder(OWNER_SECRET, big.salt, 0);
     const bigTp = { position: bigCommitment, price: 4_500_000_000n, above: firesAbove(true, "takeProfit"), salt };
     const bigPlaced = openedBig.ok
-      ? place(openedBig.state, { position: big, order: bigTp, note: sealOrderNote(pureCircuits, LIQUIDATOR_KEY, big.salt, bigTp, ephemeral) })
+      ? place(openedBig.state, { position: big, order: bigTp, note: sealOrderNote(pureCircuits, KEEPER_KEYS, big.salt, bigTp, ephemeral) })
       : openedBig;
     expect("a take profit is placed on a 20x long", bigPlaced.ok, why(bigPlaced));
     if (bigPlaced.ok) {
@@ -1141,12 +1237,13 @@ expect("a 10x short opens", shortOpened.ok, why(shortOpened));
   const differing = ta.flatMap((op, i) => (op === tb[i] ? [] : [op]));
   expect("long and short opens publish the same number of operations", ta.length === tb.length, `${ta.length} vs ${tb.length}`);
   // The values that may differ: the new leaf, 32 bytes derived from the
-  // commitment, and the liquidator note, twelve field elements of ciphertext
+  // commitment, and the liquidator note, 32 field elements of ciphertext
   // under a fresh ephemeral key. A third differing operation would tell the
   // directions apart.
   const isLeaf = (op) => /bytes,length:32/.test(op);
   // Field elements render without leading zeros, so count the array's items.
-  const isLiquidatorNote = (op) => (op.match(/value:\[([^\]]*)\]/)?.[1].split(",").length ?? 0) === 12;
+  // The ephemeral point's two coordinates and three copies of ten elements.
+  const isLiquidatorNote = (op) => (op.match(/value:\[([^\]]*)\]/)?.[1].split(",").length ?? 0) === 32;
   expect(
     "they differ in two operations only: the 32-byte leaf and the liquidator note",
     differing.length === 2 && differing.some(isLeaf) && differing.some(isLiquidatorNote),
@@ -1282,7 +1379,7 @@ const shortPool = ledger(shortOpened.state).poolValue;
   const order = async (kind, price, index) => {
     const { salt, ephemeral } = await deriveOrder(OWNER_SECRET, SHORT_SALT, index);
     const o = { position: shortCommitment, price, above: firesAbove(false, kind), salt };
-    return { order: o, note: sealOrderNote(pureCircuits, LIQUIDATOR_KEY, SHORT_SALT, o, ephemeral) };
+    return { order: o, note: sealOrderNote(pureCircuits, KEEPER_KEYS, SHORT_SALT, o, ephemeral) };
   };
   const placeShort = (state, { order: o, note }) =>
     callAt(T0, TRADER, state, "placeOrder", shortPosition, OWNER_SECRET, o, note);
@@ -1420,6 +1517,7 @@ console.log("\n  core/math.ts against the circuit\n");
       r.ok &&
       paidTo(r, TRADER) === s.toTrader &&
       paidTo(r, TREASURY) === s.toTreasury &&
+      paidTo(r, KEEPER) === s.toKeeper &&
       ledger(r.state).poolValue === l.poolValue + s.toPool - s.fromPool;
 
     const s = m.settlement(p, pnl, closeFee, borrowFee);
@@ -1524,7 +1622,7 @@ console.log("\n  core/perp.ts order functions against the circuit\n");
   const keeperView = { module: { pureCircuits } };
   const watching = (state) => {
     const l = ledger(state);
-    return watchedOrders(keeperView, l, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, LIQUIDATOR_SECRET));
+    return watchedOrders(keeperView, l, 0, LIQUIDATOR_SECRET, watchedPositions(keeperView, l, 0, LIQUIDATOR_SECRET));
   };
 
   const longRecord = recordOf(position);
@@ -1532,7 +1630,7 @@ console.log("\n  core/perp.ts order functions against the circuit\n");
   const sim = simulated(opened.state);
   expect("positionOf rebuilds the long from its record, commitment and all", hex(pureCircuits.positionCommitment(positionOf(sim.handle, longRecord))) === hex(commitment));
   expect("and the short", hex(pureCircuits.positionCommitment(positionOf(sim.handle, shortRecord))) === hex(shortCommitment));
-  expect("(the ledger's liquidator key is the keeper's)", hex(ledger(opened.state).liquidator.x.toString(16)) === hex(LIQUIDATOR_KEY.x.toString(16)));
+  expect("(the ledger's keeper keys are the keepers')", [...ledger(opened.state).keepers].every((k, i) => k.x === KEEPER_KEYS[i].x));
 
   const STOP = 2_910_000_000n;
   const TAKE = 3_150_000_000n;
@@ -1547,7 +1645,7 @@ console.log("\n  core/perp.ts order functions against the circuit\n");
   const take = await placeOrder(sim.handle, longRecord, "takeProfit", TAKE, 1);
   expect("a second order takes index 1: a long's take profit fires from below", take.order.above === true && take.index === 1);
   expect("the keeper watches both", watching(sim.state).length === 2);
-  const recovered = findOwnOrderNote(pureCircuits, ledger(sim.state).orderNotes, LIQUIDATOR_KEY, (await deriveOrder(OWNER_SECRET, SALT, 1)).ephemeral);
+  const recovered = findOwnOrderNote(pureCircuits, ledger(sim.state).orderNotes, KEEPER_KEYS, (await deriveOrder(OWNER_SECRET, SALT, 1)).ephemeral);
   expect("the trader recovers the take profit from the record alone", recovered !== null && recovered.price === TAKE && hex(recovered.salt) === hex(take.order.salt));
 
   expect(
@@ -1640,7 +1738,7 @@ console.log("\n  limit orders\n");
     payToEnc: TRADER_ENC,
   };
   const limitHash = pureCircuits.limitCommitment(longLimit);
-  const keeperNote = sealLimitNote(pureCircuits, LIQUIDATOR_KEY, longLimit, EPHEMERAL);
+  const keeperNote = sealLimitNote(pureCircuits, KEEPER_KEYS, longLimit, EPHEMERAL);
   const place = (state, overrides = {}) => {
     const o = { coin: limitCoin, order: longLimit, secret: LIMIT_SECRET, note: keeperNote, caller: TRADER, time: T0, ...overrides };
     const x = o.order;
@@ -1689,11 +1787,11 @@ console.log("\n  limit orders\n");
   expect("nor its owner secret, salt or coin nonce", !visible([hex(LIMIT_SECRET), hex(LIMIT_SALT), hex(limitCoin.nonce)]));
 
   const [note] = [...l0.limitNotes];
-  const seen = openLimitNote(pureCircuits, note, LIQUIDATOR_SECRET);
+  const seen = openLimitNote(pureCircuits, note, 0, LIQUIDATOR_SECRET);
   expect("the keeper's secret opens its note to the whole order", hex(pureCircuits.limitCommitment(seen)) === hex(limitHash));
   let otherKey = true;
   try {
-    openLimitNote(pureCircuits, note, LIQUIDATOR_SECRET - 1n);
+    openLimitNote(pureCircuits, note, 0, LIQUIDATOR_SECRET - 1n);
     otherKey = false;
   } catch {}
   expect("another secret does not", otherKey);
@@ -1734,12 +1832,12 @@ console.log("\n  limit orders\n");
   const f = l1.limitFills.lookup(nullifier);
   expect("the fill's entry and time are published under its nullifier", f.entryPrice === entry && f.openTime === T1);
   const liqNotes = [...l1.liquidatorNotes].filter((n) => !ledger(reached).liquidatorNotes.member(n));
-  const asSeen = liqNotes.length === 1 && decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(liqNotes[0], LIQUIDATOR_SECRET));
+  const asSeen = liqNotes.length === 1 && decodeLiquidatorPlaintext(pureCircuits.openLiquidatorNote(liqNotes[0], 0n, LIQUIDATOR_SECRET));
   expect(
     "and writes the position's liquidator note, so it can be liquidated",
     asSeen && hex(pureCircuits.positionCommitment(asSeen.position)) === hex(filledHash) && hex(asSeen.payToEnc) === hex(TRADER_ENC)
   );
-  expect("the keeper now watches the position", watchedPositions({ module: { pureCircuits } }, l1, LIQUIDATOR_SECRET).some((w) => w.commitment === hex(filledHash)));
+  expect("the keeper now watches the position", watchedPositions({ module: { pureCircuits } }, l1, 0, LIQUIDATOR_SECRET).some((w) => w.commitment === hex(filledHash)));
   const twice = fill(filled.state);
   expect("it fills once", !twice.ok && /already filled/.test(twice.error), why(twice));
   const late = cancel(filled.state);
@@ -1775,7 +1873,7 @@ console.log("\n  limit orders\n");
     expect("nothing to the treasury", paidTo(cancelled, TREASURY) === 0n);
     const gone = fill(priced(cancelled.state, BUY_AT, T1));
     expect("a cancelled order cannot fill", !gone.ok && /already filled or was cancelled/.test(gone.error), why(gone));
-    expect("and is not watched", watchedLimits({ module: { pureCircuits } }, ledger(cancelled.state), LIQUIDATOR_SECRET).length === 0);
+    expect("and is not watched", watchedLimits({ module: { pureCircuits } }, ledger(cancelled.state), 0, LIQUIDATOR_SECRET).length === 0);
     expect("no fill is published for it", !ledger(cancelled.state).limitFills.member(nullifier));
   }
 
@@ -1784,7 +1882,7 @@ console.log("\n  limit orders\n");
   const shortCoin2 = coin(LIMIT_COLLATERAL + LIMIT_FEE);
   shortCoin2.nonce = belowField(shortCoin2.nonce);
   const shortLimit = { ...longLimit, isLong: false, price: SELL_AT, collateralNonce: shortCoin2.nonce, salt: belowField(bytes32(0x5b)) };
-  const shortPlaced = place(pooled, { coin: shortCoin2, order: shortLimit, note: sealLimitNote(pureCircuits, LIQUIDATOR_KEY, shortLimit, EPHEMERAL) });
+  const shortPlaced = place(pooled, { coin: shortCoin2, order: shortLimit, note: sealLimitNote(pureCircuits, KEEPER_KEYS, shortLimit, EPHEMERAL) });
   expect("the trader places a short limit order", shortPlaced.ok, why(shortPlaced));
   if (shortPlaced.ok) {
     const below = fill(priced(shortPlaced.state, SELL_AT - 1n, T1), { order: shortLimit });
@@ -1812,7 +1910,7 @@ console.log("\n  limit orders\n");
 
   // core/perp.ts: the keeper's view and the call it submits.
   const keeperView = { module: { pureCircuits } };
-  const [w] = watchedLimits(keeperView, ledger(reached), LIQUIDATOR_SECRET);
+  const [w] = watchedLimits(keeperView, ledger(reached), 0, LIQUIDATOR_SECRET);
   expect("watchedLimits finds the waiting order", w !== undefined && w.commitment === hex(limitHash));
   expect("limitFires: at the reached price, not at the old one", limitFires(ledger(reached), w) && !limitFires(ledger(placed.state), w));
   const c = executeLimitCall(pureCircuits, ledger(reached), w, T1, EPHEMERAL);
@@ -1842,13 +1940,13 @@ console.log("\n  limit orders\n");
   const expCoin = coin(LIMIT_COLLATERAL + LIMIT_FEE);
   expCoin.nonce = belowField(expCoin.nonce);
   const expiring = { ...longLimit, expiry: EXPIRY, collateralNonce: expCoin.nonce, salt: belowField(bytes32(0x5c)) };
-  const expPlaced = place(pooled, { coin: expCoin, order: expiring, note: sealLimitNote(pureCircuits, LIQUIDATOR_KEY, expiring, EPHEMERAL) });
+  const expPlaced = place(pooled, { coin: expCoin, order: expiring, note: sealLimitNote(pureCircuits, KEEPER_KEYS, expiring, EPHEMERAL) });
   expect("the trader places a limit order with an expiry", expPlaced.ok, why(expPlaced));
   if (expPlaced.ok) {
     const expHaystack = [expPlaced.state.toString(), render(expPlaced.transcript)].join("\n").toLowerCase();
     expect("its expiry is not on chain", !encodings(EXPIRY).some((e) => expHaystack.includes(e.toLowerCase())));
     const [expNote] = [...ledger(expPlaced.state).limitNotes];
-    expect("the keeper's note carries the expiry", openLimitNote(pureCircuits, expNote, LIQUIDATOR_SECRET).expiry === EXPIRY);
+    expect("the keeper's note carries the expiry", openLimitNote(pureCircuits, expNote, 0, LIQUIDATOR_SECRET).expiry === EXPIRY);
     const atLimit = priced(expPlaced.state, BUY_AT, T1);
     const inTime = fill(atLimit, { order: expiring, time: EXPIRY - 1n, openTime: EXPIRY - 1n });
     expect("it fills before its expiry", inTime.ok, why(inTime));
@@ -1860,7 +1958,7 @@ console.log("\n  limit orders\n");
     }
     const expCancel = cancel(atLimit, { order: expiring, coin: { ...expCoin, mt_index: 0n }, time: EXPIRY + 1000n });
     expect("an expired order is cancelled, its whole coin back", expCancel.ok && paidTo(expCancel, TRADER) === LIMIT_COLLATERAL + LIMIT_FEE, why(expCancel));
-    const [we] = watchedLimits(keeperView, ledger(atLimit), LIQUIDATOR_SECRET);
+    const [we] = watchedLimits(keeperView, ledger(atLimit), 0, LIQUIDATOR_SECRET);
     expect("limitFires: reached before the expiry, not after", limitFires(ledger(atLimit), we, EXPIRY - 1n) && !limitFires(ledger(atLimit), we, EXPIRY));
     expect("(limitExpired agrees; 0 never expires)", limitExpired(expiring, EXPIRY) && !limitExpired(expiring, EXPIRY - 1n) && !limitExpired(longLimit, 1n << 62n));
   }

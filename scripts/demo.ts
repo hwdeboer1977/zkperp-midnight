@@ -44,7 +44,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { oracleSecrets, signerKeys } from "../core/oracle.js";
 import { LOCAL, requireLocal, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
-import { liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { keeperSecrets, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   borrowFeeOf,
   circuitNow,
@@ -176,7 +176,7 @@ async function main() {
       MAX_PRICE_AGE,
       MAINTENANCE_BPS,
       LIQUIDATION_FEE_BPS,
-      module.pureCircuits.liquidatorPublicKey(liquidatorSecret(devSeed)),
+      keeperSecrets(devSeed).map((x) => module.pureCircuits.liquidatorPublicKey(x)),
     ], ownTreasury);
     const devPerp = await handle(devWallet, devSeed, "zkperp", perpAddress);
     info(`zkperp ${perpAddress}`);

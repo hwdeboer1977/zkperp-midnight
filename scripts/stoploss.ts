@@ -18,7 +18,7 @@
  * pays the profit, the trader gets the collateral plus the profit less fees.
  *
  * Stop the relayer first: it would put the Chainlink price back. With the
- * keeper service running (`npm run keeper`), pass `--keeper`: the script then
+ * keeper services running (`npm run keeper -- --keeper 1`, …), pass `--keeper`: the script then
  * waits for the service to execute the order instead of executing it itself.
  */
 
@@ -29,7 +29,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
-import { keeperSeed, liquidatorSecret, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
+import { keeperSecret, keeperWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   cancelOrder,
   canLiquidate,
@@ -83,7 +83,8 @@ async function main() {
 
   const devSeed = walletSeed();
   const oracle = oracleSecrets(devSeed);
-  const secret = liquidatorSecret(devSeed);
+  // Keeper 1 does it here; any of the three could (see npm run liquidation).
+  const secret = keeperSecret(devSeed, 0);
 
   step("Wallets");
   const wallets: BuiltWallet[] = [];
@@ -93,14 +94,14 @@ async function main() {
     await waitForSync(dev, () => {});
     const trader = await readyTrader(dev, traderSeed(devSeed), LOCAL, info);
     wallets.push(trader);
-    const keeper = await readyWallet(dev, keeperSeed(devSeed), LOCAL, info, "keeper");
+    const keeper = await readyWallet(dev, keeperWalletSeed(devSeed, 0), LOCAL, info, "keeper 1");
     wallets.push(keeper);
     const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
     wallets.push(treasury);
 
     const devPerp = await handle(dev, devSeed, "zkperp", perpAddress);
     const traderPerp = await handle(trader, traderSeed(devSeed), "zkperp", perpAddress);
-    const keeperPerp = await handle(keeper, keeperSeed(devSeed), "zkperp", perpAddress);
+    const keeperPerp = await handle(keeper, keeperWalletSeed(devSeed, 0), "zkperp", perpAddress);
     const l0 = await readLedger(devPerp);
     if (l0.orderNotes === undefined) throw new Error("this deployment predates trigger orders: run npm run setup:local again");
     const usdc: Uint8Array = l0.usdc;
@@ -136,7 +137,7 @@ async function main() {
     step("The keeper reads the orders from their notes");
     const ordersNow = async () => {
       const ledger = await readLedger(keeperPerp);
-      const orders = watchedOrders(keeperPerp, ledger, secret, watchedPositions(keeperPerp, ledger, secret));
+      const orders = watchedOrders(keeperPerp, ledger, 0, secret, watchedPositions(keeperPerp, ledger, 0, secret));
       const of = (r: { commitment: string }) => orders.find((o) => o.position.commitment === r.commitment);
       return { ledger, orders, of };
     };
@@ -228,7 +229,7 @@ async function main() {
     await settle(firing, first.record, "stop loss");
 
     step("The second position, whose stop was cancelled, is still open");
-    const stillOpen = watchedPositions(keeperPerp, await readLedger(keeperPerp), secret).some(
+    const stillOpen = watchedPositions(keeperPerp, await readLedger(keeperPerp), 0, secret).some(
       (w) => w.commitment === second.record.commitment
     );
     check("it was not closed", stillOpen);
