@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Live ETH-USD market data for the trading chart, from Coinbase Exchange's
+ * Live market data for the trading chart (ETH-USD, BTC-USD…), from Coinbase Exchange's
  * public API: candles over REST, the last trade over its websocket.
  *
  * This is a REFERENCE only. Every open and close executes at the contract's
  * mark price, set by the oracle relayer from Chainlink. The chart shows where
  * the market is; the gap between the two is what the deviation check warns
- * about. Reading it tells Coinbase this browser's IP watches ETH-USD, nothing
+ * about. Reading it tells Coinbase this browser's IP watches the market, nothing
  * about any position.
  */
 
 import { useEffect, useState } from "react";
 
-const REST = "https://api.exchange.coinbase.com/products/ETH-USD/candles";
+const REST = "https://api.exchange.coinbase.com/products";
 const WS = "wss://ws-feed.exchange.coinbase.com";
 
 export interface Candle {
@@ -33,25 +33,27 @@ export const INTERVALS = [
   { label: "1D", seconds: 86400 },
 ] as const;
 
-/** Up to 300 candles of `seconds` each, oldest first. */
-export async function fetchCandles(seconds: number): Promise<Candle[]> {
-  const res = await fetch(`${REST}?granularity=${seconds}`);
+/** Up to 300 candles of `seconds` each for Coinbase's `product`, oldest first. */
+export async function fetchCandles(product: string, seconds: number): Promise<Candle[]> {
+  const res = await fetch(`${REST}/${product}/candles?granularity=${seconds}`);
   if (!res.ok) throw new Error(`market data: HTTP ${res.status}`);
   // [time, low, high, open, close, volume], newest first.
   const rows = (await res.json()) as number[][];
   return rows.map(([time, low, high, open, close]) => ({ time, open, high, low, close })).reverse();
 }
 
-/** The last ETH-USD trade price, streamed; null until the first tick or while disconnected. */
-export function useLivePrice(): number | null {
+/** The last trade price of `product`, streamed; null until the first tick or while disconnected. */
+export function useLivePrice(product: string | undefined): number | null {
   const [price, setPrice] = useState<number | null>(null);
   useEffect(() => {
+    setPrice(null);
+    if (!product) return;
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let closed = false;
     const connect = () => {
       ws = new WebSocket(WS);
-      ws.onopen = () => ws?.send(JSON.stringify({ type: "subscribe", product_ids: ["ETH-USD"], channels: ["ticker"] }));
+      ws.onopen = () => ws?.send(JSON.stringify({ type: "subscribe", product_ids: [product], channels: ["ticker"] }));
       ws.onmessage = (e) => {
         const m = JSON.parse(String(e.data));
         if (m.type === "ticker" && m.price) setPrice(Number(m.price));
@@ -67,19 +69,20 @@ export function useLivePrice(): number | null {
       clearTimeout(retry);
       ws?.close();
     };
-  }, []);
+  }, [product]);
   return price;
 }
 
-/** Candles for `seconds`, refreshed each minute, with the live price folded into the last one. */
-export function useCandles(seconds: number, live: number | null) {
+/** Candles of `product` for `seconds`, refreshed each minute, with the live price folded into the last one. */
+export function useCandles(product: string | undefined, seconds: number, live: number | null) {
   const [candles, setCandles] = useState<Candle[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
     setCandles(null);
+    if (!product) return;
     const load = () =>
-      fetchCandles(seconds).then(
+      fetchCandles(product, seconds).then(
         (c) => alive && (setCandles(c), setError(null)),
         (e) => alive && setError(String(e?.message ?? e))
       );
@@ -89,7 +92,7 @@ export function useCandles(seconds: number, live: number | null) {
       alive = false;
       clearInterval(timer);
     };
-  }, [seconds]);
+  }, [product, seconds]);
 
   useEffect(() => {
     if (live === null) return;

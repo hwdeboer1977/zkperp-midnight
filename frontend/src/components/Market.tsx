@@ -1,8 +1,81 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Action, PricePoint } from "../lib/activity";
 import { fmt6 } from "../lib/bytes";
+import { selectMarket } from "../lib/config";
+import { useConfig } from "../lib/hooks";
+
+const GLYPHS: Record<string, string> = { ETH: "Ξ", BTC: "₿" };
+
+/** The base asset's sign, for a market symbol such as "BTC-USD". */
+export function coinGlyph(market: string | undefined): string {
+  const base = market?.split("-")[0] ?? "";
+  return GLYPHS[base] ?? base.slice(0, 1);
+}
+
+/** How a market reads in the app: "BTC-USD" settles in pUSDC, so "BTC/USDC". */
+export function pairLabel(market: string | undefined): string {
+  return market ? `${market.split("-")[0]}/USDC` : "…";
+}
+
+/** The base asset's coin badge, coloured per asset. */
+export function CoinBadge({ market }: { market: string | undefined }) {
+  return <span className={`coin ${market?.split("-")[0]?.toLowerCase() ?? ""}`}>{coinGlyph(market)}</span>;
+}
+
+/**
+ * Picks the market the app shows: a dropdown of the pairs. Each is its own
+ * contract, pool and price; the pages remount on a change. Hidden while there
+ * is only one.
+ */
+export function MarketPicker() {
+  const config = useConfig();
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => root.current && !root.current.contains(e.target as Node) && setOpen(false);
+    const escape = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", away);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", away);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+  if (!config || config.markets.length < 2) return null;
+  return (
+    <div className="market-picker" ref={root}>
+      <button className="market-picker-button" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        <CoinBadge market={config.market} />
+        <span>{pairLabel(config.market)}</span>
+        <span className="caret" aria-hidden="true">▾</span>
+      </button>
+      {open && (
+        <ul className="market-menu" role="listbox" aria-label="Market">
+          {config.markets.map((m) => (
+            <li key={m.symbol}>
+              <button
+                role="option"
+                aria-selected={m.symbol === config.market}
+                className={m.symbol === config.market ? "on" : ""}
+                onClick={() => {
+                  setOpen(false);
+                  selectMarket(m.symbol);
+                }}
+              >
+                <CoinBadge market={m.symbol} />
+                <span className="market-menu-pair">{pairLabel(m.symbol)}</span>
+                <span className="muted market-menu-sub">Chainlink {m.description} · own pool</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 /** The mark: a shield whose inner path is half solid, half hidden. */
 export function Logo() {

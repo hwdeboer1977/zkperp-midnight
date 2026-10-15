@@ -42,7 +42,9 @@ interface DeploymentRecord {
   address: string;
   fingerprint: string;
 }
-type Deployments = Record<string, Partial<Record<ContractName, DeploymentRecord>>>;
+// Keyed by contract name, or for a market other than ETH-USD by
+// "zkperp:<symbol>" (core/markets.ts).
+type Deployments = Record<string, Record<string, DeploymentRecord>>;
 
 function readDeployments(): Deployments {
   return fs.existsSync(DEPLOYMENTS) ? JSON.parse(fs.readFileSync(DEPLOYMENTS, "utf8")) : {};
@@ -54,14 +56,14 @@ export function fingerprint(name: ContractName): string {
 }
 
 /** The deployed address, if this network has one built from the current code. */
-export function getDeployment(networkId: string, name: ContractName): string | undefined {
-  const record = readDeployments()[networkId]?.[name];
+export function getDeployment(networkId: string, name: ContractName, key: string = name): string | undefined {
+  const record = readDeployments()[networkId]?.[key];
   if (!record || typeof record !== "object") return undefined;
   return record.fingerprint === fingerprint(name) ? record.address : undefined;
 }
 
-export function saveDeployment(networkId: string, name: ContractName, address: string): void {
+export function saveDeployment(networkId: string, name: ContractName, address: string, key: string = name): void {
   const all = readDeployments();
-  all[networkId] = { ...all[networkId], [name]: { address, fingerprint: fingerprint(name) } };
+  all[networkId] = { ...all[networkId], [key]: { address, fingerprint: fingerprint(name) } };
   fs.writeFileSync(DEPLOYMENTS, JSON.stringify(all, null, 2) + "\n");
 }

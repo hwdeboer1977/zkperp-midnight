@@ -126,9 +126,10 @@ export async function deployOrFind(
   seed: string,
   name: ContractName,
   args: (module: any) => Promise<unknown[]>,
-  accept: (ledger: any) => boolean = () => true
+  accept: (ledger: any) => boolean = () => true,
+  key: string = name
 ): Promise<string> {
-  const known = getDeployment(activeNetwork().networkId, name);
+  const known = getDeployment(activeNetwork().networkId, name, key);
   const providers = providersFor(wallet, seed, name);
   const deferred = DEFERRED[name] ?? [];
   const module = await contractModule(name);
@@ -144,7 +145,7 @@ export async function deployOrFind(
     args: await args(module),
   } as any);
   const address: string = deployed.deployTxData.public.contractAddress;
-  saveDeployment(activeNetwork().networkId, name, address);
+  saveDeployment(activeNetwork().networkId, name, address, key);
   await insertDeferred(log, providers, name, address);
   return address;
 }

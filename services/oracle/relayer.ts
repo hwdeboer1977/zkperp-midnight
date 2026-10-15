@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * One oracle signer: Chainlink ETH/USD → zkperp's `setPrice`, signed by two
- * of three signers.
+ * One oracle signer: Chainlink → zkperp's `setPrice`, signed by two of three
+ * signers, for every market deployed (core/markets.ts): ETH/USD to the
+ * ETH-USD contract, BTC/USD to BTC-USD. The same key signs for each; a report
+ * names its contract, so it cannot be replayed on another market.
  *
  *   npm run relayer -- --signer 1      # and --signer 2, --signer 3; needs EVM_RPC_URL
  *
@@ -31,10 +33,11 @@
  *            default http://127.0.0.1:3020,3021,3022
  *
  * Do not run it alongside `npm run demo` or `npm run race`: they set prices
- * themselves.
+ * themselves. A market set up while it runs is picked up on restart.
  *
- *   GET /health               the last round, the contract's price, this signer's state
- *   GET /signature/<roundId>  this signer's signature on that round, if it made one
+ *   GET /health?market=BTC-USD               that market's last round, contract price
+ *                                            and this signer's state; ETH-USD by default
+ *   GET /signature/<roundId>?market=BTC-USD  this signer's signature on that round
  */
 
 import "dotenv/config";
@@ -43,7 +46,6 @@ import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, walletSeed } from "../../core/network.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
-import { getDeployment } from "../../core/contracts.js";
 import { readLedger, submitSignedPrice } from "../../core/perp.js";
 import { handle } from "../../core/session.js";
 import { oracleWalletSeed, readyWallet } from "../../core/trader.js";
@@ -56,7 +58,8 @@ import {
   type Signature,
   type SlotSignature,
 } from "../../core/oracle.js";
-import { ETH_USD_MAINNET, latestRound, toSixDecimals } from "../../core/chainlink.js";
+import { latestRound, toSixDecimals } from "../../core/chainlink.js";
+import { DEFAULT_MARKET, deployedMarkets } from "../../core/markets.js";
 
 const POLL_MS = Number(process.env.RELAYER_POLL_MS ?? 15_000);
 const TICK_MS = Number(process.env.RELAYER_TICK_MS ?? 3_000);
@@ -65,7 +68,6 @@ const TICK_MS = Number(process.env.RELAYER_TICK_MS ?? 3_000);
 const STAGGER_MS = Number(process.env.RELAYER_STAGGER_MS ?? 20_000);
 // How long to trust a lower signer that says it is transmitting a round.
 const TRANSMIT_WAIT_MS = Number(process.env.RELAYER_TRANSMIT_WAIT_MS ?? 120_000);
-const FEED = process.env.CHAINLINK_FEED ?? ETH_USD_MAINNET;
 
 const log = (s: string) => console.log(`${new Date().toISOString()} ${s}`);
 const fmt = (p: bigint) => `$${p / 1_000_000n}.${(p % 1_000_000n).toString().padStart(6, "0")}`;
@@ -88,6 +90,7 @@ const reportFromJson = (j: any): PriceReport => ({ round: BigInt(j.round), price
 
 interface Health {
   signer: number;
+  market: string;
   feed: string;
   contract: string;
   wallet: string;
@@ -113,8 +116,8 @@ async function main() {
 
   const network = activeNetwork();
   setNetworkId(network.networkId);
-  const perpAddress = getDeployment(network.networkId, "zkperp");
-  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
+  const deployed = deployedMarkets(network);
+  if (!deployed.length) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
 
   const devSeed = walletSeed();
   const secret = oracleSecret(devSeed, slot);
@@ -126,39 +129,63 @@ async function main() {
     return dev;
   };
   const wallet = await readyWallet(fundFromDev, seed, network, log, `signer ${slot + 1}`);
-  const perp = await handle(wallet, seed, "zkperp", perpAddress);
-  const pc = perp.module.pureCircuits;
 
-  const ledger0 = await readLedger(perp);
-  const keys: { x: bigint; y: bigint }[] = [...ledger0.signers];
-  const own = pc.signerPublicKey(secret);
-  if (keys[slot].x !== own.x || keys[slot].y !== own.y) {
-    throw new Error(`this key is not signer ${slot + 1} of zkperp ${perpAddress.slice(0, 12)}…: check ORACLE_SIGNER_${slot + 1}`);
+  /** One market's contract, its latest Chainlink report and this signer's signatures on it. */
+  interface MarketState {
+    symbol: string;
+    feed: string;
+    perp: Awaited<ReturnType<typeof handle>>;
+    perpAddress: string;
+    // This signer's signatures, by round; a few recent ones are enough.
+    signed: Map<bigint, { report: PriceReport; signature: Signature; seenAt: number }>;
+    health: Health;
+    report?: PriceReport;
+    polledAt: number;
   }
-
-  // This signer's signatures, by round; a few recent ones are enough.
-  const signed = new Map<bigint, { report: PriceReport; signature: Signature; seenAt: number }>();
-  const health: Health = { signer: slot + 1, feed: FEED, contract: perpAddress, wallet: wallet.unshieldedAddress, submissions: 0 };
+  const markets: MarketState[] = [];
+  for (const { market, address: perpAddress } of deployed) {
+    const perp = await handle(wallet, seed, "zkperp", perpAddress);
+    const ledger0 = await readLedger(perp);
+    const keys: { x: bigint; y: bigint }[] = [...ledger0.signers];
+    const own = perp.module.pureCircuits.signerPublicKey(secret);
+    if (keys[slot].x !== own.x || keys[slot].y !== own.y) {
+      throw new Error(`this key is not signer ${slot + 1} of zkperp ${market.symbol} ${perpAddress.slice(0, 12)}…: check ORACLE_SIGNER_${slot + 1}`);
+    }
+    markets.push({
+      symbol: market.symbol,
+      feed: market.feed,
+      perp,
+      perpAddress,
+      signed: new Map(),
+      health: { signer: slot + 1, market: market.symbol, feed: market.feed, contract: perpAddress, wallet: wallet.unshieldedAddress, submissions: 0 },
+      polledAt: 0,
+    });
+  }
+  const bySymbol = (symbol: string | null) => markets.find((m) => m.symbol === (symbol ?? DEFAULT_MARKET).toUpperCase());
 
   const server = http
     .createServer((req, res) => {
       const json = (code: number, body: unknown) =>
         res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(body, null, 2));
-      if (req.url === "/health") return json(200, health);
-      const m = req.url?.match(/^\/signature\/(\d+)$/);
-      const mine = m ? signed.get(BigInt(m[1])) : undefined;
+      const url = new URL(req.url ?? "/", "http://relayer");
+      const ms = bySymbol(url.searchParams.get("market"));
+      if (!ms) return json(404, { error: "no such market here", markets: markets.map((m) => m.symbol) });
+      if (url.pathname === "/health") return json(200, { ...ms.health, markets: markets.map((m) => m.symbol) });
+      const m = url.pathname.match(/^\/signature\/(\d+)$/);
+      const mine = m ? ms.signed.get(BigInt(m[1])) : undefined;
       if (!mine) return json(404, { error: "no signature for that round" });
       json(200, { slot, report: reportToJson(mine.report), signature: signatureToJson(mine.signature) });
     })
     .listen(port, "127.0.0.1");
-  log(`signer ${slot + 1} relaying ${FEED} to zkperp ${perpAddress.slice(0, 12)}…, on http://127.0.0.1:${port}`);
+  for (const m of markets) log(`signer ${slot + 1} relaying ${m.symbol} (${m.feed}) to zkperp ${m.perpAddress.slice(0, 12)}…`);
+  log(`signer ${slot + 1} on http://127.0.0.1:${port}`);
 
   /** Peers' signatures on exactly `report`; a peer that is down or signed another report is skipped. */
-  const peerSignatures = async (report: PriceReport): Promise<SlotSignature[]> => {
+  const peerSignatures = async (symbol: string, report: PriceReport): Promise<SlotSignature[]> => {
     const found = await Promise.all(
       peers.map(async (p): Promise<SlotSignature | null> => {
         try {
-          const r = await fetch(`${p.url}/signature/${report.round}`, { signal: AbortSignal.timeout(2_000) });
+          const r = await fetch(`${p.url}/signature/${report.round}?market=${symbol}`, { signal: AbortSignal.timeout(2_000) });
           if (!r.ok) return null;
           const body: any = await r.json();
           if (body.slot !== p.slot || !sameReport(reportFromJson(body.report), report)) return null;
@@ -172,10 +199,10 @@ async function main() {
   };
 
   /** A lower signer that says it is submitting `round` now, if any. */
-  const lowerTransmitting = async (round: bigint): Promise<number | undefined> => {
+  const lowerTransmitting = async (symbol: string, round: bigint): Promise<number | undefined> => {
     for (const p of peers.filter((x) => x.slot < slot)) {
       try {
-        const r = await fetch(`${p.url}/health`, { signal: AbortSignal.timeout(2_000) });
+        const r = await fetch(`${p.url}/health?market=${symbol}`, { signal: AbortSignal.timeout(2_000) });
         const t = r.ok ? ((await r.json()) as any).transmitting : undefined;
         if (t && BigInt(t.roundId) === round && Date.now() - t.since < TRANSMIT_WAIT_MS) return p.slot;
       } catch {
@@ -192,21 +219,24 @@ async function main() {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
-  let report: PriceReport | undefined;
-  let polledAt = 0;
   let noted = "";
   const note = (key: string, line: string) => {
     if (noted !== key) log(line);
     noted = key;
   };
-  while (!stopping) {
+  /** One pass over one market: poll its feed, sign a new round, transmit it in turn. */
+  const tick = async (ms: MarketState) => {
+    const { symbol, perp, perpAddress, signed, health } = ms;
+    const pc = perp.module.pureCircuits;
+    const tag = markets.length > 1 ? `${symbol} ` : "";
     try {
-      if (Date.now() - polledAt >= POLL_MS) {
-        const round = await latestRound(rpcUrl, FEED);
-        polledAt = Date.now();
-        report = { round: round.roundId, price: toSixDecimals(round.answer, round.decimals), updatedAt: round.updatedAt };
-        health.lastRound = { roundId: round.roundId.toString(), price: fmt(report.price), updatedAt: Number(round.updatedAt) };
+      if (Date.now() - ms.polledAt >= POLL_MS) {
+        const round = await latestRound(rpcUrl, ms.feed);
+        ms.polledAt = Date.now();
+        ms.report = { round: round.roundId, price: toSixDecimals(round.answer, round.decimals), updatedAt: round.updatedAt };
+        health.lastRound = { roundId: round.roundId.toString(), price: fmt(ms.report.price), updatedAt: Number(round.updatedAt) };
       }
+      const report = ms.report;
       const ledger = await readLedger(perp);
       const now = Math.floor(Date.now() / 1000);
       health.contractPrice = {
@@ -222,7 +252,7 @@ async function main() {
         // On chain already, or the contract is ahead of this round (a mock
         // price from `npm run price`): wait for a newer round.
       } else if (report.updatedAt < ledger.priceTime) {
-        note(`older:${report.round}`, `round ${report.round} (${fmt(report.price)}) is older than the contract's price; waiting for a newer round`);
+        note(`older:${symbol}:${report.round}`, `${tag}round ${report.round} (${fmt(report.price)}) is older than the contract's price; waiting for a newer round`);
       } else {
         let mine = signed.get(report.round);
         if (!mine) {
@@ -230,39 +260,43 @@ async function main() {
           signed.set(report.round, mine);
           for (const r of [...signed.keys()].sort((a, b) => (a < b ? -1 : 1)).slice(0, -8)) signed.delete(r);
           health.lastSigned = { roundId: report.round.toString(), at: new Date().toISOString() };
-          log(`new round ${report.round}: ${fmt(report.price)}, published ${now - Number(report.updatedAt)}s ago — signed`);
+          log(`${tag}new round ${report.round}: ${fmt(report.price)}, published ${now - Number(report.updatedAt)}s ago — signed`);
         }
         if (Date.now() - mine.seenAt >= slot * STAGGER_MS) {
-          const theirs = await peerSignatures(report);
-          const busy = await lowerTransmitting(report.round);
+          const theirs = await peerSignatures(symbol, report);
+          const busy = await lowerTransmitting(symbol, report.round);
           if (busy !== undefined) {
-            note(`busy:${report.round}`, `   signer ${busy + 1} is transmitting round ${report.round}; waiting`);
+            note(`busy:${symbol}:${report.round}`, `   ${tag}signer ${busy + 1} is transmitting round ${report.round}; waiting`);
           } else if (theirs.length === 0) {
-            note(`peers:${report.round}`, `   no peer has signed round ${report.round} yet; waiting`);
+            note(`peers:${symbol}:${report.round}`, `   ${tag}no peer has signed round ${report.round} yet; waiting`);
           } else {
             const sigs = [{ slot, signature: mine.signature }, ...theirs];
             const used = sigs.map((s) => s.slot).sort().slice(0, 2);
-            log(`   transmitting round ${report.round} with signers ${used.map((s) => s + 1).join(" and ")}…`);
+            log(`   ${tag}transmitting round ${report.round} with signers ${used.map((s) => s + 1).join(" and ")}…`);
             health.transmitting = { roundId: report.round.toString(), since: Date.now() };
             const txHash = await submitSignedPrice(perp, report, sigs).finally(() => {
               health.transmitting = undefined;
             });
             health.submissions += 1;
             health.lastSubmission = { roundId: report.round.toString(), txHash, with: used.map((s) => s + 1), at: new Date().toISOString() };
-            log(chalk.green(`   set ${fmt(report.price)} in ${txHash}`));
+            log(chalk.green(`   ${tag}set ${fmt(report.price)} in ${txHash}`));
           }
         }
       }
     } catch (error) {
       const message = String(error instanceof Error ? error.message : error).slice(0, 300);
       health.lastError = { message, at: new Date().toISOString() };
+      const report = ms.report;
       // Another signer's transmission of the same round landed first. Refused
       // locally, nothing is lost; refused on chain (FailFallible), the fee is.
-      if (/round is not newer/.test(message)) log(chalk.gray("   another signer transmitted this round first"));
+      if (/round is not newer/.test(message)) log(chalk.gray(`   ${tag}another signer transmitted this round first`));
       else if (/FailFallible/.test(message) && report && (await readLedger(perp).catch(() => null))?.priceRound >= report.round) {
-        log(chalk.yellow("   another signer's transmission of this round landed first; this one failed on chain and paid its fee"));
-      } else log(chalk.red(`error: ${message}`));
+        log(chalk.yellow(`   ${tag}another signer's transmission of this round landed first; this one failed on chain and paid its fee`));
+      } else log(chalk.red(`${tag}error: ${message}`));
     }
+  };
+  while (!stopping) {
+    for (const ms of markets) if (!stopping) await tick(ms);
     for (let waited = 0; waited < TICK_MS && !stopping; waited += 500) await sleep(500);
   }
 

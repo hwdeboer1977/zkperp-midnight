@@ -4,6 +4,7 @@ import { useState } from "react";
 import { reservedOf } from "@core/math";
 import { fmt6, hex, parse6 } from "../lib/bytes";
 import { useConfig, useLedger, useNow, useService, useShareHistory } from "../lib/hooks";
+import { marketQuery } from "../lib/config";
 import { addLiquidity, removeLiquidity } from "../lib/trading";
 import { balanceOf, useWallet } from "../lib/wallet";
 import { PriceChart, Stat } from "../components/Market";
@@ -31,8 +32,8 @@ export default function LiquidityPage() {
   const { ledger } = useLedger();
   const now = useNow(10_000);
   const shareHistory = useShareHistory();
-  const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs` : undefined, 30_000);
-  const treasury = useService<TreasuryHealth>(config ? `${config.services.treasury}/health` : undefined, 30_000);
+  const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs${marketQuery(config)}` : undefined, 30_000);
+  const treasury = useService<TreasuryHealth>(config ? `${config.services.treasury}/health${marketQuery(config)}` : undefined, 30_000);
   const [tab, setTab] = useState<"deposit" | "withdraw">("deposit");
   const [deposit, setDeposit] = useState("1000");
   const [redeem, setRedeem] = useState("");

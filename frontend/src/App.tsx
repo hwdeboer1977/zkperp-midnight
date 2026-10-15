@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { NavLink, Route, Routes } from "react-router-dom";
-import { useConfig, useLedger, useNow } from "./lib/hooks";
+import { useConfig, useLedger, useMarket, useNow } from "./lib/hooks";
 import { fmt6 } from "./lib/bytes";
 import { WalletButton } from "./components/WalletButton";
-import { Logo } from "./components/Market";
+import { Logo, MarketPicker, pairLabel } from "./components/Market";
 import PublicPage from "./pages/Public";
 import TradePage from "./pages/Trade";
 import PortfolioPage from "./pages/Portfolio";
@@ -13,6 +13,7 @@ import FaucetPage from "./pages/Faucet";
 import { Notices } from "./components/Keeper";
 
 function PriceTicker() {
+  const config = useConfig();
   const { ledger } = useLedger();
   const now = useNow(5000);
   if (!ledger) return null;
@@ -20,7 +21,7 @@ function PriceTicker() {
   const stale = age >= Number(ledger.maxPriceAge);
   return (
     <span className={`ticker ${stale ? "bad" : ""}`} title={`price published ${age}s ago; limit ${ledger.maxPriceAge}s`}>
-      <span className="pair">ETH-USD · {Math.floor(age / 60)}m ago</span>
+      <span className="pair">{pairLabel(config?.market)} · {Math.floor(age / 60)}m ago</span>
       <span className="price">${fmt6(ledger.markPrice)}</span>
     </span>
   );
@@ -43,6 +44,8 @@ function StaleBanner() {
 
 export default function App() {
   const config = useConfig();
+  // Every page reads the selected market's contract: remount them on a switch.
+  const market = useMarket();
   return (
     <>
       <header>
@@ -65,11 +68,12 @@ export default function App() {
           <NavLink to="/liquidity">Liquidity</NavLink>
           <NavLink to="/faucet">Faucet</NavLink>
         </nav>
+        <MarketPicker />
         <PriceTicker />
         <WalletButton />
       </header>
       <StaleBanner />
-      <main>
+      <main key={market ?? ""}>
         <Routes>
           <Route path="/" element={<PublicPage />} />
           <Route path="/trade" element={<TradePage />} />

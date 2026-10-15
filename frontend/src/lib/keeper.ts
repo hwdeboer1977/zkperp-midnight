@@ -9,6 +9,7 @@
 
 import { useEffect, useState } from "react";
 import { useConfig } from "./hooks";
+import { marketQuery } from "./config";
 
 export type KeeperAction = "liquidation" | "order" | "limit";
 export type KeeperStep = "prepare" | "proving" | "wallet" | "submitting";
@@ -59,7 +60,7 @@ export function useKeeper(active: boolean, everyMs = 4000): KeepersHealth | "dow
     if (!bases || !active) return setHealth(null);
     let live = true;
     const one = (base: string): Promise<KeeperHealth | null> =>
-      fetch(`${base}/health`)
+      fetch(`${base}/health${marketQuery(config!)}`)
         .then((r) => (r.ok ? r.json() : null))
         .then((h) => (h && config && h.contract === config.contracts.zkperp ? h : null))
         .catch(() => null);

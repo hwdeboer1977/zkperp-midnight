@@ -6,7 +6,9 @@
  *   npm run treasury
  *
  * Every fee reaches the treasury wallet as a shielded output, so its balance
- * is fees and nothing else. An epoch deposits the LPs' share of the fees
+ * is fees and nothing else. Each market (core/markets.ts) pays its own
+ * treasury wallet, so each wallet's fees belong to one pool; this job runs
+ * them all, one after the other. An epoch deposits the LPs' share of the fees
  * received since the last epoch into the pool with `depositFees`; the rest is
  * the protocol's and stays in the wallet.
  *
@@ -25,8 +27,9 @@
  * the wallet's balance, would give away each trade's fee — and with it its
  * size — to anyone polling before and after it; they stay in this log.
  *
- *   GET  http://127.0.0.1:3011/health   up, closes since the last epoch, the rules
- *   GET  http://127.0.0.1:3011/epochs   every epoch so far: when, closes, deposit, tx
+ *   GET  http://127.0.0.1:3011/health?market=BTC-USD   up, closes since the last epoch, the rules
+ *   GET  http://127.0.0.1:3011/epochs?market=BTC-USD   every epoch so far: when, closes, deposit, tx
+ *                                                      (ETH-USD without `market`)
  *
  * Epochs are logged in .zkperp/epochs.json, per contract.
  */
@@ -39,7 +42,7 @@ import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, stackFile, walletSeed } from "../../core/network.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
-import { getDeployment } from "../../core/contracts.js";
+import { DEFAULT_MARKET, deployedMarkets } from "../../core/markets.js";
 import { readLedger, type ContractHandle } from "../../core/perp.js";
 import { depositFees } from "../../core/pool.js";
 import { readyWallet, treasurySeed } from "../../core/trader.js";
@@ -97,71 +100,84 @@ function lastEpochOn(contractAddress: string): { closed: bigint; balanceAfter: b
     : { closed: 0n, balanceAfter: 0n, at: 0 };
 }
 
+/** One market's treasury: its wallet and its contract. */
+interface MarketTreasury {
+  symbol: string;
+  wallet: Awaited<ReturnType<typeof readyWallet>>;
+  perp: ContractHandle;
+  usdc: Uint8Array;
+  busy: boolean;
+  lastNote: string;
+}
+
 async function main() {
   const network = activeNetwork();
   setNetworkId(network.networkId);
-  const perpAddress = getDeployment(network.networkId, "zkperp");
-  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
+  const deployed = deployedMarkets(network);
+  if (!deployed.length) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
 
   const devSeed = walletSeed();
-  log("syncing the treasury wallet…");
-  const seed = treasurySeed(devSeed);
-  // The dev wallet is built only if the treasury still needs funding: the
+  // The dev wallet is built only if a treasury still needs funding: the
   // relayer may be using it.
   const fundFromDev = async () => {
     const dev = await buildWallet({ kind: "seed", value: devSeed }, network);
     await waitForSync(dev, () => {});
     return dev;
   };
-  const wallet = await readyWallet(fundFromDev, seed, network, log, "treasury");
-
-  const perp: ContractHandle = await handle(wallet, seed, "zkperp", perpAddress);
-  const ledger0 = await readLedger(perp);
-  if (hex(ledger0.treasury.bytes) !== hex(coinKey(wallet))) {
-    throw new Error("this zkperp pays its fees to a different treasury key; redeploy with the setup");
-  }
-  const usdc: Uint8Array = ledger0.usdc;
-  if (!readEpochs().some((e) => e.contractAddress === perpAddress)) {
-    const held = await balance(wallet, usdc);
-    appendEpoch({
-      contractAddress: perpAddress,
-      at: new Date(0).toISOString(),
-      closedPositions: ledger0.closedPositions.toString(),
-      fees: "0",
-      deposited: "0",
-      balanceAfter: held.toString(),
-      txHash: "",
-      baseline: true,
-    });
-    log(`first run on this contract: counting fees from the current balance, ${fmt(held)}`);
+  const markets: MarketTreasury[] = [];
+  for (const { market, address: perpAddress } of deployed) {
+    const label = deployed.length > 1 ? `${market.symbol} treasury` : "treasury";
+    log(`syncing the ${label} wallet…`);
+    const seed = treasurySeed(devSeed, market.symbol);
+    const wallet = await readyWallet(fundFromDev, seed, network, log, label);
+    const perp: ContractHandle = await handle(wallet, seed, "zkperp", perpAddress);
+    const ledger0 = await readLedger(perp);
+    if (hex(ledger0.treasury.bytes) !== hex(coinKey(wallet))) {
+      throw new Error(`zkperp ${market.symbol} pays its fees to a different treasury key; redeploy with the setup`);
+    }
+    const usdc: Uint8Array = ledger0.usdc;
+    if (!readEpochs().some((e) => e.contractAddress === perpAddress)) {
+      const held = await balance(wallet, usdc);
+      appendEpoch({
+        contractAddress: perpAddress,
+        at: new Date(0).toISOString(),
+        closedPositions: ledger0.closedPositions.toString(),
+        fees: "0",
+        deposited: "0",
+        balanceAfter: held.toString(),
+        txHash: "",
+        baseline: true,
+      });
+      log(`first run on ${market.symbol}'s contract: counting fees from the current balance, ${fmt(held)}`);
+    }
+    markets.push({ symbol: market.symbol, wallet, perp, usdc, busy: false, lastNote: "" });
   }
 
   /** What an epoch now would cover, and why it may not run. */
-  async function pending() {
-    const last = lastEpochOn(perpAddress!);
-    const ledger = await readLedger(perp);
-    const held = await balance(wallet, usdc);
+  async function pending(m: MarketTreasury) {
+    const last = lastEpochOn(m.perp.address);
+    const ledger = await readLedger(m.perp);
+    const held = await balance(m.wallet, m.usdc);
     const fees = held - last.balanceAfter;
     const closes = ledger.closedPositions - last.closed;
     const elapsed = Math.floor((Date.now() - last.at) / 1000);
     return { last, ledger, held, fees, closes, elapsed, toLps: (fees * LP_SHARE_PCT) / 100n };
   }
 
-  let busy = false;
-  async function runEpoch(): Promise<string> {
-    if (busy) return "an epoch is already running";
-    busy = true;
+  async function runEpoch(m: MarketTreasury): Promise<string> {
+    if (m.busy) return "an epoch is already running";
+    m.busy = true;
     try {
-      const p = await pending();
+      const p = await pending(m);
       if (p.closes < MIN_CLOSES) return `waiting: ${p.closes} of ${MIN_CLOSES} closes since the last epoch`;
       if (p.elapsed < MIN_SECONDS) return `waiting: ${p.elapsed}s of ${MIN_SECONDS}s since the last epoch`;
       if (p.toLps <= 0n) return "no fees to pay out";
-      log(`epoch: ${p.closes} closes, fees ${fmt(p.fees)}, ${LP_SHARE_PCT}% to LPs: ${fmt(p.toLps)}…`);
-      const txHash = await depositFees(perp, usdc, p.toLps);
+      log(`${m.symbol} epoch: ${p.closes} closes, fees ${fmt(p.fees)}, ${LP_SHARE_PCT}% to LPs: ${fmt(p.toLps)}…`);
+      const txHash = await depositFees(m.perp, m.usdc, p.toLps);
       // The change comes back a moment later; count from the settled balance.
-      const after = await waitForBalance(wallet, usdc, (b) => b === p.held - p.toLps);
+      const after = await waitForBalance(m.wallet, m.usdc, (b) => b === p.held - p.toLps);
       appendEpoch({
-        contractAddress: perpAddress!,
+        contractAddress: m.perp.address,
         at: new Date().toISOString(),
         closedPositions: p.ledger.closedPositions.toString(),
         fees: p.fees.toString(),
@@ -172,7 +188,7 @@ async function main() {
       log(chalk.green(`   deposited ${fmt(p.toLps)} in ${txHash}`));
       return `deposited ${fmt(p.toLps)} in ${txHash}`;
     } finally {
-      busy = false;
+      m.busy = false;
     }
   }
 
@@ -181,21 +197,26 @@ async function main() {
       const json = (status: number, body: unknown) =>
         res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body, null, 2));
       try {
-        if (req.method === "GET" && req.url === "/health") {
-          const p = await pending();
+        const url = new URL(req.url ?? "/", "http://treasury");
+        const symbol = (url.searchParams.get("market") ?? DEFAULT_MARKET).toUpperCase();
+        const m = markets.find((x) => x.symbol === symbol);
+        if (!m) return json(404, { error: "no such market here", markets: markets.map((x) => x.symbol) });
+        if (req.method === "GET" && url.pathname === "/health") {
+          const p = await pending(m);
           return json(200, {
-            contract: perpAddress,
+            market: m.symbol,
+            contract: m.perp.address,
             closesSinceLastEpoch: Number(p.closes),
             secondsSinceLastEpoch: p.last.at ? p.elapsed : null,
             rules: { minCloses: Number(MIN_CLOSES), minSeconds: MIN_SECONDS, lpSharePct: Number(LP_SHARE_PCT) },
           });
         }
-        if (req.method === "GET" && req.url === "/epochs") {
+        if (req.method === "GET" && url.pathname === "/epochs") {
           // Only what each deposit already shows on chain.
           return json(
             200,
             readEpochs()
-              .filter((e) => e.contractAddress === perpAddress && !e.baseline)
+              .filter((e) => e.contractAddress === m.perp.address && !e.baseline)
               .map(({ at, closedPositions, deposited, txHash }) => ({ at, closedPositions, deposited, txHash }))
           );
         }
@@ -205,26 +226,27 @@ async function main() {
       }
     })
     .listen(PORT, "127.0.0.1");
-  log(`treasury for zkperp ${perpAddress.slice(0, 12)}…: epochs every ≥${MIN_CLOSES} closes and ≥${MIN_SECONDS}s, ${LP_SHARE_PCT}% to LPs`);
-  log(`http://127.0.0.1:${PORT}/health`);
+  for (const m of markets) log(`treasury for zkperp ${m.symbol} ${m.perp.address.slice(0, 12)}…`);
+  log(`epochs every ≥${MIN_CLOSES} closes and ≥${MIN_SECONDS}s, ${LP_SHARE_PCT}% to LPs; http://127.0.0.1:${PORT}/health`);
 
   let stopping = false;
   process.on("SIGINT", () => (stopping = true));
   process.on("SIGTERM", () => (stopping = true));
-  let lastNote = "";
   while (!stopping) {
-    try {
-      const result = await runEpoch();
-      if (result !== lastNote) log(result);
-      lastNote = result;
-    } catch (error) {
-      log(chalk.red(`error: ${String(error instanceof Error ? error.message : error).slice(0, 300)}`));
+    for (const m of markets) {
+      try {
+        const result = await runEpoch(m);
+        if (result !== m.lastNote) log(markets.length > 1 ? `${m.symbol}: ${result}` : result);
+        m.lastNote = result;
+      } catch (error) {
+        log(chalk.red(`${m.symbol} error: ${String(error instanceof Error ? error.message : error).slice(0, 300)}`));
+      }
     }
     for (let waited = 0; waited < CHECK_MS && !stopping; waited += 500) await sleep(500);
   }
   log("stopping…");
   server.close();
-  await wallet.facade.stop();
+  for (const m of markets) await m.wallet.facade.stop();
 }
 
 main().catch((error) => {

@@ -3,8 +3,9 @@
 import { reservedOf } from "@core/math";
 import { fmt6 } from "../lib/bytes";
 import { useActivity, useConfig, useLedger, useNow, useService } from "../lib/hooks";
+import { marketQuery } from "../lib/config";
 import { useKeeper } from "../lib/keeper";
-import { ActivityFeed, PriceChart, Stat } from "../components/Market";
+import { ActivityFeed, PriceChart, Stat, pairLabel } from "../components/Market";
 
 interface Epoch {
   at: string;
@@ -18,11 +19,11 @@ export default function PublicPage() {
   const { ledger, error } = useLedger();
   const now = useNow(5000);
   // The oracle's three signers, each its own relayer.
-  const signerUrl = (n: number) => config?.services.signers?.[n] && `${config.services.signers[n]}/health`;
+  const signerUrl = (n: number) => config?.services.signers?.[n] && `${config.services.signers[n]}/health${marketQuery(config)}`;
   const signerHealth = [useService<any>(signerUrl(0)), useService<any>(signerUrl(1)), useService<any>(signerUrl(2))];
   // The three keepers, any one of which can liquidate alone.
   const keepers = useKeeper(true, 15_000);
-  const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs` : undefined, 30_000);
+  const epochs = useService<Epoch[]>(config ? `${config.services.treasury}/epochs${marketQuery(config)}` : undefined, 30_000);
   const { actions, prices } = useActivity();
 
   if (error) return <div className="card bad">{error}</div>;
@@ -73,7 +74,7 @@ export default function PublicPage() {
           }
         />
         <Stat
-          label="Mark price · ETH-USD"
+          label={`Mark price · ${pairLabel(config?.market)}`}
           value={`$${fmt6(ledger.markPrice)}`}
           sub={`${Math.floor(age / 60)} of ${Math.floor(maxAge / 60)} min max age · signed by signers ${signedBy} · ${signersUp} of 3 signers up`}
           meter={{ value: age / maxAge, tone: age >= maxAge ? "bad" : age > maxAge * 0.75 ? "warn" : undefined }}

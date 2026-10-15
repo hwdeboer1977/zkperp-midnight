@@ -8,6 +8,10 @@
  *   npm run setup:local      # the devnet; needs EVM_RPC_URL in .env
  *   npm run setup:preview    # the preview testnet; also needs WALLET_SEED_PREVIEW,
  *                            # funded with tNIGHT from the faucet
+ *   npm run setup:preview -- --market BTC-USD
+ *                            # another market (core/markets.ts): its own zkperp,
+ *                            # pool and treasury wallet, the same pUSDC; ETH-USD
+ *                            # by default
  *   npm run relayer -- --signer 1   # and --signer 2, 3: the oracle's three
  *                                   # signers (relayer:preview for preview)
  *   npm run treasury         # in another terminal
@@ -32,7 +36,8 @@
  *
  * Writes .zkperp/<network>-stack.json: the addresses, the network endpoints
  * and the treasury's keys — everything the frontend needs to find the
- * contract and pay fees.
+ * contract and pay fees. Each market is one entry of its `markets`; setting
+ * up one market keeps the others.
  */
 
 import "dotenv/config";
@@ -48,7 +53,8 @@ import { KEEPER_SLOTS, keeperSecrets, keeperWalletSeed, oracleWalletSeed, readyT
 import { readLedger, type ContractHandle } from "../core/perp.js";
 import { addLiquidity } from "../core/pool.js";
 import { balance, coinKey, deployOrFind, handle, waitForBalance } from "../core/session.js";
-import { ETH_USD_MAINNET, latestRound, toSixDecimals } from "../core/chainlink.js";
+import { latestRound, toSixDecimals } from "../core/chainlink.js";
+import { DEFAULT_MARKET, deploymentKey, marketArg, readStack, stackMarkets, type StackMarket } from "../core/markets.js";
 
 const PUSDC = 1_000_000n;
 const LIQUIDITY = 500_000n * PUSDC;
@@ -85,7 +91,8 @@ async function main() {
   setNetworkId(network.networkId);
   const devSeed = walletSeed(network);
   const oracle = oracleSecrets(devSeed);
-  console.log(chalk.bold(`zkperp setup on ${network.name}`));
+  const market = marketArg();
+  console.log(chalk.bold(`zkperp setup on ${network.name}: ${market.symbol}`));
 
   step("Wallets");
   let dev: BuiltWallet;
@@ -116,7 +123,7 @@ async function main() {
     const traderSeedHex = traderSeed(devSeed);
     const trader = isLocal(network) ? await readyTrader(dev, traderSeedHex, network, info) : null;
     if (trader) others.push(trader);
-    const treasury = await readyWallet(dev, treasurySeed(devSeed), network, info, "treasury");
+    const treasury = await readyWallet(dev, treasurySeed(devSeed, market.symbol), network, info, `${market.symbol} treasury`);
     others.push(treasury);
     // One wallet per keeper, funded now for the same reason as the signers'.
     const keeperWallets: BuiltWallet[] = [];
@@ -149,11 +156,11 @@ async function main() {
     info(`pUSDC ${pusdcAddress}`);
 
     step("Chainlink");
-    const round = await latestRound(rpcUrl, ETH_USD_MAINNET);
+    const round = await latestRound(rpcUrl, market.feed);
     const price = toSixDecimals(round.answer, round.decimals);
     info(`${round.description} round ${round.roundId}: $${fmt(price)}, published ${Math.floor(Date.now() / 1000) - Number(round.updatedAt)}s ago`);
 
-    step("zkperp, fresh");
+    step(`zkperp ${market.symbol}, fresh`);
     const perpAddress = await deployOrFind(
       info,
       dev,
@@ -178,7 +185,8 @@ async function main() {
         PARAMS.liquidationFeeBps,
         keeperSecrets(devSeed).map((x) => module.pureCircuits.liquidatorPublicKey(x)),
       ],
-      () => false
+      () => false,
+      deploymentKey(market.symbol)
     );
     info(`zkperp ${perpAddress}`);
     const perp: ContractHandle = await handle(dev, devSeed, "zkperp", perpAddress);
@@ -197,6 +205,27 @@ async function main() {
       await traderPusdc.deployed.callTx.mint(TRADER_MINT);
     }
 
+    const treasuryKeys = {
+      coinPublicKey: hex(coinKey(treasury)),
+      encryptionPublicKey: String(treasury.shieldedSecretKeys.encryptionPublicKey),
+    };
+    const params = Object.fromEntries(Object.entries(PARAMS).map(([k, v]) => [k, v.toString()]));
+    const entry: StackMarket = {
+      symbol: market.symbol,
+      address: perpAddress,
+      feed: market.feed,
+      description: round.description,
+      candles: market.candles,
+      treasury: treasuryKeys,
+      params,
+    };
+    // The other markets stay, if they share this pUSDC.
+    const before = readStack(network);
+    const kept = before?.contracts?.pusdc === pusdcAddress ? stackMarkets(before).filter((m) => m.symbol !== market.symbol) : [];
+    const markets = [...kept, entry].sort((a, b) => (a.symbol === DEFAULT_MARKET ? -1 : b.symbol === DEFAULT_MARKET ? 1 : 0));
+    // The top-level zkperp, treasury, oracle and params are the first market's,
+    // for readers from before markets existed.
+    const first = markets[0]!;
     const stack = {
       network: {
         networkId: network.networkId,
@@ -205,21 +234,19 @@ async function main() {
         indexerWS: network.indexerWS,
         proofServer: network.proofServer,
       },
-      contracts: { pusdc: pusdcAddress, zkperp: perpAddress },
+      contracts: { pusdc: pusdcAddress, zkperp: first.address },
       usdcToken: hex(usdc),
-      treasury: {
-        coinPublicKey: hex(coinKey(treasury)),
-        encryptionPublicKey: String(treasury.shieldedSecretKeys.encryptionPublicKey),
-      },
-      oracle: { feed: ETH_USD_MAINNET, description: round.description },
-      params: Object.fromEntries(Object.entries(PARAMS).map(([k, v]) => [k, v.toString()])),
+      treasury: first.treasury,
+      oracle: { feed: first.feed, description: first.description },
+      params: first.params,
+      markets,
       createdAt: new Date().toISOString(),
     };
     fs.mkdirSync(path.dirname(FILE), { recursive: true, mode: 0o700 });
     fs.writeFileSync(FILE, JSON.stringify(stack, null, 2) + "\n");
-    console.log(`\n${chalk.green.bold(`${network.name} stack ready.`)} ${chalk.gray(FILE)}`);
+    console.log(`\n${chalk.green.bold(`${network.name} stack ready: ${markets.map((m) => m.symbol).join(", ")}.`)} ${chalk.gray(FILE)}`);
     const suffix = isLocal(network) ? "" : `:${network.key}`;
-    console.log(chalk.gray(`   next: npm run relayer${suffix} -- --signer 1 (and 2, 3), treasury${suffix}, and keeper${suffix} -- --keeper 1 (and 2, 3), each in its own terminal`));
+    console.log(chalk.gray(`   next: npm run relayer${suffix} -- --signer 1 (and 2, 3), treasury${suffix}, and keeper${suffix} -- --keeper 1 (and 2, 3), each in its own terminal; running ones pick up a new market on restart`));
   } finally {
     for (const w of others) await w.facade.stop();
     await dev.facade.stop();

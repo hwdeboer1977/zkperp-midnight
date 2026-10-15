@@ -8,7 +8,8 @@
  *
  *   frontend/src/generated/<contract>/   the compiled contract modules
  *   frontend/public/zk/<contract>/       proving and verifier keys, ZKIR
- *   frontend/public/config.json          network, addresses, treasury keys
+ *   frontend/public/config.json          network, addresses, treasury keys,
+ *                                        one entry per market
  *
  * The contract modules are COPIED, not imported from contracts/managed: an
  * import from outside frontend/ would resolve a second compact-runtime from
@@ -26,6 +27,7 @@ import path from "path";
 import chalk from "chalk";
 import { fingerprint, type ContractName } from "../core/contracts.js";
 import { activeNetwork, stackFile } from "../core/network.js";
+import { stackMarkets } from "../core/markets.js";
 
 const ROOT = process.cwd();
 const FRONTEND = path.join(ROOT, "frontend");
@@ -68,8 +70,11 @@ function main() {
     console.log(chalk.gray(`   ${name}: contract module, ${keys} key files, ${zkir} ZKIR files`));
   }
 
+  const markets = stackMarkets(stack);
+  if (!markets.length) throw new Error(`${STACK} lists no market: run the setup for this network first`);
   const config = {
     ...stack,
+    markets,
     zkVersion: fingerprint("zkperp"),
     // Same-origin paths; the dev server proxies them to the services (see
     // frontend/vite.config.ts), so the browser needs no CORS.
@@ -81,7 +86,8 @@ function main() {
     },
   };
   fs.writeFileSync(path.join(FRONTEND, "public", "config.json"), JSON.stringify(config, null, 2) + "\n");
-  console.log(chalk.green(`frontend configured for zkperp ${stack.contracts.zkperp.slice(0, 12)}… on ${stack.network.networkId}`));
+  const list = markets.map((m) => `${m.symbol} ${m.address.slice(0, 12)}…`).join(", ");
+  console.log(chalk.green(`frontend configured on ${stack.network.networkId}: ${list}`));
 }
 
 main();

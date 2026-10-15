@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 import { circuitNow, closeFeeOf, liquidationPrice, openFeeOf, positionPnl } from "@core/math";
 import { fmt6, parse6 } from "../lib/bytes";
 import { useConfig, useLedger, useNow, useService } from "../lib/hooks";
+import { marketQuery } from "../lib/config";
 import { INTERVALS, useCandles, useLivePrice } from "../lib/market";
 import { PriceMovedError, openPosition } from "../lib/trading";
 import { usePositionKey } from "../lib/positionKey";
@@ -21,6 +22,7 @@ import { TxProgress, useTxProgress } from "../components/TxProgress";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { ProverLine, ProverSetup, WhyDocker } from "../components/ProverSetup";
 import { NeedsWallet } from "../components/WalletButton";
+import { CoinBadge, pairLabel } from "../components/Market";
 import { OpenRow } from "./Portfolio";
 
 /**
@@ -44,11 +46,12 @@ export default function TradePage() {
   const { ledger } = useLedger();
   const now = useNow(1000);
   const [interval, setInterval_] = useState<number>(900);
-  const live = useLivePrice();
-  const { candles, error: marketError } = useCandles(interval, live);
+  const product = config?.markets.find((m) => m.symbol === config.market)?.candles;
+  const live = useLivePrice(product);
+  const { candles, error: marketError } = useCandles(product, interval, live);
   const key = usePositionKey();
   const positions = usePositions();
-  const relayer = useService<any>(config ? `${config.services.relayer}/health` : undefined, 15_000);
+  const relayer = useService<any>(config ? `${config.services.relayer}/health${marketQuery(config)}` : undefined, 15_000);
   const [isLong, setLong] = useState(true);
   // Market opens now at the mark price; limit posts the coin now and waits for its price.
   const [mode, setMode] = useState<"market" | "limit">("market");
@@ -196,9 +199,9 @@ export default function TradePage() {
         <section className="card">
           <div className="market-head">
             <div className="pair">
-              <span className="coin">Ξ</span>
+              <CoinBadge market={pairLabel(config?.market)} />
               <span>
-                ETH-USD
+                {pairLabel(config?.market)}
                 <small className="tag-line">Perpetual</small>
               </span>
             </div>
@@ -251,7 +254,7 @@ export default function TradePage() {
               </span>
             )}
             <span className="muted legend">
-              <i className="swatch" /> execution price · candles: Coinbase ETH-USD
+              <i className="swatch" /> execution price · candles: Coinbase {product ?? "…"}
             </span>
           </div>
           {deviates && !stale && (
@@ -263,7 +266,7 @@ export default function TradePage() {
             </div>
           )}
           {marketError && <p className="muted" style={{ fontSize: 13 }}>Live market data unavailable: {marketError}</p>}
-          <CandleChart candles={candles} oracle={oracle} levels={levels} />
+          <CandleChart candles={candles} oracle={oracle} levels={levels} market={pairLabel(config?.market)} />
         </section>
 
         <KeeperLine

@@ -13,7 +13,7 @@ import { KIND_LABEL, cancelOrder, checkLevel, liveOrders, placeOrder, replaceOrd
 import { proverLabel, useWallet } from "../lib/wallet";
 import { PositionKeyPanel } from "../components/PositionKey";
 import { NeedsWallet } from "../components/WalletButton";
-import { Stat } from "../components/Market";
+import { Stat, pairLabel } from "../components/Market";
 import { LimitOrdersTable } from "../components/LimitOrders";
 import { KeeperLine } from "../components/Keeper";
 import { limitReached } from "@core/limits";
@@ -333,6 +333,8 @@ function OrderPanel({
 
 /** An open position as a card: the Portfolio's main view. */
 function OpenCard({ record, ledger, onClosed }: { record: PositionRecord; ledger: any; onClosed: () => void }) {
+  const config = useConfig();
+  const market = config?.markets.find((m) => m.address === record.contractAddress)?.symbol ?? config?.market;
   const c = useClose(record, ledger, onClosed);
   const o = record.opening;
   const net = c.quote ? c.quote.settled.toTrader - postedOf(record) : null;
@@ -340,7 +342,7 @@ function OpenCard({ record, ledger, onClosed }: { record: PositionRecord; ledger
   return (
     <div className={`pos-card ${o.isLong ? "long" : "short"}`}>
       <div className="pos-head">
-        <span className="pos-market">ETH-USD</span>
+        <span className="pos-market">{pairLabel(market)}</span>
         <span className={`chip plain ${o.isLong ? "good" : "bad"}`}>
           {o.isLong ? "LONG" : "SHORT"} {leverageOf(o)}×
         </span>

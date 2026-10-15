@@ -233,9 +233,12 @@ Today the contract holds one `markPrice`, one pool and one slot count.
 
 Tasks for the separate deployment:
 
-- [ ] `setup` takes a market (feed, name) and writes a deployment per market.
-- [ ] The frontend config lists markets; Trade gets a market selector; the candles follow the market.
-- [ ] The relayer and keeper run per market.
+- [x] `setup` takes a market (feed, name) and writes a deployment per market: `npm run setup:preview -- --market BTC-USD`. Markets are listed in `core/markets.ts`. ETH-USD keeps the deployment record `zkperp`; another market's is `zkperp:<symbol>`. The stack file gains `markets`; setting up one market keeps the others.
+- [x] The frontend config lists markets; the header gets a market picker (shown from two markets on), and every page follows the selected market: Trade (candles from Coinbase's product for it), Portfolio, Liquidity, Public. Pages remount on a switch.
+- [x] The relayer and keeper run per market. Decided 2026-10-15: **one process serves all markets**, with the same signer and keeper keys, wallets, ports and LevelDB stores; it submits for one market at a time. Endpoints take `?market=<symbol>` (ETH-USD without it). A report names its contract, so one signer key is safe across markets.
+- [x] The treasury: one wallet **per market** (`TREASURY_<BTC_USD>_SEED`, or derived), because it counts fees from its balance and one wallet paid by two pools could not tell whose LPs a fee belongs to. One process runs them all.
+
+Status 2026-10-15: built; devnet run in progress. No contract change: prices are `Uint<64>` in 6 decimals (BTC ≈ 8·10¹⁰), and size is a USD notional, so price enters only as the ratio `size × Δ / entry`.
 
 ## 6. Take profit and stop loss
 

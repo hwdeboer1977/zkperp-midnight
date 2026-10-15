@@ -107,7 +107,7 @@ The privacy claims are tested, not just asserted:
 contracts/           Compact sources: zkperp, pusdc, and test-only probes in probe/
 core/                shared TypeScript: wallets, providers, contract calls, fee and PnL
                      maths, position records, the Chainlink reader, the privacy search
-services/oracle/     the oracle signer: Chainlink ETH/USD → setPrice, signed by 2 of 3 relayers
+services/oracle/     the oracle signer: Chainlink → setPrice per market, signed by 2 of 3 relayers
 services/treasury/   the fee-epoch job: pays the LPs' share of fees into the pool
 scripts/             dev tooling: the devnet demo, the race tests, the probes, local setup
 test/                circuit tests, run locally without a chain
@@ -178,6 +178,7 @@ The same stack runs on Midnight's public `preview` network; the scripts and serv
 1. Put a fresh, secret 64-hex `WALLET_SEED_PREVIEW` in `.env` (per network, so it does not replace the devnet's seed). This is the **operator** wallet: it deploys, submits prices, adds the first liquidity and funds the treasury and keeper. Traders, you included, use their own 1AM accounts in the browser; keep the two apart, since the operator wallet's transactions are public. On the devnet the dev seed is public; here it controls the oracle, the liquidator key and every derived wallet, and the scripts refuse to run without it.
 2. Run `npm run setup:preview`. The first run stops with the dev wallet's address: get tNIGHT for it at <https://midnight-tmnight-preview.nethermind.dev/>, then run it again. It registers the NIGHT for DUST, funds the treasury, keeper and signer wallets with `NIGHT_PER_WALLET` (default 100 NIGHT each), deploys pUSDC and zkperp, adds liquidity, and writes `.zkperp/preview-stack.json`.
 3. Run `npm run relayer:preview -- --signer 1` (and `--signer 2`, `--signer 3`), `npm run treasury:preview` and `npm run keeper:preview -- --keeper 1` (and `--keeper 2`, `--keeper 3`), each in its own terminal. Give each signer and keeper its own key and wallet in `.env` before the setup (`ORACLE_SIGNER_1..3_PREVIEW` and `KEEPER_SECRET_1..3_PREVIEW`, hex scalars; `ORACLE_1..3_SEED_PREVIEW` and `KEEPER_1..3_SEED_PREVIEW`, 64 hex); unset, they derive from the operator seed.
+   **A second market.** `npm run setup:preview -- --market BTC-USD` deploys another zkperp on the BTC/USD feed, with its own pool and treasury wallet and the same pUSDC (markets are listed in `core/markets.ts`). Then restart the relayers, keepers and treasury, which serve every deployed market from the same processes, and rerun step 4. The header then shows a market picker.
 4. Run `npm run frontend:preview`, and set 1AM to its Preview network. Check that the wallet button shows a prover on this machine: in red, the local proof server did not answer and 1AM's hosted prover, which sees your positions, is in use.
 
 The devnet tools (`demo`, `race`, the probes, `fund`, `liquidation`, `stoploss`, `limit`) refuse to run against `preview`.

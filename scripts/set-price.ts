@@ -5,6 +5,7 @@
  * network whose price comes from Chainlink.
  *
  *   npm run price:preview -- 2370        # dollars
+ *   npm run price:preview -- 80000 --market BTC-USD
  *
  * Stop the relayer first: it submits from the same operator wallet, and would
  * race this transaction. The price is stamped with the current time, so when
@@ -20,6 +21,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
+import { deploymentKey, marketArg } from "../core/markets.js";
 import { readLedger, submitPrice } from "../core/perp.js";
 import { handle } from "../core/session.js";
 
@@ -35,8 +37,9 @@ async function main() {
   const price = parseDollars(process.argv[2]);
   const network = activeNetwork();
   setNetworkId(network.networkId);
-  const perpAddress = getDeployment(network.networkId, "zkperp");
-  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
+  const market = marketArg();
+  const perpAddress = getDeployment(network.networkId, "zkperp", deploymentKey(market.symbol));
+  if (!perpAddress) throw new Error(`no current zkperp ${market.symbol} deployment on ${network.name}: run the setup first`);
 
   const seed = walletSeed();
   const oracle = oracleSecrets(seed);
@@ -46,7 +49,7 @@ async function main() {
     await waitForSync(wallet, () => {});
     const perp = await handle(wallet, seed, "zkperp", perpAddress);
     const before = await readLedger(perp);
-    console.log(chalk.gray(`zkperp ${perpAddress.slice(0, 12)}… on ${network.name}: ${fmt(before.markPrice)} → ${fmt(price)}`));
+    console.log(chalk.gray(`zkperp ${market.symbol} ${perpAddress.slice(0, 12)}… on ${network.name}: ${fmt(before.markPrice)} → ${fmt(price)}`));
     const txHash = await submitPrice(perp, price, oracle);
     console.log(chalk.green(`set ${fmt(price)} in ${txHash}`));
     console.log(chalk.gray("restart the relayer when done; it resumes at the next Chainlink round"));

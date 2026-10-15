@@ -4,6 +4,7 @@
  * Liquidation, end to end on the local stack.
  *
  *   npm run setup:local && npm run liquidation
+ *   npm run liquidation -- --market BTC-USD    # another market's deployment
  *
  * The trader opens a 19x long; each of the three keepers finds the position
  * from its copy of the liquidator note — which it decrypts with its own
@@ -25,6 +26,7 @@ import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { LOCAL, requireLocal, stackFile, walletSeed } from "../core/network.js";
 import { buildWallet, waitForSync, type BuiltWallet } from "../core/wallet.js";
 import { getDeployment } from "../core/contracts.js";
+import { deploymentKey, marketArg, stackMarkets } from "../core/markets.js";
 import { KEEPER_SLOTS, keeperSecrets, keeperWalletSeed, readyTrader, readyWallet, traderSeed, treasurySeed } from "../core/trader.js";
 import {
   canLiquidate,
@@ -58,11 +60,13 @@ function check(name: string, ok: boolean, detail = "") {
 async function main() {
   requireLocal("npm run liquidation");
   setNetworkId(LOCAL.networkId);
-  const perpAddress = getDeployment(LOCAL.networkId, "zkperp");
+  const market = marketArg();
+  const perpAddress = getDeployment(LOCAL.networkId, "zkperp", deploymentKey(market.symbol));
   const file = stackFile(LOCAL);
-  if (!perpAddress || !fs.existsSync(file)) throw new Error("no local stack: run npm run setup:local first");
-  const stack = JSON.parse(fs.readFileSync(file, "utf8"));
-  const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
+  if (!perpAddress || !fs.existsSync(file)) throw new Error(`no local ${market.symbol} stack: run npm run setup:local first`);
+  const entry = stackMarkets(JSON.parse(fs.readFileSync(file, "utf8"))).find((m) => m.address === perpAddress);
+  if (!entry) throw new Error(`${file} does not list ${market.symbol}: run its setup again`);
+  const treasuryEncKey: string = entry.treasury.encryptionPublicKey;
 
   const devSeed = walletSeed();
   const oracle = oracleSecrets(devSeed);
@@ -82,7 +86,7 @@ async function main() {
     const keepers: BuiltWallet[] = [];
     for (const slot of KEEPER_SLOTS) keepers.push(await readyWallet(dev, keeperWalletSeed(devSeed, slot), LOCAL, info, `keeper ${slot + 1}`));
     wallets.push(...keepers);
-    const treasury = await readyWallet(dev, treasurySeed(devSeed), LOCAL, info, "treasury");
+    const treasury = await readyWallet(dev, treasurySeed(devSeed, market.symbol), LOCAL, info, `${market.symbol} treasury`);
     wallets.push(treasury);
 
     const devPerp = await handle(dev, devSeed, "zkperp", perpAddress);
@@ -94,7 +98,7 @@ async function main() {
     const l0 = await readLedger(devPerp);
     const usdc: Uint8Array = l0.usdc;
     const p0: bigint = l0.markPrice;
-    info(`zkperp ${perpAddress} at $${fmt(p0)}, maintenance ${l0.maintenanceBps} bps, liquidation fee ${l0.liquidationFeeBps} bps`);
+    info(`zkperp ${market.symbol} ${perpAddress} at $${fmt(p0)}, maintenance ${l0.maintenanceBps} bps, liquidation fee ${l0.liquidationFeeBps} bps`);
     if (reservedOf(l0) !== 0n) info("note: other positions are open on this deployment");
 
     step("The trader opens a 19x long");

@@ -3,7 +3,9 @@
 /**
  * One of three independent keepers: liquidates positions whose equity fell
  * below maintenance margin, executes trigger orders (stop loss, take profit)
- * whose level is reached, and fills limit orders whose price is reached.
+ * whose level is reached, and fills limit orders whose price is reached. In
+ * every market deployed (core/markets.ts), one after the other, with the same
+ * key and wallet: each market's contract stores the same three keeper keys.
  *
  *   npm run keeper -- --keeper 1      # and --keeper 2, --keeper 3
  *
@@ -51,9 +53,10 @@
  * sign (the keeper's DUST), submit and wait for the block. What it is doing
  * now, and how its last action ended, are at
  *
- *   GET http://127.0.0.1:<port>/health
+ *   GET http://127.0.0.1:<port>/health?market=BTC-USD
  *
- * which the frontend shows next to an order whose price is reached, and which
+ * (busy only if busy in that market; without `market`, busy anywhere: what
+ * the other keepers read) which the frontend shows next to an order whose price is reached, and which
  * the other keepers read. It names the kind of action and the step, never the
  * position or the order: the endpoint is as public as the frontend, and the
  * order's commitment would tie it to its fill.
@@ -65,8 +68,9 @@ import http from "http";
 import chalk from "chalk";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js-network-id";
 import { activeNetwork, stackFile, walletSeed } from "../../core/network.js";
+import { stackMarkets } from "../../core/markets.js";
 import { buildWallet, waitForSync } from "../../core/wallet.js";
-import { getDeployment } from "../../core/contracts.js";
+import { deployedMarkets } from "../../core/markets.js";
 import {
   canLiquidate,
   circuitNow,
@@ -113,8 +117,8 @@ function keeperSlot(): number {
 
 /** What the keeper is doing, step by step: the logs, and /health. */
 class Jobs {
-  current: { action: Action; step: Step; startedAt: number; stepAt: number } | null = null;
-  last: { action: Action; ok: boolean; step: Step; at: number; seconds: number } | null = null;
+  current: { market: string; action: Action; step: Step; startedAt: number; stepAt: number } | null = null;
+  last: { market: string; action: Action; ok: boolean; step: Step; at: number; seconds: number } | null = null;
   lastTick: number | null = null;
 
   constructor(private readonly proofServer: string) {}
@@ -142,35 +146,39 @@ class Jobs {
   }
 
   /** Runs one keeper action, logging each of its steps. */
-  async run<T>(action: Action, f: () => Promise<T>): Promise<T> {
+  async run<T>(market: string, action: Action, f: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
-    this.current = { action, step: "prepare", startedAt, stepAt: startedAt };
+    this.current = { market, action, step: "prepare", startedAt, stepAt: startedAt };
     try {
       const r = await f();
       this.done(this.current!);
-      this.last = { action, ok: true, step: "submitting", at: Date.now(), seconds: (Date.now() - startedAt) / 1000 };
+      this.last = { market, action, ok: true, step: "submitting", at: Date.now(), seconds: (Date.now() - startedAt) / 1000 };
       log(`   total ${secs(Date.now() - startedAt)}`);
       return r;
     } catch (error) {
       const j = this.current!;
       log(chalk.red(`   ✗ ${this.label(j.step)} failed after ${secs(Date.now() - j.stepAt)}`));
-      this.last = { action, ok: false, step: j.step, at: Date.now(), seconds: (Date.now() - startedAt) / 1000 };
+      this.last = { market, action, ok: false, step: j.step, at: Date.now(), seconds: (Date.now() - startedAt) / 1000 };
       throw error;
     } finally {
       this.current = null;
     }
   }
 
-  health(contract: string, keeper: number) {
+  /** In `market` only, if given; otherwise across every market. */
+  health(contracts: Map<string, string>, keeper: number, market?: string) {
     const now = Date.now();
-    const j = this.current;
+    const j = market && this.current?.market !== market ? null : this.current;
+    const last = market && this.last?.market !== market ? null : this.last;
     return {
       keeper,
-      contract,
+      market: market ?? null,
+      contract: market ? contracts.get(market) : contracts.values().next().value,
+      contracts: Object.fromEntries(contracts),
       checkEverySeconds: CHECK_MS / 1000,
       lastTickSecondsAgo: this.lastTick === null ? null : Math.round((now - this.lastTick) / 1000),
-      busy: j && { action: j.action, step: j.step, stepSeconds: Math.round((now - j.stepAt) / 1000), seconds: Math.round((now - j.startedAt) / 1000) },
-      last: this.last && { ...this.last, at: new Date(this.last.at).toISOString(), secondsAgo: Math.round((now - this.last.at) / 1000) },
+      busy: j && { market: j.market, action: j.action, step: j.step, stepSeconds: Math.round((now - j.stepAt) / 1000), seconds: Math.round((now - j.startedAt) / 1000) },
+      last: last && { ...last, at: new Date(last.at).toISOString(), secondsAgo: Math.round((now - last.at) / 1000) },
     };
   }
 }
@@ -186,12 +194,11 @@ async function main() {
 
   const network = activeNetwork();
   setNetworkId(network.networkId);
-  const perpAddress = getDeployment(network.networkId, "zkperp");
-  if (!perpAddress) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
+  const deployed = deployedMarkets(network);
+  if (!deployed.length) throw new Error(`no current zkperp deployment on ${network.name}: run the setup first`);
   const STACK_FILE = stackFile(network);
   if (!fs.existsSync(STACK_FILE)) throw new Error(`${STACK_FILE} is missing: run the setup first`);
-  const stack = JSON.parse(fs.readFileSync(STACK_FILE, "utf8"));
-  const treasuryEncKey: string = stack.treasury.encryptionPublicKey;
+  const stackEntries = stackMarkets(JSON.parse(fs.readFileSync(STACK_FILE, "utf8")));
 
   const devSeed = walletSeed();
   const secret = keeperSecret(devSeed, slot);
@@ -203,26 +210,51 @@ async function main() {
     return dev;
   };
   const wallet = await readyWallet(fundFromDev, seed, network, log, me);
-  const perp: ContractHandle = await handle(wallet, seed, "zkperp", perpAddress);
   const jobs = new Jobs(network.proofServer);
-  reportStages(perp.providers, (stage) => jobs.step(stage));
 
-  const ledger0 = await readLedger(perp);
-  const ourKey = perp.module.pureCircuits.liquidatorPublicKey(secret);
-  const keyIn = (l: any) => l.keepers[slot].x === ourKey.x && l.keepers[slot].y === ourKey.y;
-  if (!keyIn(ledger0)) {
-    throw new Error(`this zkperp has another key in keeper slot ${slot + 1}; redeploy with the setup, or rotate it in`);
+  /** One market: its contract, and the keys its fees go to. */
+  interface MarketState {
+    symbol: string;
+    perp: ContractHandle;
+    usdc: Uint8Array;
+    treasuryEncKey: string;
+    tag: string;
   }
-  const usdc: Uint8Array = ledger0.usdc;
+  const markets: MarketState[] = [];
+  let ourKey: { x: bigint; y: bigint } | undefined;
+  const keyIn = (l: any) => l.keepers[slot].x === ourKey!.x && l.keepers[slot].y === ourKey!.y;
+  for (const { market, address } of deployed) {
+    const perp: ContractHandle = await handle(wallet, seed, "zkperp", address);
+    reportStages(perp.providers, (stage) => jobs.step(stage));
+    ourKey ??= perp.module.pureCircuits.liquidatorPublicKey(secret);
+    const ledger0 = await readLedger(perp);
+    if (!keyIn(ledger0)) {
+      throw new Error(`zkperp ${market.symbol} has another key in keeper slot ${slot + 1}; redeploy with the setup, or rotate it in`);
+    }
+    const entry = stackEntries.find((m) => m.address === address);
+    if (!entry) throw new Error(`${STACK_FILE} does not list zkperp ${market.symbol} ${address.slice(0, 12)}…: run its setup again`);
+    markets.push({
+      symbol: market.symbol,
+      perp,
+      usdc: ledger0.usdc,
+      treasuryEncKey: entry.treasury.encryptionPublicKey,
+      tag: deployed.length > 1 ? `${market.symbol} ` : "",
+    });
+  }
+  const contracts = new Map(markets.map((m) => [m.symbol, m.perp.address]));
   http
     .createServer((req, res) => {
-      if (req.method !== "GET" || req.url !== "/health") return res.writeHead(404).end();
-      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(jobs.health(perpAddress, slot + 1), null, 2));
+      const url = new URL(req.url ?? "/", "http://keeper");
+      if (req.method !== "GET" || url.pathname !== "/health") return res.writeHead(404).end();
+      const market = url.searchParams.get("market")?.toUpperCase() || undefined;
+      if (market && !contracts.has(market)) return res.writeHead(404).end();
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(jobs.health(contracts, slot + 1, market), null, 2));
     })
     .listen(port, "127.0.0.1");
+  for (const m of markets) log(`${me} watching ${m.symbol} on ${m.perp.address}`);
   log(
     chalk.green(
-      `${me} ready on ${perpAddress}, checking every ${CHECK_MS / 1000}s` +
+      `${me} ready, checking every ${CHECK_MS / 1000}s` +
         (slot ? `, acting ${((slot * STAGGER_MS) / 1000).toFixed(0)}s after the keepers before it` : "") +
         `, health on http://127.0.0.1:${port}/health`
     )
@@ -275,11 +307,14 @@ async function main() {
   const seenOrders = new Set<string>();
   const seenLimits = new Set<string>();
   const expiredLimits = new Set<string>();
-  for (;;) {
+  /** One pass over one market: its positions, trigger orders and limit orders. */
+  const tick = async (m: MarketState) => {
+    const { perp, usdc, treasuryEncKey } = m;
+    const mlog = (line: string) => log(m.tag + line);
     try {
       const ledger = await readLedger(perp);
       if (!keyIn(ledger)) {
-        log(chalk.red(`keeper slot ${slot + 1} has another key now (rotated); this keeper stops`));
+        mlog(chalk.red(`keeper slot ${slot + 1} has another key now (rotated); this keeper stops`));
         process.exit(1);
       }
       const live = watchedPositions(perp, ledger, slot, secret);
@@ -287,7 +322,7 @@ async function main() {
         if (seen.has(w.commitment)) continue;
         seen.add(w.commitment);
         const p = w.position;
-        log(
+        mlog(
           `watching ${w.commitment.slice(0, 12)}…: ${p.isLong ? "long" : "short"} ${fmt(p.size)} on ${fmt(p.collateral)} ` +
             `from $${fmt(p.entryPrice)}, liquidation near $${fmt(liquidationPrice(p, ledger, circuitNow()))}`
         );
@@ -297,7 +332,7 @@ async function main() {
         const id = Buffer.from(o.view.salt).toString("hex");
         if (seenOrders.has(id)) continue;
         seenOrders.add(id);
-        log(
+        mlog(
           `watching an order on ${o.position.commitment.slice(0, 12)}…: close at or ${o.order.above ? "above" : "below"} $${fmt(o.order.price)}`
         );
       }
@@ -308,25 +343,25 @@ async function main() {
         if (executed.has(o.position.commitment)) continue;
         executed.add(o.position.commitment);
         if (!(await myTurn(o.position.commitment, `an order on ${o.position.commitment.slice(0, 12)}…`))) continue;
-        log(chalk.yellow(`executing an order on ${o.position.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
+        mlog(chalk.yellow(`executing an order on ${o.position.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
         try {
-          const r = await jobs.run("order", () => executeOrder(perp, o, usdc, treasuryEncKey));
-          log(
+          const r = await jobs.run(m.symbol, "order", () => executeOrder(perp, o, usdc, treasuryEncKey));
+          mlog(
             chalk.green(
               `executed on ${o.position.commitment.slice(0, 12)}…: ${r.profit ? "profit" : "loss"} ${fmt(r.pnl)}, ` +
                 `${fmt(r.settled.toTreasury)} to the treasury, ${fmt(r.settled.toTrader)} to the trader (tx ${r.txHash.slice(0, 12)}…)`
             )
           );
         } catch (error) {
-          log(chalk.red(`order execution failed: ${error instanceof Error ? error.message : String(error)}`));
+          mlog(chalk.red(`order execution failed: ${error instanceof Error ? error.message : String(error)}`));
         }
       }
       for (const w of live.filter((x) => !executed.has(x.commitment) && canLiquidate(ledger, x))) {
         if (!(await myTurn(w.commitment, `liquidating ${w.commitment.slice(0, 12)}…`))) continue;
-        log(chalk.yellow(`liquidating ${w.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
+        mlog(chalk.yellow(`liquidating ${w.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
         try {
-          const r = await jobs.run("liquidation", () => liquidatePosition(perp, w, usdc, treasuryEncKey));
-          log(
+          const r = await jobs.run(m.symbol, "liquidation", () => liquidatePosition(perp, w, usdc, treasuryEncKey));
+          mlog(
             chalk.green(
               `liquidated ${w.commitment.slice(0, 12)}…: loss ${fmt(r.settled.toPool)} to the pool, ` +
                 `${fmt(r.settled.toTreasury)} to the treasury, ${fmt(r.settled.toKeeper)} to this keeper, ` +
@@ -335,7 +370,7 @@ async function main() {
           );
         } catch (error) {
           // Most often the price moved or the trader closed first; the next tick decides again.
-          log(chalk.red(`liquidation failed: ${error instanceof Error ? error.message : String(error)}`));
+          mlog(chalk.red(`liquidation failed: ${error instanceof Error ? error.message : String(error)}`));
         }
       }
       // Last: a fill takes a slot that a close above may just have freed.
@@ -344,7 +379,7 @@ async function main() {
         if (seenLimits.has(w.commitment)) continue;
         seenLimits.add(w.commitment);
         const o = w.order;
-        log(
+        mlog(
           `watching a limit order ${w.commitment.slice(0, 12)}…: ${o.isLong ? "long" : "short"} ${fmt(o.size)} on ${fmt(o.collateral)} ` +
             `at or ${o.isLong ? "below" : "above"} $${fmt(o.price)}` +
             (o.expiry ? `, until ${new Date(Number(o.expiry) * 1000).toISOString()}` : "")
@@ -353,26 +388,29 @@ async function main() {
       for (const w of limits) {
         if (expiredLimits.has(w.commitment) || !limitExpired(w.order, circuitNow())) continue;
         expiredLimits.add(w.commitment);
-        log(`limit order ${w.commitment.slice(0, 12)}… expired; it waits for its owner to cancel it`);
+        mlog(`limit order ${w.commitment.slice(0, 12)}… expired; it waits for its owner to cancel it`);
       }
       for (const w of limits.filter((x) => limitFires(ledger, x))) {
         if (!(await myTurn(w.commitment, `limit order ${w.commitment.slice(0, 12)}…`))) continue;
-        log(chalk.yellow(`filling limit order ${w.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
+        mlog(chalk.yellow(`filling limit order ${w.commitment.slice(0, 12)}… at $${fmt(ledger.markPrice)}`));
         try {
-          const r = await jobs.run("limit", () => executeLimitOrder(perp, w));
-          log(chalk.green(`filled: position ${r.commitment.slice(0, 12)}… opened at $${fmt(r.entryPrice)} (tx ${r.txHash.slice(0, 12)}…)`));
+          const r = await jobs.run(m.symbol, "limit", () => executeLimitOrder(perp, w));
+          mlog(chalk.green(`filled: position ${r.commitment.slice(0, 12)}… opened at $${fmt(r.entryPrice)} (tx ${r.txHash.slice(0, 12)}…)`));
         } catch (error) {
           // Most often the price moved back, or the pool has no free slot; the next tick decides again.
-          log(chalk.red(`limit fill failed: ${error instanceof Error ? error.message : String(error)}`));
+          mlog(chalk.red(`limit fill failed: ${error instanceof Error ? error.message : String(error)}`));
         }
       }
-      // Forget what is no longer due: done, by this keeper or another.
-      for (const id of dueSince.keys()) if (!dueThisTick.has(id)) dueSince.delete(id);
-      dueThisTick.clear();
-      jobs.lastTick = Date.now();
     } catch (error) {
-      log(chalk.red(`tick failed: ${error instanceof Error ? error.message : String(error)}`));
+      mlog(chalk.red(`tick failed: ${error instanceof Error ? error.message : String(error)}`));
     }
+  };
+  for (;;) {
+    for (const m of markets) await tick(m);
+    // Forget what is no longer due: done, by this keeper or another.
+    for (const id of dueSince.keys()) if (!dueThisTick.has(id)) dueSince.delete(id);
+    dueThisTick.clear();
+    jobs.lastTick = Date.now();
     await sleep(CHECK_MS);
   }
 }

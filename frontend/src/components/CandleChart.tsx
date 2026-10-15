@@ -26,11 +26,21 @@ export interface Level {
 }
 
 /**
- * ETH-USD candles from the live market, with the contract's execution price
+ * Candles from the live market, with the contract's execution price
  * drawn across them as a dashed line, so any gap between the two is visible,
  * and any `levels` (stop losses, take profits) as dotted ones.
  */
-export function CandleChart({ candles, oracle, levels = [] }: { candles: Candle[] | null; oracle: number | null; levels?: Level[] }) {
+export function CandleChart({
+  candles,
+  oracle,
+  levels = [],
+  market,
+}: {
+  candles: Candle[] | null;
+  oracle: number | null;
+  levels?: Level[];
+  market?: string;
+}) {
   const box = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
   const series = useRef<ISeriesApi<"Candlestick"> | null>(null);
@@ -122,7 +132,7 @@ export function CandleChart({ candles, oracle, levels = [] }: { candles: Candle[
   return (
     <div className="candles">
       <div ref={box} className="candles-box" />
-      {!candles && <div className="candles-wait">Loading ETH-USD market data…</div>}
+      {!candles && <div className="candles-wait">Loading {market ?? ""} market data…</div>}
     </div>
   );
 }

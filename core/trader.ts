@@ -31,9 +31,9 @@ const NIGHT = nativeToken().raw;
 const NIGHT_FOR_TRADER = BigInt(process.env.NIGHT_PER_WALLET ?? 100_000_000);
 const nightText = (n: bigint) => `${n / 1_000_000n}.${(n % 1_000_000n).toString().padStart(6, "0")}`;
 
-function seedFor(role: "trader" | "treasury" | `keeper-${number}` | `oracle-${number}`, devSeed: string): string {
+function seedFor(role: "trader" | "treasury" | `treasury-${string}` | `keeper-${number}` | `oracle-${number}`, devSeed: string): string {
   // Per network first (ORACLE_1_SEED_PREVIEW), as for WALLET_SEED_PREVIEW.
-  const base = `${role.toUpperCase().replace("-", "_")}_SEED`;
+  const base = `${role.toUpperCase().replaceAll("-", "_")}_SEED`;
   const scoped = `${base}_${activeNetwork().key.toUpperCase()}`;
   const variable = process.env[scoped]?.trim() ? scoped : base;
   const explicit = process.env[variable]?.trim();
@@ -47,8 +47,14 @@ function seedFor(role: "trader" | "treasury" | `keeper-${number}` | `oracle-${nu
 /** TRADER_SEED, or one derived from the dev seed so reruns reuse the same trader. */
 export const traderSeed = (devSeed: string) => seedFor("trader", devSeed);
 
-/** TREASURY_SEED, or one derived from the dev seed. */
-export const treasurySeed = (devSeed: string) => seedFor("treasury", devSeed);
+/**
+ * The treasury of a market: TREASURY_SEED for ETH-USD, TREASURY_<BTC_USD>_SEED
+ * for another, or one derived from the dev seed. One wallet per market: the
+ * treasury counts its fees as the wallet's balance grows, so a wallet shared
+ * by two pools could not tell whose LPs a fee belongs to.
+ */
+export const treasurySeed = (devSeed: string, market = "ETH-USD") =>
+  seedFor(market === "ETH-USD" ? "treasury" : `treasury-${market.toLowerCase()}`, devSeed);
 
 /** The keeper slots: three independent keepers, each with its own key and wallet. */
 export const KEEPER_SLOTS = [0, 1, 2] as const;

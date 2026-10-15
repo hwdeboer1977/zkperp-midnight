@@ -11,7 +11,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ConnectedAPI, InitialAPI } from "@midnight-ntwrk/dapp-connector-api";
-import { loadConfig } from "./config";
+import { loadConfig, selectedMarket } from "./config";
 import { keyBytes } from "./bytes";
 import { connectContract, proverRoute, type ContractHandle, type ProverRoute } from "./providers";
 
@@ -181,12 +181,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const contract = useCallback(
     (which: "zkperp" | "pusdc") => {
       if (!api || !route) return Promise.reject(new Error("Connect a wallet first."));
-      if (!handles.has(which)) {
+      // One zkperp handle per market: each is its own contract.
+      const key = which === "zkperp" ? `zkperp:${selectedMarket() ?? ""}` : which;
+      if (!handles.has(key)) {
         const p = connectContract(api, which, route);
-        p.catch(() => handles.delete(which));
-        handles.set(which, p);
+        p.catch(() => handles.delete(key));
+        handles.set(key, p);
       }
-      return handles.get(which)!;
+      return handles.get(key)!;
     },
     [api, route, handles]
   );

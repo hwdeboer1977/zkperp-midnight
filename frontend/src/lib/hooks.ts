@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useEffect, useState } from "react";
-import { loadConfig, type AppConfig } from "./config";
+import { loadConfig, onMarketChange, selectedMarket, type AppConfig } from "./config";
 import { readLedger } from "./providers";
 import { contractActions, priceHistory, sharePriceHistory, type Action, type PricePoint } from "./activity";
 import { contractModule } from "./contracts";
 
-/** Polls a contract's public state. */
+/** Polls a contract's public state; for zkperp, the selected market's. */
 export function useLedger(name: "zkperp" | "pusdc" = "zkperp", everyMs = 5000) {
   const [ledger, setLedger] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const market = useMarket();
   useEffect(() => {
     let live = true;
+    if (name === "zkperp") setLedger(null);
     const tick = () =>
       readLedger(name)
         .then((l) => live && (setLedger(l), setError(null)))
@@ -22,14 +24,31 @@ export function useLedger(name: "zkperp" | "pusdc" = "zkperp", everyMs = 5000) {
       live = false;
       clearInterval(timer);
     };
-  }, [name, everyMs]);
+  }, [name, everyMs, name === "zkperp" ? market : null]);
   return { ledger, error };
 }
 
+/** The config, with the selected market's contract; follows the market picker. */
 export function useConfig(): AppConfig | null {
   const [config, setConfig] = useState<AppConfig | null>(null);
-  useEffect(() => void loadConfig().then(setConfig, () => {}), []);
+  useEffect(() => {
+    let live = true;
+    const load = () => void loadConfig().then((c) => live && setConfig(c), () => {});
+    load();
+    const off = onMarketChange(load);
+    return () => {
+      live = false;
+      off();
+    };
+  }, []);
   return config;
+}
+
+/** The selected market's symbol, as last picked (null: the first market). */
+export function useMarket(): string | null {
+  const [market, setMarket] = useState(selectedMarket);
+  useEffect(() => onMarketChange(() => setMarket(selectedMarket())), []);
+  return market;
 }
 
 /** JSON from one of the services, polled; null while unreachable. */
