@@ -47,15 +47,17 @@ What is missing, in order of value:
 
 Random sizes, collateral, leverage, entry and exit prices, and hold times, many thousands of cases, checking invariants rather than examples:
 
-- [ ] Settlement conserves value: what leaves the coin (to pool, treasury, trader) equals collateral plus opening fee, plus any profit from the pool.
-- [ ] The pool never goes negative, and never pays more than `maxPayout` per position.
-- [ ] A loss never exceeds the collateral; fees never exceed what equity is left.
-- [ ] `isLiquidatable` is true exactly when the circuit accepts `liquidatePosition`, and a position in profit is never liquidatable.
-- [ ] `liquidationPrice` lands within one price unit of where `isLiquidatable` flips.
-- [ ] Share price: a deposit followed by a withdrawal never returns more than was deposited; rounding is always in the pool's favour.
-- [ ] Capacity: no sequence of opens, closes, deposits and withdrawals leaves reserved liquidity above the pool.
+- [x] Settlement conserves value: what leaves the coin (to pool, treasury, trader) equals collateral plus opening fee, plus any profit from the pool.
+- [x] The pool never goes negative, and never pays more than `maxPayout` per position.
+- [x] A loss never exceeds the collateral; fees never exceed what equity is left.
+- [x] `isLiquidatable` is true exactly when the circuit accepts `liquidatePosition`, and a position in profit is never liquidatable.
+- [x] `liquidationPrice` lands within one price unit of where `isLiquidatable` flips.
+- [x] Share price: a deposit followed by a withdrawal never returns more than was deposited; rounding is always in the pool's favour.
+- [x] Capacity: no sequence of opens, closes, deposits and withdrawals leaves reserved liquidity above the pool.
 
 Run each against both `core/math.ts` and the circuit's JavaScript, so the two cannot drift.
+
+Built 2026-10-15: `test/props.test.mjs`, part of `npm test` (50,000 math cases and 30 contract lives by default, about 80 s; `npm run test:props` runs 500,000 and 500, about 8 minutes). Past about 200 lives in one process the runtime's WASM slows and then dies (`RuntimeError: unreachable`), so longer runs go in batches of 40 lives, each its own process, four at a time; each life is seeded on its own and replays alone. The contract lives come from `test/life.mjs`, the walker the `/check` fuzzer uses, moved out of it so both share one. After every call it checks the pool's slots and coin; after every close, liquidation and executed order, that the circuit paid each party what `core/math.ts`'s `settlement` says; before every close, that a keeper's `liquidatePosition` on the same state is accepted exactly when `isLiquidatable` says so.
 
 ### 1b. Fuzzing through the proof server's `/check`
 
@@ -72,19 +74,21 @@ Proofs evaluate **every** branch of an `if`; only the taken branch's effects are
 What the fuzzer found in the runtime's refusals:
 
 - [x] **A close in profit is refused when the pool is full.** `settle` calls `repool` before `freeSlots.increment(1)`, so when every slot is taken and the profit moves the pool below a slot boundary, `repool` finds no free slot to retire and asserts "that liquidity is reserved for open positions", although the closing position's own slot is about to free. A trader cannot close a winning position, and a take profit cannot execute, until another position frees a slot or an LP deposits. Reproduced: a pool of 1 slot plus 1,000 units, one long, a 10% rise. Fixed 2026-10-11: `settle` frees the slot before `repool`; regression test "a full pool" in `test/zkperp.test.mjs`. Ships with the steps 3 + 4 redeployment; `preview` still runs the old contract.
-- [ ] A position whose loss would add more than 65,535 slots to the pool cannot be closed or liquidated ("the pool changes by too many slots at once"). Unreachable with real parameters (at a `maxPayout` of 100,000 pUSDC it takes a loss above 6.5 billion pUSDC), but worth bounding at open, or splitting the step.
+- [x] A position whose loss would add more than 65,535 slots to the pool cannot be closed or liquidated ("the pool changes by too many slots at once"). Unreachable with real parameters (at a `maxPayout` of 100,000 pUSDC it takes a loss above 6.5 billion pUSDC), but worth bounding at open, or splitting the step. Bounded at open 2026-10-15: `sizing` (shared by `openPosition` and `placeLimitOrder`) asserts `collateral ≤ maxPayout × 65,535`; proving keys +141 and +186 bytes. In the source, **not deployed**: preview (934f289a, f8147603) keeps the old contract until the next redeploy, after wave 2 (the order freeze). Until then `core/perp.ts` and the order ticket refuse such opens (`maxCollateralOf` in `core/math.ts`). Regression test "a position too large to settle" in `test/zkperp.test.mjs`.
 - [ ] Each new circuit joins the fuzzer as it lands: `addCollateral` (step 10) and the partial close (step 12).
-- [ ] Run it in CI against a proof server container.
+- [x] Run it in CI against a proof server container: the `fuzz` job in `.github/workflows/ci.yml` compiles with proving keys (`/check` reads `.bzkir`, which `--skip-zk` does not emit), starts `midnightntwrk/proof-server:8.1.0` and runs 20 cases seeded from the run number; failures are uploaded as an artifact.
 
 ### 1c. Frontend unit tests
 
 The frontend has none today. Worth covering:
 
-- [ ] `sizeFor` (Trade): never exceeds the contract's leverage bound, for every leverage and fee.
+- [x] `sizeFor` (Trade): never exceeds the contract's leverage bound, for every leverage and fee.
 - [ ] `closingOf` (`history.ts`): matches an exact close's numbers when given the exact close time.
-- [ ] Recovery: notes rebuild the same records; "Lock and clear" followed by unlock restores every open position; a note from another wallet account is skipped.
-- [ ] Oracle staleness and deviation logic, including the expiring window.
-- [ ] `useCandles`: the live price folds into the right candle across an interval boundary.
+- [x] Recovery: notes rebuild the same records; "Lock and clear" followed by unlock restores every open position; a note from another wallet account is skipped.
+- [x] Oracle staleness and deviation logic, including the expiring window.
+- [x] `useCandles`: the live price folds into the right candle across an interval boundary.
+
+Built 2026-10-15 with vitest (`frontend/test/`, `npm run test:frontend`; happy-dom and fake-indexeddb). The logic moved out of the components to be testable: `lib/tradeMath.ts` (`sizeFor`, `oracleAge`, `deviationOf`) and `foldLive` in `lib/market.ts`. Recovery runs the app's generated contract module locally: real circuits and notes, no network. `closingOf` is still untested.
 
 **Done when** `npm test` runs all of it, CI runs it on every push, and the `/check` fuzzer has run at least once against each circuit.
 
@@ -94,10 +98,11 @@ The frontend has none today. Worth covering:
 
 Today every role derives from one seed (`WALLET_SEED_PREVIEW`): the deployer, the oracle admin secret, the liquidator key, the keeper wallet and the treasury wallet. One leaked seed takes all of them.
 
-- [ ] Separate secrets in `.env`: deployer, each oracle signer, each keeper's liquidator key and wallet, treasury wallet.
-- [ ] Each service reads only its own secrets.
-- [ ] A relayer's or keeper's wallet only pays DUST; the authority is the secret behind a hash stored in the contract. Keep that distinction in the docs.
-- [ ] `npm run setup:preview` generates or takes each key, and prints which public values go in the contract.
+- [x] Separate secrets in `.env` for the deployer (`WALLET_SEED_PREVIEW`), each oracle signer (`ORACLE_SIGNER_<n>_PREVIEW`) and its wallet (`ORACLE_<n>_SEED_PREVIEW`), and each keeper's liquidator key (`KEEPER_SECRET_<n>_PREVIEW`) and wallet (`KEEPER_<n>_SEED_PREVIEW`).
+- [ ] The treasury wallets: still derived from the operator seed (no `TREASURY_SEED_PREVIEW` or `TREASURY_BTC_USD_SEED_PREVIEW` in `.env`).
+- [ ] Each service reads only its own secrets. (2026-10-15: not yet. Every service also reads `WALLET_SEED_PREVIEW`, to fund its wallet from the operator wallet on first use and to derive any secret not set.)
+- [ ] A relayer's or keeper's wallet only pays DUST; the authority is the secret behind a hash stored in the contract. Keep that distinction in the docs. (Said in the relayer's and `core/trader.ts`'s comments; not yet in README or `docs/privacy.md`.)
+- [ ] `npm run setup:preview` generates or takes each key, and prints which public values go in the contract. (It takes each key from `.env` or derives it, and prints the wallets' addresses; not yet the public keys.)
 
 ## 3. 2-of-3 oracle
 
@@ -180,14 +185,16 @@ Tasks:
 - [x] Frontend: the Privacy inspector and Public page say "three keepers" (and how many are up); the keeper line names which keeper is busy. The docs say the liquidation fee goes to the keeper.
 - [x] Tests: each keeper alone can liquidate; a second liquidation of the same position is refused; the fee reaches the liquidating keeper; rotation.
 - [x] Re-measure the open circuit's proving-key size. Proving time: not yet re-measured.
-- [ ] Preview: redeploy with `KEEPER_SECRET_1..3_PREVIEW` and `KEEPER_1..3_SEED_PREVIEW` in `.env`, start three keepers, and liquidate with one or two of them stopped.
+- [x] Preview: redeploy with `KEEPER_SECRET_1..3_PREVIEW` and `KEEPER_1..3_SEED_PREVIEW` in `.env`, and start three keepers (zkperp `934f289a…`, 2026-10-13; BTC-USD `f8147603…`, 2026-10-15).
+- [ ] Preview: liquidate with one or two of the keepers stopped.
 
 ## 3 + 4 + 6. One redeployment
 
-- [ ] Ship steps 3, 4 and 6 in one contract version.
-- [ ] Run `npm test`, the `/check` fuzzer, `npm run demo` and `npm run liquidation` on the devnet.
-- [ ] Before redeploying `preview`: close open positions on the old deployment, and let LPs withdraw. There is no upgrade path; the new contract has new addresses, a new pool and a new pUSDC token.
-- [ ] `npm run setup:preview` with the per-role keys from step 2; start three relayers and three keepers.
+- [x] Ship steps 3, 4 and 6 in one contract version. Steps 3 and 4 shipped in `934f289a…` with step 6's take profit and stop loss; step 6's merge of `executeOrder` into `closePosition` is deferred (see step 6).
+- [x] Run `npm test`, the `/check` fuzzer and `npm run liquidation` on the devnet (also `-- --market BTC-USD`, 2026-10-15).
+- [ ] `npm run demo` on the devnet against this contract version: not rerun since.
+- [x] Before redeploying `preview`: close open positions on the old deployment, and let LPs withdraw. There is no upgrade path; the new contract has new addresses, a new pool and a new pUSDC token. (The old deployments had no open positions; the operator's liquidity was left in them.)
+- [x] `npm run setup:preview` with the per-role keys from step 2; start three relayers and three keepers.
 - [ ] Re-run the preview checks: open, close, liquidation (with `npm run price:preview`, which in 2-of-3 needs two signers), a take profit and a stop loss, recovery on a second browser.
 
 ### Circuit count and the deploy limit (noted 2026-10-09)
@@ -206,11 +213,11 @@ Expected count after steps 3 and 4:
 
 Tasks:
 
-- [ ] Add each new circuit to `DEFERRED`, and deploy on the devnet as soon as the circuits exist: that is the test. Each insert adds about 15 s to setup.
-- [ ] Watch for a limit not yet seen: total contract state size (each verifier key adds about 2 KB, so 15 keys is about 30 KB; no cap known, none tested). Check that preview and preprod accept the deploy and the inserts as the devnet does.
-- [ ] Keep the trader's circuits within 1AM's proving-key limit (37 MB carried, 81 MB refused). Three keeper notes add about 0.1–0.3 MB each to `openPosition` (11 MB). `closePosition` (38.8 MB) is already just above 37 MB, so the fee-to-caller change in close and liquidate must not grow it.
-- [ ] Limit orders need three keepers too: `executeLimitOrder` writes the new position's keeper notes in the circuit, so three (keeper-proven, 21.6 MB today). The trigger-order and limit notes the trader seals outside the circuit become three each, at no proof cost.
-- [ ] Rotation of oracle signers and keepers goes through the contract's own circuits, signed by two of three, never through the maintenance key. Freezing the maintenance authority before preprod (step 9) then leaves rotation working.
+- [x] Add each new circuit to `DEFERRED`, and deploy on the devnet as soon as the circuits exist: that is the test. Each insert adds about 15 s to setup.
+- [x] Watch for a limit not yet seen: total contract state size (each verifier key adds about 2 KB, so 15 keys is about 30 KB; no cap known, none tested). Check that preview and preprod accept the deploy and the inserts as the devnet does. (Preview accepted the 15-circuit deploy plus 8 inserts three times, the last on 2026-10-15 for BTC-USD; preprod is step 9.)
+- [ ] Keep the trader's circuits within 1AM's proving-key limit (37 MB carried, 81 MB refused). Three keeper notes add about 0.1–0.3 MB each to `openPosition` (11 MB). `closePosition` (38.8 MB) is already just above 37 MB, so the fee-to-caller change in close and liquidate must not grow it. (It did not: `closePosition` is still 38.8 MB, `openPosition` 11.0 MB. Whether 1AM proves 38.8 MB is still unmeasured.)
+- [x] Limit orders need three keepers too: `executeLimitOrder` writes the new position's keeper notes in the circuit, so three (keeper-proven, 21.6 MB today). The trigger-order and limit notes the trader seals outside the circuit become three each, at no proof cost.
+- [x] Rotation of oracle signers and keepers goes through the contract's own circuits, signed by two of three, never through the maintenance key. Freezing the maintenance authority before preprod (step 9) then leaves rotation working.
 
 ## 5. A second market
 

@@ -73,6 +73,22 @@ export function useLivePrice(product: string | undefined): number | null {
   return price;
 }
 
+/**
+ * `candles` with the live price `live` at `now` (seconds) folded in: into the
+ * last candle while `now` is in its interval, else as a new candle opening at
+ * the last close. A price from an interval before the last candle is ignored.
+ */
+export function foldLive(candles: Candle[], live: number, seconds: number, now: number): Candle[] {
+  if (candles.length === 0) return candles;
+  const start = now - (now % seconds);
+  const last = candles[candles.length - 1];
+  if (last.time === start) {
+    return [...candles.slice(0, -1), { ...last, close: live, high: Math.max(last.high, live), low: Math.min(last.low, live) }];
+  }
+  if (start > last.time) return [...candles, { time: start, open: last.close, high: live, low: live, close: live }];
+  return candles;
+}
+
 /** Candles of `product` for `seconds`, refreshed each minute, with the live price folded into the last one. */
 export function useCandles(product: string | undefined, seconds: number, live: number | null) {
   const [candles, setCandles] = useState<Candle[] | null>(null);
@@ -96,17 +112,7 @@ export function useCandles(product: string | undefined, seconds: number, live: n
 
   useEffect(() => {
     if (live === null) return;
-    setCandles((c) => {
-      if (!c || c.length === 0) return c;
-      const now = Math.floor(Date.now() / 1000);
-      const start = now - (now % seconds);
-      const last = c[c.length - 1];
-      if (last.time === start) {
-        return [...c.slice(0, -1), { ...last, close: live, high: Math.max(last.high, live), low: Math.min(last.low, live) }];
-      }
-      if (start > last.time) return [...c, { time: start, open: last.close, high: live, low: live, close: live }];
-      return c;
-    });
+    setCandles((c) => (c ? foldLive(c, live, seconds, Math.floor(Date.now() / 1000)) : c));
   }, [live, seconds]);
 
   return { candles, error };

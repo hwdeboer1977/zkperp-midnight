@@ -1051,6 +1051,10 @@ circuit sizing(value: Uint<128>, size: Uint<64>, openFee: Uint<64>): Uint<64> {
   assert(openFee < gross, "the opening fee exceeds the collateral");
   const collateral = (gross - openFee) as Uint<64>;
   assert(collateral >= minCollateral, "collateral below the minimum");
+  // A loss is at most the collateral, and `repool` moves the pool's capacity
+  // by at most 65,535 slots at once: a position whose loss could move it more
+  // could never be closed or liquidated. (Found by the /check fuzzer.)
+  assert(collateral <= maxPayout * 65535, "collateral above 65,535 payout slots");
   assert(size >= collateral, "size below collateral: leverage under 1x");
   assert(size <= collateral * maxLeverage, "leverage above the maximum");
   return collateral;

@@ -9,8 +9,12 @@
 # circuits through `compact-runtime` and never prove. (Adapted from
 # midnight-polisZK's CI.)
 #
+# A second job compiles WITH proving keys and fuzzes the circuits through a
+# proof server's `/check` (test/check.fuzz.mjs): `--skip-zk` emits only text
+# ZKIR, and `/check` reads the binary `.bzkir`.
+#
 # Not here: the devnet runs (`npm run demo`, `npm run liquidation`), which need
-# a node, an indexer and a proof server.
+# a node and an indexer.
 
 name: CI
 
@@ -72,10 +76,14 @@ jobs:
       - name: Compile the contracts from source (no proving keys)
         run: npm run compile:skip-zk
 
-      # tsc over core, scripts and services, then the four test files:
-      # pUSDC, zkperp (rules, privacy sweeps, liquidation), notes, password.
+      # tsc over core, scripts and services, then the test files: pUSDC,
+      # zkperp (rules, privacy sweeps, liquidation), notes, password, math,
+      # and the property tests of the money (seeded from the run number, so
+      # each run explores new cases and a failure prints its seed).
       - name: Typecheck and run the suite
         run: npm test
+        env:
+          PROP_SEED: ${{ github.run_number }}
 
       # The frontend imports the compiled contract modules from
       # src/generated/, which `npm run frontend:config` normally copies along
@@ -88,3 +96,66 @@ jobs:
             cp -r "contracts/managed/$name/contract/." "frontend/src/generated/$name/"
           done
           (cd frontend && npx tsc --noEmit -p .)
+
+      # vitest: the order ticket's sizing, oracle age and deviation, candle
+      # folding, and recovery from notes (which runs the generated module).
+      - name: Frontend unit tests
+        run: npm test --prefix frontend
+
+  fuzz:
+    name: fuzz the circuits through a proof server's /check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Cache the Compact toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.compact
+          key: compact-${{ runner.os }}-${{ env.COMPACT_COMPILER_VERSION }}
+
+      - name: Install the Compact toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/midnightntwrk/compact/releases/latest/download/compact-installer.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Pin the compiler
+        run: compact update "$COMPACT_COMPILER_VERSION"
+
+      # Started by hand, not as a service container: services cannot pass the
+      # command (`midnight-proof-server -v`). Same image as `npm run proof:up`.
+      - name: Start a proof server
+        run: |
+          docker run -d --name proof-server -p 6300:6300 midnightntwrk/proof-server:8.1.0 midnight-proof-server -v
+
+      - name: Compile the contracts with proving keys
+        run: npm run compile
+
+      - name: Wait for the proof server
+        run: |
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:6300/version && exit 0; sleep 5; done
+          docker logs proof-server; exit 1
+
+      # 20 random lives (about 200 calls), seeded from the run number; a
+      # failure writes check-fuzz-failures-<seed>.json, uploaded below.
+      - name: Fuzz
+        run: npm run test:fuzz -- 20 ${{ github.run_number }}
+
+      - name: Keep the failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-fuzz-failures
+          path: check-fuzz-failures-*.json
+          if-no-files-found: ignore

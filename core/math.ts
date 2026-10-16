@@ -26,6 +26,16 @@ export function capacityOf(poolValue: bigint, maxPayout: bigint): bigint {
   return poolValue === 0n ? 0n : (poolValue - 1n) / maxPayout;
 }
 
+/**
+ * The most collateral a position may hold: its loss, at most the collateral,
+ * may move the pool by at most 65,535 slots of `maxPayout` at once, or it
+ * could never be closed or liquidated. The contract enforces it at open from
+ * the version after 934f289a; until then the frontend and core refuse.
+ */
+export function maxCollateralOf(maxPayout: bigint): bigint {
+  return maxPayout * 65_535n;
+}
+
 /** Liquidity set aside for open positions: maxPayout per used slot. */
 export function reservedOf(ledger: { slotCapacity: bigint; freeSlots: bigint; maxPayout: bigint }): bigint {
   return (ledger.slotCapacity - ledger.freeSlots) * ledger.maxPayout;

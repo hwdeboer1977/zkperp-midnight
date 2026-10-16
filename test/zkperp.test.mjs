@@ -2152,5 +2152,62 @@ console.log("\n  a full pool\n");
   }
 }
 
-console.log(failures ? `\n${failures} failure(s)\n` : "\nall passed\n");
+// ── A position too large to settle ──────────────────────────────────────────
+
+console.log("\n  a position too large to settle\n");
+
+{
+  // A loss moves the pool's capacity by up to collateral / maxPayout slots,
+  // and `repool` takes at most 65,535 at once: a larger position could never
+  // be closed or liquidated. So the open refuses it. Found by the /check
+  // fuzzer (test/check.fuzz.mjs).
+  const BOUND = MAX_PAYOUT * 65_535n;
+  expect("(core/math.ts has the same bound)", m.maxCollateralOf(MAX_PAYOUT) === BOUND);
+  const size = BOUND * 2n;
+  const over = openCall(TRADER, pooled, coin(BOUND + 1n), size, true, bytes32(0x61), belowField(bytes32(0x62)));
+  expect("collateral one unit above 65,535 payout slots is refused", !over.ok && /65,535 payout slots/.test(over.error), why(over));
+
+  const c = coin(BOUND);
+  c.nonce = belowField(c.nonce);
+  const secret = bytes32(0x63);
+  const salt = belowField(bytes32(0x64));
+  const at = openCall(TRADER, pooled, c, size, true, secret, salt);
+  expect("collateral of exactly 65,535 payout slots is accepted", at.ok, why(at));
+  if (at.ok) {
+    // A wipe-out: the price falls 60% at 2x, so the whole collateral goes to the pool.
+    const low = 1_200_000_000n;
+    const fallen = call(DEPLOYER, at.state, "setPrice", ...signed(at.state, low, T0)).state;
+    const p = {
+      owner: pureCircuits.ownerKey(secret), isLong: true, size, collateral: BOUND, openFee: openFeeOf(size),
+      entryPrice: PRICE, openTime: T0, collateralNonce: c.nonce, salt, payTo: TRADER,
+    };
+    const pnl = m.positionPnl(true, size, PRICE, low, MAX_PAYOUT).pnl;
+    const l = ledger(fallen);
+    const lost = callAt(
+      T0, TRADER, fallen, "closePosition", p, secret, l.positions.findPathForLeaf(pureCircuits.positionCommitment(p)),
+      held(c, size), pnl, closeFeeOf(size), 0n, T0, capOf(l.poolValue + BOUND)
+    );
+    expect("and its full loss can still be settled", lost.ok, why(lost));
+    if (lost.ok) {
+      const after = ledger(lost.state);
+      expect("(the pool grew by the collateral, 65,535 slots or fewer)", after.poolValue === l.poolValue + BOUND && after.slotCapacity - l.slotCapacity <= 65_535n);
+    }
+  }
+
+  // A limit order goes through the same sizing at placement.
+  const owner = bytes32(0x65);
+  const lsalt = belowField(bytes32(0x66));
+  const nonce = belowField(bytes32(0x67));
+  const order = {
+    owner: pureCircuits.ownerKey(owner), isLong: true, size, collateral: BOUND + 1n, openFee: openFeeOf(size), price: PRICE,
+    expiry: 0n, collateralNonce: nonce, salt: lsalt, payTo: TRADER, payToEnc: TRADER_ENC,
+  };
+  const limit = call(
+    TRADER, pooled, "placeLimitOrder", { nonce, color: USDC, value: BOUND + 1n + openFeeOf(size) }, size, true, openFeeOf(size), PRICE, 0n,
+    owner, lsalt, TRADER_ENC, NOTE, sealLimitNote(pureCircuits, ledger(pooled).keepers, order, EPHEMERAL)
+  );
+  expect("a limit order above 65,535 payout slots is refused too", !limit.ok && /65,535 payout slots/.test(limit.error), why(limit));
+}
+
+console.log(failures ?`\n${failures} failure(s)\n` : "\nall passed\n");
 process.exit(failures ? 1 : 0);

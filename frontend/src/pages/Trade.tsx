@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { circuitNow, closeFeeOf, liquidationPrice, openFeeOf, positionPnl } from "@core/math";
+import { circuitNow, closeFeeOf, liquidationPrice, openFeeOf, positionPnl, maxCollateralOf } from "@core/math";
 import { fmt6, parse6 } from "../lib/bytes";
 import { useConfig, useLedger, useNow, useService } from "../lib/hooks";
 import { marketQuery } from "../lib/config";
@@ -24,21 +24,8 @@ import { ProverLine, ProverSetup, WhyDocker } from "../components/ProverSetup";
 import { NeedsWallet } from "../components/WalletButton";
 import { CoinBadge, pairLabel } from "../components/Market";
 import { OpenRow } from "./Portfolio";
+import { deviationOf, oracleAge, sizeFor } from "../lib/tradeMath";
 
-/**
- * The largest size `coin` can carry at `leverage`, after the opening fee:
- * size ≤ leverage × (coin − fee(size)), the contract's own bound.
- */
-function sizeFor(coin: bigint, leverage: bigint, feeBps: bigint): bigint {
-  let size = (coin * leverage * 10_000n) / (10_000n + leverage * feeBps);
-  while (size > 0n && size > leverage * (coin - openFeeOf(size, feeBps))) size -= 1n;
-  return size;
-}
-
-/** A proof plus the wallet's part takes about this long; a price closer than this to its limit may expire on the way. */
-const TRADE_SECONDS = 120;
-/** Above this gap between the live market and the execution price, warn: Chainlink itself updates at 0.5%. */
-const DEVIATION_WARN = 1;
 
 export default function TradePage() {
   const w = useWallet();
@@ -96,10 +83,9 @@ export default function TradePage() {
 
   const maxLeverage = ledger ? Number(ledger.maxLeverage) : 20;
   const pusdc = config ? balanceOf(w.shieldedBalances, config.usdcToken) : 0n;
-  const age = ledger ? now - Number(ledger.priceTime) : 0;
-  const maxAge = ledger ? Number(ledger.maxPriceAge) : 0;
-  const stale = !!ledger && age >= maxAge;
-  const nearStale = !!ledger && !stale && maxAge - age < TRADE_SECONDS;
+  const { age, maxAge, stale, nearStale } = ledger
+    ? oracleAge(Number(ledger.priceTime), Number(ledger.maxPriceAge), now)
+    : { age: 0, maxAge: 0, stale: false, nearStale: false };
   const problem = !ledger
     ? "Reading zkperp…"
     : stale && mode === "market"
@@ -110,6 +96,8 @@ export default function TradePage() {
         ? "Enter the collateral to post."
         : plan.net < ledger.minCollateral
           ? `Collateral after the fee must be at least ${fmt6(ledger.minCollateral)} pUSDC.`
+          : plan.net > maxCollateralOf(ledger.maxPayout)
+            ? `Collateral after the fee can be at most ${fmt6(maxCollateralOf(ledger.maxPayout))} pUSDC: a larger loss could not be settled.`
           : coin > pusdc
             ? `Your wallet holds ${fmt6(pusdc)} pUSDC. Get more from the faucet.`
             : ledger.freeSlots < 1n && mode === "market"
@@ -121,8 +109,7 @@ export default function TradePage() {
 
   const oracle = ledger ? Number(ledger.markPrice) / 1e6 : null;
   const market = live ?? (candles && candles.length ? candles[candles.length - 1].close : null);
-  const deviation = market !== null && oracle !== null ? ((oracle - market) / market) * 100 : null;
-  const deviates = deviation !== null && Math.abs(deviation) >= DEVIATION_WARN;
+  const { deviation, deviates } = deviationOf(oracle, market);
   const first = candles && candles.length ? candles[0].open : null;
   const change = market !== null && first ? ((market - first) / first) * 100 : null;
   const usd = (v: number) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;

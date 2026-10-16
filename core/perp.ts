@@ -30,6 +30,7 @@ import {
   closeFeeOf,
   isLiquidatable,
   liquidationFeeOf,
+  maxCollateralOf,
   openFeeOf,
   positionPnl,
   settlement,
@@ -121,6 +122,17 @@ export interface Opened {
  * position's collateral. The opening is saved BEFORE submitting and marked
  * open or failed after; see positions.ts.
  */
+/**
+ * Refuses collateral whose loss could never be settled (`maxCollateralOf`).
+ * Deployments up to 934f289a accept such an open; the contract after it
+ * refuses it itself.
+ */
+function refuseUnsettleable(collateral: bigint, maxPayout: bigint): void {
+  if (collateral > maxCollateralOf(maxPayout)) {
+    throw new Error(`collateral above ${maxCollateralOf(maxPayout)}: a loss that large could never be settled`);
+  }
+}
+
 export async function openPosition(
   perp: ContractHandle,
   usdc: Uint8Array,
@@ -131,6 +143,7 @@ export async function openPosition(
 ): Promise<Opened> {
   const ledger = await readLedger(perp);
   const openFee = openFeeOf(size, BigInt(ledger.openFeeBps));
+  refuseUnsettleable(coinValue - openFee, ledger.maxPayout);
   const openTime = circuitNow();
   const ownerSecret = new Uint8Array(randomBytes(32));
   const record: PositionRecord = {
@@ -615,6 +628,7 @@ export async function placeLimitOrder(
 ): Promise<LimitPlaced> {
   const ledger = await readLedger(perp);
   const openFee = openFeeOf(size, BigInt(ledger.openFeeBps));
+  refuseUnsettleable(coinValue - openFee, ledger.maxPayout);
   const ownerSecret = new Uint8Array(randomBytes(32));
   const record: LimitRecord = {
     status: "pending",
